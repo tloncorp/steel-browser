@@ -1,5 +1,6 @@
-# Build the sibling Steel MCP checkout, then add the stdio-to-HTTP bridge that
-# lets Urbit's remote MCP proxy connect to it.
+# Build the sibling Steel MCP checkout as its native multi-tenant HTTP server.
+# Each Urbit upstream supplies its own X-Api-Key, which becomes the tenant
+# principal while the local Steel Browser remains credential-free.
 FROM node:22-alpine AS builder
 
 WORKDIR /app
@@ -11,13 +12,13 @@ COPY scripts/clean-dist.mjs ./scripts/clean-dist.mjs
 
 RUN npm ci --ignore-scripts
 RUN npm run build
-RUN npm prune --omit=dev
+RUN IOREDIS="$(node -p "require('./package.json').peerDependencies.ioredis")" \
+ && MCP_NODE="$(node -p "require('./package.json').peerDependencies['@modelcontextprotocol/node']")" \
+ && npm pkg delete devDependencies peerDependencies peerDependenciesMeta \
+ && npm prune --omit=dev \
+ && npm install --no-save --ignore-scripts "ioredis@$IOREDIS" "@modelcontextprotocol/node@$MCP_NODE"
 
 FROM node:22-alpine
-
-RUN apk add --no-cache python3 \
- && python3 -m venv /opt/mcp-proxy \
- && /opt/mcp-proxy/bin/pip install --no-cache-dir mcp-proxy==0.11.0 mcp==1.26.0
 
 WORKDIR /app
 
@@ -27,5 +28,5 @@ COPY --from=builder /app/package.json ./package.json
 
 EXPOSE 8000
 
-ENTRYPOINT ["/opt/mcp-proxy/bin/mcp-proxy"]
-CMD ["--host", "0.0.0.0", "--port", "8000", "--stateless", "--pass-environment", "node", "dist/stdio.js"]
+ENTRYPOINT ["node"]
+CMD ["dist/hosted.js"]

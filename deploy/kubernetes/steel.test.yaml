@@ -1,7 +1,7 @@
 # The browser image is built from this repository.
 # The MCP image is built from Dockerfile.steel-mcp with steel-mcp-server as context:
 #   docker build -f steel-browser/Dockerfile.steel-mcp \
-#     -t us-central1-docker.pkg.dev/prod-f0181862/images/steel-mcp:latest \
+#     -t us-central1-docker.pkg.dev/test-61eb624c/images/steel-mcp:latest \
 #     steel-mcp-server
 #
 # Apply with:
@@ -44,14 +44,16 @@ spec:
           type: RuntimeDefault
       containers:
         - name: browser
-          image: us-central1-docker.pkg.dev/prod-f0181862/images/steel-browser:latest
+          image: us-central1-docker.pkg.dev/test-61eb624c/images/steel-browser:latest
           imagePullPolicy: Always
+          # The MCP sidecar connects through Steel's API/WebSocket endpoint on
+          # port 3000, so the image's nginx CDP proxy is unnecessary. Disabling
+          # it also lets this container keep all Linux capabilities dropped.
+          args:
+            - --no-nginx
           ports:
             - name: browser
               containerPort: 3000
-              protocol: TCP
-            - name: devtools
-              containerPort: 9223
               protocol: TCP
           env:
             - name: NODE_ENV
@@ -65,7 +67,7 @@ spec:
             - name: DOMAIN
               value: 127.0.0.1:3000
             - name: CDP_DOMAIN
-              value: 127.0.0.1:9223
+              value: 127.0.0.1:3000
             - name: CHROME_HEADLESS
               value: "true"
             - name: DISABLE_CHROME_SANDBOX
@@ -125,13 +127,21 @@ spec:
               readOnly: true
 
         - name: mcp
-          image: us-central1-docker.pkg.dev/prod-f0181862/images/steel-mcp:latest
+          image: us-central1-docker.pkg.dev/test-61eb624c/images/steel-mcp:latest
           imagePullPolicy: Always
           ports:
             - name: mcp
               containerPort: 8000
               protocol: TCP
           env:
+            - name: HOST
+              value: 0.0.0.0
+            - name: PORT
+              value: "8000"
+            # Urbit's configured X-Api-Key is consumed as tenant identity by
+            # Steel MCP. It is never forwarded to the local browser API.
+            - name: STEEL_ALLOWED_HOSTS
+              value: steel-mcp,steel-mcp.tlon.svc.cluster.local
             - name: STEEL_LOCAL
               value: "true"
             - name: STEEL_BASE_URL
@@ -160,13 +170,15 @@ spec:
               memory: 512Mi
               ephemeral-storage: 1Gi
           startupProbe:
-            tcpSocket:
+            httpGet:
+              path: /healthz
               port: mcp
             periodSeconds: 2
             timeoutSeconds: 2
             failureThreshold: 30
           readinessProbe:
-            tcpSocket:
+            httpGet:
+              path: /healthz
               port: mcp
             periodSeconds: 10
             timeoutSeconds: 2

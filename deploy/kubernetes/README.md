@@ -1,13 +1,13 @@
 # Kubernetes deployment
 
-This deployment runs Steel Browser and the Steel MCP HTTP bridge in one Pod. The MCP sidecar talks
-to the browser over loopback, and the `steel-mcp` ClusterIP Service exposes only the MCP port to
-other workloads in the `tlon` namespace.
+This deployment runs Steel Browser and the tenant-aware Steel MCP HTTP server in one Pod. The MCP
+sidecar talks to the browser over loopback, and the `steel-mcp` ClusterIP Service exposes only the
+MCP port to other workloads in the `tlon` namespace.
 
 The browser image is:
 
 ```text
-us-central1-docker.pkg.dev/prod-f0181862/images/steel-browser:latest
+us-central1-docker.pkg.dev/test-61eb624c/images/steel-browser:latest
 ```
 
 Build the separate MCP sidecar image from the directory containing the sibling
@@ -16,9 +16,9 @@ Build the separate MCP sidecar image from the directory containing the sibling
 ```sh
 docker build \
   -f steel-browser/Dockerfile.steel-mcp \
-  -t us-central1-docker.pkg.dev/prod-f0181862/images/steel-mcp:latest \
+  -t us-central1-docker.pkg.dev/test-61eb624c/images/steel-mcp:latest \
   steel-mcp-server
-docker push us-central1-docker.pkg.dev/prod-f0181862/images/steel-mcp:latest
+docker push us-central1-docker.pkg.dev/test-61eb624c/images/steel-mcp:latest
 ```
 
 Deploy and wait for readiness:
@@ -33,6 +33,25 @@ Configure each Urbit MCP desk with:
 ```text
 http://steel-mcp.tlon.svc.cluster.local:8000/mcp
 ```
+
+Configure that upstream with an `X-Api-Key` header containing the moon's own distinct MCP API key.
+Steel MCP hashes the key into a tenant principal, strips it before dispatch, and binds every browser
+handle to that principal. The local Steel Browser never receives the key. Do not reuse one key for
+multiple moons: callers with the same key intentionally share one tenant and can resume each
+other's sessions. A moon still passes the opaque `session_id` to session tools; if it loses that
+handle, `steel_session_diagnostics` with `list_live: true` rediscovers only that tenant's live ones.
+
+The sidecar treats possession of any non-empty key as tenant identity; it does not call back into the
+moon's MCP desk to validate it. Keep the Service cluster-private as shown. A leaked key grants access
+to that tenant, while an invented key creates a separate tenant and can consume shared capacity.
+
+Handles and tenant clients persist across HTTP requests but are held in memory with the single
+replica shown here. `REDIS_URL` plus a shared `STEEL_REQUEST_STATE_SECRET` can preserve handles
+across an MCP-sidecar restart while its browser stays alive. Redis alone does not make this combined
+Deployment horizontally scalable: each handle still belongs to the browser in the Pod that created
+it. Multiple replicas also require a shared/routable Steel backend or tenant/session-aware routing
+to the owning Pod. Browser profiles remain disposable `emptyDir` data and do not survive Pod
+replacement.
 
 The manifest admits four browser sessions, expires them after 15 minutes, retains at most 20
 released-session records, and bounds disposable profile storage to 8 GiB.
@@ -55,9 +74,8 @@ The audience in `steel.yaml` is specifically for `ovh-test-1`. Change it to the 
 bare-metal cluster's `WORKLOAD_IDENTITY_POOL_AUDIENCE` when deploying elsewhere; that cluster
 must also provide its corresponding `pioneer-wid-config` ConfigMap.
 
-The current self-hosted Steel MCP server hard-codes its own session limit to one. Its config must be
-patched to honor `STEEL_MAX_SESSIONS` before the sidecar will open four sessions. Keep the
-Deployment at one replica while MCP handles are process-local.
+The patched self-hosted Steel MCP server honors `STEEL_MAX_SESSIONS`, so the sidecar and browser both
+admit four sessions. Keep the Deployment at one replica while MCP handles are process-local.
 
-The Service is not an authentication boundary. The NetworkPolicy limits ingress to Pods in
-`tlon`, but a tenant-aware MCP layer must still enforce which caller owns each browser handle.
+The NetworkPolicy limits ingress to Pods in `tlon`; `X-Api-Key` provides the tenant boundary within
+that network. Requests without a supported credential are rejected before a tenant runtime exists.
