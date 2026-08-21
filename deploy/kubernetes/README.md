@@ -37,6 +37,24 @@ http://steel-mcp.tlon.svc.cluster.local:8000/mcp
 The manifest admits four browser sessions, expires them after 15 minutes, retains at most 20
 released-session records, and bounds disposable profile storage to 8 GiB.
 
+## Bare-metal GAR authentication
+
+The Pod mirrors the working Voyager pattern on `ovh-test-1`:
+
+- it runs as the existing `pioneer` Kubernetes ServiceAccount;
+- it is scheduled onto nodes labeled `node.tlon.io/planetary=true`;
+- it mounts the existing `pioneer-wid-config` ConfigMap; and
+- it projects a one-hour `ksa-token` for the `ovh-test-1` Workload Identity provider.
+
+The projected volumes provide Google ADC after a container starts. They cannot authorize the
+initial image pull because kubelet pulls images before creating or mounting container volumes. The
+pull itself therefore depends on the bare-metal nodes' existing GAR credential provider, using the
+same ServiceAccount/node path as Voyager.
+
+The audience in `steel.yaml` is specifically for `ovh-test-1`. Change it to the target
+bare-metal cluster's `WORKLOAD_IDENTITY_POOL_AUDIENCE` when deploying elsewhere; that cluster
+must also provide its corresponding `pioneer-wid-config` ConfigMap.
+
 The current self-hosted Steel MCP server hard-codes its own session limit to one. Its config must be
 patched to honor `STEEL_MAX_SESSIONS` before the sidecar will open four sessions. Keep the
 Deployment at one replica while MCP handles are process-local.

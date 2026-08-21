@@ -6,13 +6,6 @@
 #
 # Apply with:
 #   kubectl apply -f steel-browser/deploy/kubernetes/steel.yaml
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: steel
-  namespace: tlon
-automountServiceAccountToken: false
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -38,8 +31,13 @@ spec:
         app.kubernetes.io/name: steel
         app.kubernetes.io/component: browser-mcp
     spec:
-      serviceAccountName: steel
+      # Bare-metal GAR pulls use the same KSA/node credential-provider path as
+      # Voyager workloads. The projected token below is for in-container ADC;
+      # kubelet performs image pulls before volume mounts exist.
+      serviceAccountName: pioneer
       automountServiceAccountToken: false
+      nodeSelector:
+        node.tlon.io/planetary: "true"
       terminationGracePeriodSeconds: 90
       securityContext:
         seccompProfile:
@@ -82,6 +80,8 @@ spec:
               value: "20"
             - name: SESSION_TTL_MS
               value: "900000"
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /var/run/secrets/wid/credential-configuration.json
           resources:
             requests:
               cpu: "1"
@@ -117,6 +117,12 @@ spec:
               mountPath: /tmp
             - name: browser-files
               mountPath: /files
+            - name: wid-config
+              mountPath: /var/run/secrets/wid
+              readOnly: true
+            - name: ksa-token
+              mountPath: /var/run/secrets/tokens
+              readOnly: true
 
         - name: mcp
           image: us-central1-docker.pkg.dev/prod-f0181862/images/steel-mcp:latest
@@ -142,6 +148,8 @@ spec:
               value: /tmp
             - name: TMPDIR
               value: /tmp
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /var/run/secrets/wid/credential-configuration.json
           resources:
             requests:
               cpu: 100m
@@ -172,6 +180,12 @@ spec:
           volumeMounts:
             - name: mcp-tmp
               mountPath: /tmp
+            - name: wid-config
+              mountPath: /var/run/secrets/wid
+              readOnly: true
+            - name: ksa-token
+              mountPath: /var/run/secrets/tokens
+              readOnly: true
       volumes:
         # Disposable profiles and downloads are removed at session release.
         # The size limit also bounds debris left by a hard container crash.
@@ -187,6 +201,17 @@ spec:
         - name: mcp-tmp
           emptyDir:
             sizeLimit: 1Gi
+        - name: wid-config
+          configMap:
+            name: pioneer-wid-config
+        - name: ksa-token
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  audience: //iam.googleapis.com/projects/539195039066/locations/global/workloadIdentityPools/tlon-test-env-baremetal-pool/providers/ovh-test-1
+                  expirationSeconds: 3600
+                  path: ksa-token
 ---
 apiVersion: v1
 kind: Service
