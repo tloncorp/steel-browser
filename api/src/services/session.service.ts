@@ -4,7 +4,7 @@ import { mkdir, rm } from "fs/promises";
 import os from "os";
 import path, { dirname } from "path";
 import { fileURLToPath } from "url";
-import { v4 as uuidv4 } from "uuid";
+import { validate as uuidValidate, v4 as uuidv4 } from "uuid";
 import { env } from "../env.js";
 import { CredentialsOptions, SessionDetails } from "../modules/sessions/sessions.schema.js";
 import {
@@ -171,6 +171,9 @@ export class SessionService {
     caCertificates?: string[];
   }): Promise<SessionDetails> {
     const id = options.sessionId || uuidv4();
+    if (!uuidValidate(id)) {
+      throw new Error(`Invalid session ID: ${id}`);
+    }
     if (
       env.MAX_CONCURRENT_SESSIONS !== undefined &&
       this.sessions.size >= env.MAX_CONCURRENT_SESSIONS
