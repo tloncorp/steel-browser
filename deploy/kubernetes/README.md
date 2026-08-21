@@ -17,7 +17,7 @@ Build the separate MCP sidecar image from the directory containing the sibling
 docker build \
   -f steel-browser/Dockerfile.steel-mcp \
   -t us-central1-docker.pkg.dev/prod-f0181862/images/steel-mcp:latest \
-  .
+  steel-mcp-server
 docker push us-central1-docker.pkg.dev/prod-f0181862/images/steel-mcp:latest
 ```
 

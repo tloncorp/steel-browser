@@ -1,7 +1,8 @@
 # The browser image is built from this repository.
-# The MCP image is built from Dockerfile.steel-mcp with the parent directory as context:
+# The MCP image is built from Dockerfile.steel-mcp with steel-mcp-server as context:
 #   docker build -f steel-browser/Dockerfile.steel-mcp \
-#     -t us-central1-docker.pkg.dev/prod-f0181862/images/steel-mcp:latest .
+#     -t us-central1-docker.pkg.dev/prod-f0181862/images/steel-mcp:latest \
+#     steel-mcp-server
 #
 # Apply with:
 #   kubectl apply -f steel-browser/deploy/kubernetes/steel.yaml
