@@ -70,6 +70,10 @@ const envSchema = z.object({
     .default("false"),
   PROXY_INTERNAL_BYPASS: z.string().optional(),
   CHROME_USER_DATA_DIR: z.string().optional(),
+  SESSION_PROFILE_ROOT: z.string().optional(),
+  MAX_CONCURRENT_SESSIONS: z.coerce.number().int().positive().optional(),
+  MAX_RETAINED_SESSIONS: z.coerce.number().int().nonnegative().default(100),
+  SESSION_TTL_MS: z.coerce.number().int().positive().optional(),
   LOG_STORAGE_ENABLED: z
     .string()
     .optional()

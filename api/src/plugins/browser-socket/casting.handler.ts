@@ -23,7 +23,7 @@ export async function handleCastSession(
   sessionService: SessionService,
   params: Record<string, string> | undefined,
 ): Promise<void> {
-  const id = request.url?.split("/sessions/")[1].split("/cast")[0];
+  const id = params?.sessionId;
 
   if (!id) {
     console.error("Cast Session ID not found");
@@ -31,8 +31,8 @@ export async function handleCastSession(
     return;
   }
 
-  const session = await sessionService.activeSession;
-  if (!session) {
+  const session = sessionService.getSession(id);
+  if (!session || session.status !== "live") {
     console.error(`Cast Session ${id} not found`);
     socket.destroy();
     return;
@@ -173,9 +173,9 @@ export async function handleCastSession(
     };
 
     try {
-      browser = await puppeteer.connect({
-        browserWSEndpoint: `ws://${env.HOST}:${env.PORT}`,
-      });
+      const browserEndpoint = new URL(`ws://${env.HOST}:${env.PORT}`);
+      browserEndpoint.searchParams.set("sessionId", id);
+      browser = await puppeteer.connect({ browserWSEndpoint: browserEndpoint.toString() });
 
       if (!browser) {
         console.error("Failed to connect to browser");

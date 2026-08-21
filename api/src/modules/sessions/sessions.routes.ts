@@ -21,6 +21,13 @@ import {
 import { BrowserEventType, EmitEvent } from "../../types/enums.js";
 
 async function routes(server: FastifyInstance) {
+  const getRequestedCDPService = (request: FastifyRequest) => {
+    const query = request.query as { sessionId?: string };
+    const header = request.headers["x-session-id"];
+    const sessionId = query.sessionId || (Array.isArray(header) ? header[0] : header);
+    return server.sessionService.getCDPService(sessionId);
+  };
+
   server.get(
     "/health",
     {
@@ -103,8 +110,8 @@ async function routes(server: FastifyInstance) {
         },
       },
     },
-    async (request: FastifyRequest, reply: FastifyReply) =>
-      handleGetBrowserContext(server.cdpService, request, reply),
+    async (request: FastifyRequest<{ Params: { sessionId: string } }>, reply: FastifyReply) =>
+      handleGetBrowserContext(server, request, reply),
   );
 
   server.post(
@@ -120,7 +127,7 @@ async function routes(server: FastifyInstance) {
         },
       },
     },
-    async (request: FastifyRequest, reply: FastifyReply) =>
+    async (request: FastifyRequest<{ Params: { sessionId: string } }>, reply: FastifyReply) =>
       handleExitBrowserSession(server, request, reply),
   );
 
@@ -172,7 +179,7 @@ async function routes(server: FastifyInstance) {
       },
     },
     async (request: FastifyRequest<{ Body: RecordedEvents }>, reply: FastifyReply) => {
-      server.cdpService.getInstrumentationLogger().record({
+      getRequestedCDPService(request).getInstrumentationLogger().record({
         type: BrowserEventType.Recording,
         timestamp: new Date().toISOString(),
         data: request.body,
@@ -215,7 +222,7 @@ async function routes(server: FastifyInstance) {
       },
     },
     async (request: SessionsScrapeRequest, reply: FastifyReply) =>
-      handleScrape(server.sessionService, server.cdpService, request, reply),
+      handleScrape(server.sessionService, getRequestedCDPService(request), request, reply),
   );
 
   server.post(
@@ -233,7 +240,7 @@ async function routes(server: FastifyInstance) {
       },
     },
     async (request: SessionsScreenshotRequest, reply: FastifyReply) =>
-      handleScreenshot(server.sessionService, server.cdpService, request, reply),
+      handleScreenshot(server.sessionService, getRequestedCDPService(request), request, reply),
   );
 
   server.post(
@@ -251,7 +258,7 @@ async function routes(server: FastifyInstance) {
       },
     },
     async (request: SessionsPDFRequest, reply: FastifyReply) =>
-      handlePDF(server.sessionService, server.cdpService, request, reply),
+      handlePDF(server.sessionService, getRequestedCDPService(request), request, reply),
   );
 }
 

@@ -19,10 +19,13 @@ async function routes(server: FastifyInstance) {
       request: FastifyRequest<{ Querystring: z.infer<typeof cdpSchemas.GetDevtoolsUrlSchema> }>,
       reply: FastifyReply,
     ) => {
+      const cdpService = server.sessionService.getCDPService(request.query.sessionId);
+      const debuggerWsUrl = new URL(cdpService.getDebuggerWsUrl(request.query.pageId));
+      if (request.query.sessionId) {
+        debuggerWsUrl.searchParams.set("sessionId", request.query.sessionId);
+      }
       return reply.redirect(
-        `${server.cdpService.getDebuggerUrl()}?ws=${server.cdpService
-          .getDebuggerWsUrl(request.query.pageId)
-          .replace("ws:", "")}`,
+        `${cdpService.getDebuggerUrl()}?ws=${debuggerWsUrl.toString().replace("ws:", "")}`,
       );
     },
   );

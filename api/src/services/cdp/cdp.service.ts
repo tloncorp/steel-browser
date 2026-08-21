@@ -83,6 +83,7 @@ import { TimezoneFetcher } from "../timezone-fetcher.service.js";
 export class CDPService extends EventEmitter {
   private logger: FastifyBaseLogger;
   private keepAlive: boolean;
+  private cleanupFiles: boolean;
 
   private browserInstance: Browser | null;
   private wsEndpoint: string | null;
@@ -113,16 +114,17 @@ export class CDPService extends EventEmitter {
   private disconnectHandler: () => Promise<void> = () => this.endSession();
 
   constructor(
-    config: { keepAlive?: boolean },
+    config: { keepAlive?: boolean; cleanupFiles?: boolean },
     logger: FastifyBaseLogger,
     storage?: any,
     enableConsoleLogging?: boolean,
   ) {
     super();
     this.logger = logger.child({ component: "CDPService" });
-    const { keepAlive = true } = config;
+    const { keepAlive = true, cleanupFiles = true } = config;
 
     this.keepAlive = keepAlive;
+    this.cleanupFiles = cleanupFiles;
     this.browserInstance = null;
     this.wsEndpoint = null;
     this.fingerprintData = null;
@@ -476,12 +478,14 @@ export class CDPService extends EventEmitter {
       await this.browserInstance?.process()?.kill();
       await this.shutdownHook();
 
-      this.logger.info("[CDPService] Cleaning up files during shutdown");
-      try {
-        await FileService.getInstance().cleanupFiles();
-        this.logger.info("[CDPService] Files cleaned successfully");
-      } catch (error) {
-        this.logger.error(`[CDPService] Error cleaning files during shutdown: ${error}`);
+      if (this.cleanupFiles) {
+        this.logger.info("[CDPService] Cleaning up files during shutdown");
+        try {
+          await FileService.getInstance().cleanupFiles();
+          this.logger.info("[CDPService] Files cleaned successfully");
+        } catch (error) {
+          this.logger.error(`[CDPService] Error cleaning files during shutdown: ${error}`);
+        }
       }
 
       this.fingerprintData = null;
@@ -497,12 +501,14 @@ export class CDPService extends EventEmitter {
       await this.browserInstance?.process()?.kill();
       await this.shutdownHook();
 
-      try {
-        await FileService.getInstance().cleanupFiles();
-      } catch (cleanupError) {
-        this.logger.error(
-          `[CDPService] Error cleaning files during error recovery: ${cleanupError}`,
-        );
+      if (this.cleanupFiles) {
+        try {
+          await FileService.getInstance().cleanupFiles();
+        } catch (cleanupError) {
+          this.logger.error(
+            `[CDPService] Error cleaning files during error recovery: ${cleanupError}`,
+          );
+        }
       }
 
       this.browserInstance = null;
@@ -640,21 +646,23 @@ export class CDPService extends EventEmitter {
           (error) => categorizeError(error, "configuration validation"),
         );
 
-        // File cleanup - non-critical, log errors but continue
-        this.logger.info("[CDPService] Cleaning up files before browser launch");
-        await executeOptional(
-          this.logger,
-          async () => {
-            await FileService.getInstance().cleanupFiles();
-            this.logger.info("[CDPService] Files cleaned successfully before launch");
-          },
-          (error) =>
-            new CleanupError(
-              error instanceof Error ? error.message : String(error),
-              CleanupType.PRE_LAUNCH_FILE_CLEANUP,
-              error,
-            ),
-        );
+        if (this.cleanupFiles) {
+          // File cleanup - non-critical, log errors but continue
+          this.logger.info("[CDPService] Cleaning up files before browser launch");
+          await executeOptional(
+            this.logger,
+            async () => {
+              await FileService.getInstance().cleanupFiles();
+              this.logger.info("[CDPService] Files cleaned successfully before launch");
+            },
+            (error) =>
+              new CleanupError(
+                error instanceof Error ? error.message : String(error),
+                CleanupType.PRE_LAUNCH_FILE_CLEANUP,
+                error,
+              ),
+          );
+        }
 
         const { options, userAgent, userDataDir, fingerprint } = this.launchConfig;
         this.fingerprintData = fingerprint ?? null;
@@ -880,7 +888,9 @@ export class CDPService extends EventEmitter {
         const dynamicArgs = [
           this.launchConfig.dimensions ? "" : "--start-maximized",
           `--remote-debugging-address=${env.HOST}`,
-          "--remote-debugging-port=9222",
+          // Port zero lets Chrome allocate a unique loopback debugging port. This is
+          // required when multiple browser processes share a container.
+          "--remote-debugging-port=0",
           `--window-size=${this.launchConfig.dimensions?.width ?? 1920},${
             this.launchConfig.dimensions?.height ?? 1080
           }`,
@@ -1002,7 +1012,10 @@ export class CDPService extends EventEmitter {
         await executeBestEffort(
           this.logger,
           async () => {
-            const downloadPath = FileService.getInstance().getBaseFilesPath();
+            const downloadPath =
+              this.launchConfig?.options.downloadsPath ||
+              FileService.getInstance().getBaseFilesPath();
+            await fs.promises.mkdir(downloadPath, { recursive: true });
             const cdpSession = await this.browserInstance!.target().createCDPSession();
             await cdpSession.send("Browser.setDownloadBehavior", {
               behavior: "allow",
@@ -1357,8 +1370,11 @@ export class CDPService extends EventEmitter {
       await this.pluginManager.onAfterSessionEnd(sessionConfig);
     }
 
-    // Relaunch the idle browser
-    await this.launch(this.defaultLaunchConfig);
+    // The default service keeps an idle browser warm. Session-scoped services are
+    // disposable and must not launch a replacement browser after release.
+    if (this.keepAlive) {
+      await this.launch(this.defaultLaunchConfig);
+    }
   }
 
   private async onDisconnect(): Promise<void> {

@@ -8,6 +8,8 @@ import { FileService } from "../services/file.service.js";
 declare module "fastify" {
   interface FastifyRequest {}
   interface FastifyInstance {
+    cdpService: CDPService;
+    createCDPService: (config?: { keepAlive?: boolean; cleanupFiles?: boolean }) => CDPService;
     seleniumService: SeleniumService;
     sessionService: SessionService;
     fileService: FileService;

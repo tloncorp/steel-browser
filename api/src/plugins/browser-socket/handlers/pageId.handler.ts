@@ -5,6 +5,7 @@ import { WebSocketHandler, WebSocketHandlerContext } from "../../../types/websoc
 
 function handlePageIdWebSocket(context: WebSocketHandlerContext, ws: WebSocket) {
   const { fastify } = context;
+  const cdpService = fastify.sessionService.getCDPService(context.params.sessionId);
 
   const messageHandler = (payload: { pageId: string }) => {
     if (ws.readyState === WebSocket.OPEN) {
@@ -12,7 +13,7 @@ function handlePageIdWebSocket(context: WebSocketHandlerContext, ws: WebSocket) 
     }
   };
 
-  fastify.cdpService.on("pageId", messageHandler);
+  cdpService.on("pageId", messageHandler);
 
   ws.on("error", (err) => {
     fastify.log.error({ err }, "PageId WebSocket error");
@@ -20,7 +21,7 @@ function handlePageIdWebSocket(context: WebSocketHandlerContext, ws: WebSocket) 
 
   ws.on("close", () => {
     fastify.log.info("PageId WebSocket connection closed");
-    fastify.cdpService.removeListener("pageId", messageHandler);
+    cdpService.removeListener("pageId", messageHandler);
   });
 }
 

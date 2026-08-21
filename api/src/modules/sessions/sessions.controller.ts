@@ -1,9 +1,14 @@
-import { CDPService } from "../../services/cdp/cdp.service.js";
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { getErrors } from "../../utils/errors.js";
-import { CreateSessionRequest, SessionDetails, SessionStreamRequest } from "./sessions.schema.js";
 import { CookieData } from "../../services/context/types.js";
-import { getUrl, getBaseUrl } from "../../utils/url.js";
+import { getErrors } from "../../utils/errors.js";
+import { getBaseUrl, getUrl } from "../../utils/url.js";
+import { CreateSessionRequest, SessionDetails, SessionStreamRequest } from "./sessions.schema.js";
+
+const sessionUrl = (url: string, sessionId: string): string => {
+  const parsed = new URL(url);
+  parsed.searchParams.set("sessionId", sessionId);
+  return parsed.toString();
+};
 
 export const handleLaunchBrowserSession = async (
   server: FastifyInstance,
@@ -30,6 +35,7 @@ export const handleLaunchBrowserSession = async (
       skipFingerprintInjection,
       userPreferences,
       deviceConfig,
+      fullscreen,
       headless,
     } = request.body;
 
@@ -55,12 +61,18 @@ export const handleLaunchBrowserSession = async (
       skipFingerprintInjection,
       userPreferences,
       deviceConfig,
+      fullscreen,
       headless,
     });
   } catch (e: unknown) {
-    server.log.error({ err: e }, "Failed lauching browser session");
+    server.log.error({ err: e }, "Failed launching browser session");
     const error = getErrors(e);
-    return reply.code(500).send({ success: false, message: error });
+    const status = error.includes("already exists")
+      ? 409
+      : error.includes("Maximum concurrent")
+      ? 429
+      : 500;
+    return reply.code(status).send({ success: false, message: error });
   }
 };
 
@@ -70,22 +82,34 @@ export const handleExitBrowserSession = async (
   reply: FastifyReply,
 ) => {
   try {
-    const sessionDetails = await server.sessionService.endSession();
-
+    const params = request.params as { sessionId?: string } | undefined;
+    const sessionDetails = await server.sessionService.endSession(params?.sessionId);
     reply.send({ success: true, ...sessionDetails });
-  } catch (e: any) {
+  } catch (e: unknown) {
     const error = getErrors(e);
-    return reply.code(500).send({ success: false, message: error });
+    const status =
+      error.includes("not found") || error.includes("No active")
+        ? 404
+        : error.includes("sessionId is required")
+        ? 400
+        : 500;
+    return reply.code(status).send({ success: false, message: error });
   }
 };
 
 export const handleGetBrowserContext = async (
-  browserService: CDPService,
-  request: FastifyRequest,
+  server: FastifyInstance,
+  request: FastifyRequest<{ Params: { sessionId: string } }>,
   reply: FastifyReply,
 ) => {
-  const context = await browserService.getBrowserState();
-  return reply.send(context);
+  try {
+    const context = await server.sessionService
+      .getCDPService(request.params.sessionId)
+      .getBrowserState();
+    return reply.send(context);
+  } catch (e: unknown) {
+    return reply.code(404).send({ message: getErrors(e) });
+  }
 };
 
 export const handleGetSessionDetails = async (
@@ -94,49 +118,39 @@ export const handleGetSessionDetails = async (
   reply: FastifyReply,
 ) => {
   const sessionId = request.params.sessionId;
-  if (sessionId !== server.sessionService.activeSession.id) {
-    return reply.send({
-      id: sessionId,
-      createdAt: new Date().toISOString(),
-      status: "released",
-      duration: 0,
-      eventCount: 0,
-      timeout: 0,
-      creditsUsed: 0,
-      websocketUrl: getBaseUrl("ws"),
-      debugUrl: getUrl("v1/sessions/debug"),
-      debuggerUrl: getUrl("v1/devtools/inspector.html"),
-      sessionViewerUrl: getBaseUrl(),
-      userAgent: "",
-      isSelenium: false,
-      proxy: "",
-      proxyTxBytes: 0,
-      proxyRxBytes: 0,
-      solveCaptcha: false,
-    } as SessionDetails);
-  }
+  const session = server.sessionService.getSession(sessionId);
+  if (session) return reply.send(session);
 
-  const session = server.sessionService.activeSession;
-  const duration = new Date().getTime() - new Date(session.createdAt).getTime();
-  console.log("duration", duration);
+  // Preserve the historical response shape for unknown/released IDs.
   return reply.send({
-    ...session,
-    duration,
-  });
+    id: sessionId,
+    createdAt: new Date().toISOString(),
+    status: "released",
+    duration: 0,
+    eventCount: 0,
+    timeout: 0,
+    creditsUsed: 0,
+    websocketUrl: sessionUrl(getBaseUrl("ws"), sessionId),
+    debugUrl: sessionUrl(getUrl("v1/sessions/debug"), sessionId),
+    debuggerUrl: sessionUrl(getUrl("v1/devtools/inspector.html"), sessionId),
+    sessionViewerUrl: sessionUrl(getBaseUrl(), sessionId),
+    userAgent: "",
+    isSelenium: false,
+    proxy: "",
+    proxyTxBytes: 0,
+    proxyRxBytes: 0,
+    solveCaptcha: false,
+  } as SessionDetails);
 };
 
 export const handleGetSessions = async (
   server: FastifyInstance,
-  request: FastifyRequest,
+  _request: FastifyRequest,
   reply: FastifyReply,
 ) => {
-  const currentSession = {
-    ...server.sessionService.activeSession,
-    duration:
-      new Date().getTime() - new Date(server.sessionService.activeSession.createdAt).getTime(),
-  };
-  const pastSessions = server.sessionService.pastSessions;
-  return reply.send({ sessions: [currentSession, ...pastSessions] });
+  return reply.send({
+    sessions: [...server.sessionService.getActiveSessions(), ...server.sessionService.pastSessions],
+  });
 };
 
 export const handleGetSessionStream = async (
@@ -144,24 +158,29 @@ export const handleGetSessionStream = async (
   request: SessionStreamRequest,
   reply: FastifyReply,
 ) => {
-  const { showControls, theme, interactive, pageId, pageIndex } = request.query;
-
-  const singlePageMode = !!(pageId || pageIndex);
-
-  // Construct WebSocket URL with page parameters if present
-  let wsUrl = getUrl("v1/sessions/cast", "ws");
-  if (pageId) {
-    wsUrl += `?pageId=${encodeURIComponent(pageId)}`;
-  } else if (pageIndex) {
-    wsUrl += `?pageIndex=${encodeURIComponent(pageIndex)}`;
+  const { sessionId, showControls, theme, interactive, pageId, pageIndex } = request.query;
+  if (!sessionId && server.sessionService.getActiveSessions().length > 1) {
+    return reply.code(400).send("sessionId is required when multiple sessions are active");
+  }
+  const session = sessionId
+    ? server.sessionService.getSession(sessionId)
+    : server.sessionService.activeSession;
+  if (!session || session.status !== "live") {
+    return reply.code(404).send("Session not found");
   }
 
+  const singlePageMode = !!(pageId || pageIndex);
+  const wsUrl = new URL(getUrl("v1/sessions/cast", "ws"));
+  wsUrl.searchParams.set("sessionId", session.id);
+  if (pageId) wsUrl.searchParams.set("pageId", pageId);
+  else if (pageIndex) wsUrl.searchParams.set("pageIndex", pageIndex);
+
   return reply.view("live-session-streamer.ejs", {
-    wsUrl,
+    wsUrl: wsUrl.toString(),
     showControls,
     theme,
     interactive,
-    dimensions: server.sessionService.activeSession.dimensions,
+    dimensions: session.dimensions,
     singlePageMode,
   });
 };
@@ -172,15 +191,18 @@ export const handleGetSessionLiveDetails = async (
   reply: FastifyReply,
 ) => {
   try {
-    const pages = await server.cdpService.getAllPages();
+    const session = server.sessionService.getSession(request.params.id);
+    if (!session || session.status !== "live") {
+      return reply.code(404).send({ message: `Session ${request.params.id} not found` });
+    }
+    const cdpService = server.sessionService.getCDPService(request.params.id);
+    const pages = await cdpService.getAllPages();
 
     const pagesInfo = await Promise.all(
       pages.map(async (page) => {
         try {
           const pageId = page.target()._targetId;
-
           const title = await page.title();
-
           let favicon: string | null = null;
           try {
             favicon = await page.evaluate(() => {
@@ -196,45 +218,38 @@ export const handleGetSessionLiveDetails = async (
               }
               return null;
             });
-          } catch (error) {}
+          } catch {}
 
-          return {
-            id: pageId,
-            url: page.url(),
-            title,
-            favicon,
-          };
+          return { id: pageId, url: page.url(), title, favicon };
         } catch (error) {
-          console.error("Error collecting page info:", error);
+          server.log.error({ err: error }, "Error collecting page info");
           return null;
         }
       }),
     );
 
     const validPagesInfo = pagesInfo.filter((page) => page !== null);
-
-    const browserVersion = await server.cdpService.getBrowserState();
-
-    const browserState = {
-      status: server.sessionService.activeSession.status,
-      userAgent: server.sessionService.activeSession.userAgent,
-      browserVersion,
-      initialDimensions: server.sessionService.activeSession.dimensions || {
-        width: 1920,
-        height: 1080,
-      },
-      pageCount: validPagesInfo.length,
-    };
+    const browserVersion = await cdpService.getBrowserState();
+    const viewerUrl = new URL(session.sessionViewerUrl);
 
     return reply.send({
       pages: validPagesInfo,
-      browserState,
-      websocketUrl: server.sessionService.activeSession.websocketUrl,
-      sessionViewerUrl: server.sessionService.activeSession.sessionViewerUrl,
-      sessionViewerFullscreenUrl: `${server.sessionService.activeSession.sessionViewerUrl}?showControls=false`,
+      browserState: {
+        status: session.status,
+        userAgent: session.userAgent,
+        browserVersion,
+        initialDimensions: session.dimensions || { width: 1920, height: 1080 },
+        pageCount: validPagesInfo.length,
+      },
+      websocketUrl: session.websocketUrl,
+      sessionViewerUrl: session.sessionViewerUrl,
+      sessionViewerFullscreenUrl: (() => {
+        viewerUrl.searchParams.set("showControls", "false");
+        return viewerUrl.toString();
+      })(),
     });
   } catch (error) {
-    console.error("Error getting session state:", error);
+    server.log.error({ err: error }, "Error getting session state");
     return reply.code(500).send({
       message: "Failed to get session state",
       error: getErrors(error),

@@ -14,6 +14,7 @@ import { env } from "../env.js";
 declare module "fastify" {
   interface FastifyInstance {
     cdpService: CDPService;
+    createCDPService: (config?: { keepAlive?: boolean; cleanupFiles?: boolean }) => CDPService;
     registerCDPLaunchHook: (hook: (config: BrowserLauncherOptions) => Promise<void> | void) => void;
     registerCDPShutdownHook: (
       hook: (config: BrowserLauncherOptions | null) => Promise<void> | void,
@@ -53,17 +54,29 @@ const browserInstancePlugin: FastifyPluginAsync = async (fastify, _options) => {
   }
 
   const cdpService = new CDPService({}, fastify.log, storage, enableConsoleLogging);
+  const launchHooks: Array<(config: BrowserLauncherOptions) => Promise<void> | void> = [];
+  const shutdownHooks: Array<(config: BrowserLauncherOptions | null) => Promise<void> | void> = [];
+
+  const createCDPService = (config: { keepAlive?: boolean; cleanupFiles?: boolean } = {}) => {
+    const service = new CDPService(config, fastify.log, storage, enableConsoleLogging);
+    launchHooks.forEach((hook) => service.registerLaunchHook(hook));
+    shutdownHooks.forEach((hook) => service.registerShutdownHook(hook));
+    return service;
+  };
 
   fastify.decorate("cdpService", cdpService);
+  fastify.decorate("createCDPService", createCDPService);
   fastify.decorate(
     "registerCDPLaunchHook",
     (hook: (config: BrowserLauncherOptions) => Promise<void> | void) => {
+      launchHooks.push(hook);
       cdpService.registerLaunchHook(hook);
     },
   );
   fastify.decorate(
     "registerCDPShutdownHook",
     (hook: (config: BrowserLauncherOptions | null) => Promise<void> | void) => {
+      shutdownHooks.push(hook);
       cdpService.registerShutdownHook(hook);
     },
   );

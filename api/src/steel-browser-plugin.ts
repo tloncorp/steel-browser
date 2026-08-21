@@ -32,6 +32,7 @@ declare module "fastify" {
   interface FastifyInstance {
     steelBrowserConfig: SteelBrowserConfig;
     cdpService: CDPService;
+    createCDPService: (config?: { keepAlive?: boolean; cleanupFiles?: boolean }) => CDPService;
     sessionService: SessionService;
     webSocketRegistry: WebSocketRegistryService;
     registerCDPLaunchHook: (hook: (config: BrowserLauncherOptions) => Promise<void> | void) => void;

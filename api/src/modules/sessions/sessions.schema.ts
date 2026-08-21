@@ -135,6 +135,7 @@ const RecordedEvents = z.object({
 });
 
 const SessionStreamQuery = z.object({
+  sessionId: z.string().uuid().optional().describe("Session to stream"),
   showControls: z
     .boolean()
     .optional()
