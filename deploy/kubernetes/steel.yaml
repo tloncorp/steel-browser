@@ -1,0 +1,228 @@
+# The browser image is built from this repository.
+# The MCP image is built from Dockerfile.steel-mcp with the parent directory as context:
+#   docker build -f steel-browser/Dockerfile.steel-mcp \
+#     -t us-central1-docker.pkg.dev/prod-f0181862/images/steel-mcp:latest .
+#
+# Apply with:
+#   kubectl apply -f steel-browser/deploy/kubernetes/steel.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: steel
+  namespace: tlon
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: steel
+  namespace: tlon
+  labels:
+    app.kubernetes.io/name: steel
+    app.kubernetes.io/component: browser-mcp
+spec:
+  # The MCP handle registry is process-local. Keep this at one until the MCP
+  # server uses a shared registry and requests have session-aware routing.
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: steel
+      app.kubernetes.io/component: browser-mcp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: steel
+        app.kubernetes.io/component: browser-mcp
+    spec:
+      serviceAccountName: steel
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: browser
+          image: us-central1-docker.pkg.dev/prod-f0181862/images/steel-browser:latest
+          imagePullPolicy: Always
+          ports:
+            - name: browser
+              containerPort: 3000
+              protocol: TCP
+            - name: devtools
+              containerPort: 9223
+              protocol: TCP
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: HOST
+              value: 0.0.0.0
+            - name: PORT
+              value: "3000"
+            # All browser connections are consumed by the MCP sidecar over
+            # loopback; the Service intentionally does not expose this port.
+            - name: DOMAIN
+              value: 127.0.0.1:3000
+            - name: CDP_DOMAIN
+              value: 127.0.0.1:9223
+            - name: CHROME_HEADLESS
+              value: "true"
+            - name: DISABLE_CHROME_SANDBOX
+              value: "true"
+            - name: LOG_STORAGE_ENABLED
+              value: "false"
+            - name: SESSION_PROFILE_ROOT
+              value: /var/lib/steel/sessions
+            - name: MAX_CONCURRENT_SESSIONS
+              value: "4"
+            - name: MAX_RETAINED_SESSIONS
+              value: "20"
+            - name: SESSION_TTL_MS
+              value: "900000"
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+              ephemeral-storage: 2Gi
+            limits:
+              cpu: "4"
+              memory: 6Gi
+              ephemeral-storage: 12Gi
+          startupProbe:
+            httpGet:
+              path: /v1/health
+              port: browser
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: browser
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: session-profiles
+              mountPath: /var/lib/steel/sessions
+            - name: browser-tmp
+              mountPath: /tmp
+            - name: browser-files
+              mountPath: /files
+
+        - name: mcp
+          image: us-central1-docker.pkg.dev/prod-f0181862/images/steel-mcp:latest
+          imagePullPolicy: Always
+          ports:
+            - name: mcp
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: STEEL_LOCAL
+              value: "true"
+            - name: STEEL_BASE_URL
+              value: http://127.0.0.1:3000
+            - name: STEEL_CONNECT_URL
+              value: ws://127.0.0.1:3000
+            - name: STEEL_MAX_SESSIONS
+              value: "4"
+            - name: STEEL_SESSION_TIMEOUT_MS
+              value: "900000"
+            - name: STEEL_INACTIVITY_TIMEOUT_MS
+              value: "300000"
+            - name: HOME
+              value: /tmp
+            - name: TMPDIR
+              value: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+              ephemeral-storage: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+              ephemeral-storage: 1Gi
+          startupProbe:
+            tcpSocket:
+              port: mcp
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            tcpSocket:
+              port: mcp
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: mcp-tmp
+              mountPath: /tmp
+      volumes:
+        # Disposable profiles and downloads are removed at session release.
+        # The size limit also bounds debris left by a hard container crash.
+        - name: session-profiles
+          emptyDir:
+            sizeLimit: 8Gi
+        - name: browser-tmp
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: browser-files
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: mcp-tmp
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: steel-mcp
+  namespace: tlon
+  labels:
+    app.kubernetes.io/name: steel
+    app.kubernetes.io/component: browser-mcp
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: steel
+    app.kubernetes.io/component: browser-mcp
+  ports:
+    - name: mcp
+      port: 8000
+      targetPort: mcp
+      protocol: TCP
+---
+# Only workloads in the tlon namespace can reach the MCP service. Browser and
+# DevTools ports remain inaccessible over the pod network.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: steel-mcp-ingress
+  namespace: tlon
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: steel
+      app.kubernetes.io/component: browser-mcp
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 8000
+          protocol: TCP
