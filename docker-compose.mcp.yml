@@ -1,0 +1,16 @@
+services:
+  steel-mcp:
+    build:
+      context: ..
+      dockerfile: steel-browser/Dockerfile.steel-mcp
+    ports:
+      - "8000:8000"
+    environment:
+      STEEL_LOCAL: "true"
+      STEEL_BASE_URL: http://api:3000
+    depends_on:
+      api:
+        condition: service_started
+    networks:
+      - steel-network
+    restart: unless-stopped
