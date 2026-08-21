@@ -116,7 +116,7 @@ We welcome contributions to improve our documentation! Here's how you can help:
 - **API/Backend** → [Architecture](ARCHITECTURE.md) + [API Docs](http://localhost:3000/documentation)
 - **Frontend/UI** → [Architecture](ARCHITECTURE.md) + UI source code
 - **Plugins** → [Plugin Development Guide](PLUGIN_DEVELOPMENT.md)
-- **Docker** → [Development Setup](DEVELOPMENT_SETUP.md) + [Troubleshooting](TROUBLESHOOTING.md)
+- **Docker** → [Development Setup](DEVELOPMENT_SETUP.md) + [Multi-session deployment](MULTI_SESSION.md) + [Troubleshooting](TROUBLESHOOTING.md)
 
 ## 📋 Documentation Roadmap
 
@@ -160,4 +160,4 @@ Our documentation aims to be:
 
 **Happy learning and building with Steel Browser!** 🚀
 
-*Last updated: [Current Date] - If you notice outdated information, please let us know!* 
+_Last updated: [Current Date] - If you notice outdated information, please let us know!_
