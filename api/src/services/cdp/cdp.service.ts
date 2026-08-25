@@ -147,13 +147,14 @@ export class CDPService extends EventEmitter {
 
     // Initialize timezone fetcher for cold start
     const timezoneFetcher = new TimezoneFetcher(logger);
-    const coldStartTimezone = timezoneFetcher.getTimezone(undefined, this.defaultTimezone);
+    const coldStartTimezone = timezoneFetcher.getTimezone(env.PROXY_URL, this.defaultTimezone);
 
     this.defaultLaunchConfig = {
       options: {
         headless: env.CHROME_HEADLESS,
         args: [],
         ignoreDefaultArgs: ["--enable-automation"],
+        proxyUrl: env.PROXY_URL,
       },
       blockAds: true,
       extensions: [],

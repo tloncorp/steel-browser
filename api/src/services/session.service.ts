@@ -187,8 +187,8 @@ export class SessionService {
       throw new Error("Only one Selenium session can run at a time");
     }
 
+    const proxyUrl = options.proxyUrl ?? env.PROXY_URL;
     const {
-      proxyUrl,
       userAgent,
       sessionContext,
       extensions,

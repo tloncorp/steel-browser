@@ -28,6 +28,18 @@ kubectl apply -f steel-browser/deploy/kubernetes/steel.yaml
 kubectl -n tlon rollout status deployment/steel
 ```
 
+The test viewer is published at `browser-session-ovh-test-1.test.tlon.systems`. Production uses
+one single-label wildcard hostname per cluster: `browser-session-ovh1.tlon.network`,
+`browser-session-ovh2.tlon.network`, `browser-session-ovh3.tlon.network`, or
+`browser-session-east5.tlon.network`.
+
+Render the production manifest for the target cluster instead of applying `steel.prod.yaml`
+directly:
+
+```sh
+steel-browser/deploy/kubernetes/render-steel-prod.sh ovh1 | kubectl apply -f -
+```
+
 Configure each Urbit MCP desk with:
 
 ```text

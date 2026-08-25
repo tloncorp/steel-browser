@@ -3,6 +3,10 @@
 #   docker build -f steel-browser/Dockerfile.steel-mcp \
 #     -t us-central1-docker.pkg.dev/prod-f0181862/images/steel-mcp:latest \
 #     steel-mcp-server
+# The public viewer gateway is built from this repository:
+#   docker build -f steel-browser/Dockerfile.session-viewer \
+#     -t us-central1-docker.pkg.dev/prod-f0181862/images/session-viewer:latest \
+#     steel-browser
 #
 # Apply with:
 #   kubectl apply -f steel-browser/deploy/kubernetes/steel.yaml
@@ -42,6 +46,87 @@ spec:
       securityContext:
         seccompProfile:
           type: RuntimeDefault
+      initContainers:
+        - name: wireproxy-config
+          image: busybox:1.36.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              sed -E 's/^(Address[[:space:]]*=[[:space:]]*[0-9.]+)$/\1\/32/' \
+                /secret/wg0.conf > /config/wireproxy.conf
+              if ! grep -q '^PersistentKeepalive[[:space:]]*=' /config/wireproxy.conf; then
+                sed -i '/^Endpoint[[:space:]]*=/a PersistentKeepalive = 25' /config/wireproxy.conf
+              fi
+              printf '\n[Socks5]\nBindAddress = 127.0.0.1:1080\n' >> /config/wireproxy.conf
+              chmod 444 /config/wireproxy.conf
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: wireguard-config
+              mountPath: /config
+            - name: wireguard-secret
+              mountPath: /secret
+              readOnly: true
+        # Native userspace sidecar: standard WireGuard peer config in, a
+        # loopback SOCKS5 endpoint for Chromium out. It changes no pod routes.
+        - name: egress-wireproxy
+          image: us-central1-docker.pkg.dev/prod-f0181862/images/wireproxy:latest
+          imagePullPolicy: Always
+          restartPolicy: Always
+          args:
+            - --silent
+            - --config
+            - /config/wireproxy.conf
+            - --info
+            # Kubelet probes arrive on the pod IP, so expose only the
+            # non-proxy info listener there. SOCKS remains loopback-only.
+            - 0.0.0.0:9080
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          startupProbe:
+            tcpSocket:
+              port: 9080
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            tcpSocket:
+              port: 9080
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: wireguard-config
+              mountPath: /config
+              readOnly: true
       containers:
         - name: browser
           image: us-central1-docker.pkg.dev/prod-f0181862/images/steel-browser:latest
@@ -65,15 +150,21 @@ spec:
             # All browser connections are consumed by the MCP sidecar over
             # loopback; the Service intentionally does not expose this port.
             - name: DOMAIN
-              value: 127.0.0.1:3000
+              value: browser-session-ovh1.tlon.network
+            - name: USE_SSL
+              value: "true"
             - name: CDP_DOMAIN
-              value: 127.0.0.1:3000
+              value: browser-session-ovh1.tlon.network
             - name: CHROME_HEADLESS
               value: "true"
             - name: DISABLE_CHROME_SANDBOX
               value: "true"
             - name: LOG_STORAGE_ENABLED
               value: "false"
+            # wireproxy is an unprivileged userspace WireGuard client. Only
+            # Chromium uses its loopback SOCKS endpoint; pod routes are intact.
+            - name: PROXY_URL
+              value: socks5://127.0.0.1:1080
             - name: SESSION_PROFILE_ROOT
               value: /var/lib/steel/sessions
             - name: MAX_CONCURRENT_SESSIONS
@@ -145,7 +236,9 @@ spec:
             - name: STEEL_LOCAL
               value: "true"
             - name: STEEL_BASE_URL
-              value: http://127.0.0.1:3000
+              # The loopback viewer manager rewrites session connection
+              # details while keeping the browser REST API private.
+              value: http://127.0.0.1:3001
             - name: STEEL_CONNECT_URL
               value: ws://127.0.0.1:3000
             - name: STEEL_MAX_SESSIONS
@@ -198,6 +291,76 @@ spec:
             - name: ksa-token
               mountPath: /var/run/secrets/tokens
               readOnly: true
+
+        - name: session-viewer
+          image: us-central1-docker.pkg.dev/prod-f0181862/images/session-viewer:latest
+          imagePullPolicy: Always
+          ports:
+            - name: viewer
+              containerPort: 8080
+              protocol: TCP
+            - name: viewer-internal
+              containerPort: 3001
+              protocol: TCP
+          env:
+            - name: SESSION_VIEWER_PUBLIC_ORIGIN
+              value: https://browser-session-ovh1.tlon.network
+            - name: SESSION_VIEWER_UPSTREAM_ORIGIN
+              value: http://127.0.0.1:3000
+            - name: SESSION_VIEWER_INTERNAL_HOST
+              value: 127.0.0.1
+            - name: SESSION_VIEWER_INTERNAL_PORT
+              value: "3001"
+            - name: SESSION_VIEWER_PUBLIC_HOST
+              value: 0.0.0.0
+            - name: SESSION_VIEWER_PUBLIC_PORT
+              value: "8080"
+            - name: SESSION_VIEWER_MAX_TTL_MS
+              value: "900000"
+            - name: SESSION_VIEWER_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: session-viewer-secrets
+                  key: signing-key
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+              ephemeral-storage: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+              ephemeral-storage: 128Mi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: viewer
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: viewer
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: viewer
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop:
+                - ALL
       volumes:
         # Disposable profiles and downloads are removed at session release.
         # The size limit also bounds debris left by a hard container crash.
@@ -213,6 +376,13 @@ spec:
         - name: mcp-tmp
           emptyDir:
             sizeLimit: 1Gi
+        - name: wireguard-config
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: wireguard-secret
+          secret:
+            secretName: steel-wireguard
+            defaultMode: 384
         - name: wid-config
           configMap:
             name: pioneer-wid-config
@@ -244,8 +414,79 @@ spec:
       targetPort: mcp
       protocol: TCP
 ---
-# Only workloads in the tlon namespace can reach the MCP service. Browser and
-# DevTools ports remain inaccessible over the pod network.
+apiVersion: v1
+kind: Service
+metadata:
+  name: session-viewer
+  namespace: tlon
+  labels:
+    app.kubernetes.io/name: session-viewer
+    app.kubernetes.io/component: browser-viewer
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: steel
+    app.kubernetes.io/component: browser-mcp
+  ports:
+    - name: viewer
+      port: 8080
+      targetPort: viewer
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: session-viewer
+  namespace: tlon
+  labels:
+    app.kubernetes.io/name: session-viewer
+    app.kubernetes.io/component: browser-viewer
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-production-dns01
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/configuration-snippet: |-
+      add_header X-Accel-Buffering off;
+      proxy_cache off;
+      chunked_transfer_encoding off;
+      more_clear_headers 'Server';
+      more_set_headers 'X-Accel-Buffering: off';
+      more_set_headers 'X-Frame-Options: SAMEORIGIN';
+      more_set_headers 'Expect-CT: enforce, max-age=31536000';
+      more_set_headers 'Referrer-Policy: no-referrer';
+      more_set_headers "Content-Security-Policy: default-src data: blob: 'unsafe-inline' 'unsafe-eval' *; worker-src 'self' blob: data: *;";
+    nginx.ingress.kubernetes.io/connection-proxy-header: ""
+    nginx.ingress.kubernetes.io/enable-access-log: "false"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
+    nginx.ingress.kubernetes.io/limit-connections: "100"
+    nginx.ingress.kubernetes.io/limit-rps: "200"
+    nginx.ingress.kubernetes.io/proxy-body-size: 1m
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "960"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "480"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: browser-session-ovh1.tlon.network
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: session-viewer
+                port:
+                  name: viewer
+  tls:
+    - hosts:
+        - browser-session-ovh1.tlon.network
+      secretName: tlon-public-wildcard-tls
+---
+# Only workloads in the tlon namespace can reach MCP. Browser and internal
+# manager ports remain inaccessible; the public viewer requires a capability.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -263,4 +504,9 @@ spec:
         - podSelector: {}
       ports:
         - port: 8000
+          protocol: TCP
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - port: 8080
           protocol: TCP
