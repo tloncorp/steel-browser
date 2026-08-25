@@ -21,6 +21,13 @@ docker build \
 docker push us-central1-docker.pkg.dev/test-61eb624c/images/steel-mcp:latest
 ```
 
+The `Build browser images` GitHub Actions workflow builds and publishes `steel-browser`,
+`steel-mcp`, and `session-viewer` together. Run it manually, choose `test` or `prod`, and provide
+the published Steel MCP branch, tag, or SHA. Each GitHub Environment must expose its GAR service
+account JSON as the `GKE_SA_KEY` secret. The workflow pushes both a shared immutable tag and
+`latest` to that environment's `images` repository. It checks out the requested `mcp_ref` from
+`tloncorp/steel-mcp-server` using the `TLONBOT_READ` secret.
+
 Deploy and wait for readiness:
 
 ```sh
