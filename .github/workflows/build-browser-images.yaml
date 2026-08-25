@@ -1,0 +1,134 @@
+name: Build browser images
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GAR environment to publish to
+        required: true
+        type: choice
+        options:
+          - test
+          - prod
+        default: test
+      mcp_ref:
+        description: Branch, tag, or SHA in tloncorp/steel-mcp-server
+        required: true
+        type: string
+        default: tlon/x-api-key-tenancy
+      image_tag:
+        description: Optional shared image tag; defaults to the Steel Browser short SHA
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: browser-images-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    name: Build and push browser images (${{ inputs.environment }})
+    environment: ${{ inputs.environment }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      GAR_LOCATION: us-central1
+      PROJECT_ID: ${{ inputs.environment == 'prod' && 'prod-f0181862' || 'test-61eb624c' }}
+      GAR_REPOSITORY: images
+
+    steps:
+      - name: Check out Steel Browser
+        uses: actions/checkout@v4
+        with:
+          path: steel-browser
+
+      - name: Check out Steel MCP
+        uses: actions/checkout@v4
+        with:
+          repository: tloncorp/steel-mcp-server
+          ref: ${{ inputs.mcp_ref }}
+          path: steel-mcp-server
+          token: ${{ secrets.TLONBOT_READ }}
+
+      - name: Select image tag
+        id: image
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            tag="$REQUESTED_TAG"
+          else
+            tag="$(git -C steel-browser rev-parse --short HEAD)"
+          fi
+          if [[ ! "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "Invalid container image tag: $tag" >&2
+            exit 2
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Google Artifact Registry
+        shell: bash
+        env:
+          GHA_SA_KEY: ${{ secrets.GKE_SA_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHA_SA_KEY" | docker login \
+            "${GAR_LOCATION}-docker.pkg.dev" \
+            --username _json_key \
+            --password-stdin
+
+      - name: Build images
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          set -euo pipefail
+          registry="${GAR_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${GAR_REPOSITORY}"
+
+          docker build \
+            --file steel-browser/Dockerfile \
+            --tag "${registry}/steel-browser:${IMAGE_TAG}" \
+            --tag "${registry}/steel-browser:latest" \
+            steel-browser
+
+          docker build \
+            --file steel-browser/Dockerfile.steel-mcp \
+            --tag "${registry}/steel-mcp:${IMAGE_TAG}" \
+            --tag "${registry}/steel-mcp:latest" \
+            steel-mcp-server
+
+          docker build \
+            --file steel-browser/Dockerfile.session-viewer \
+            --tag "${registry}/session-viewer:${IMAGE_TAG}" \
+            --tag "${registry}/session-viewer:latest" \
+            steel-browser
+
+      - name: Push images
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          set -euo pipefail
+          registry="${GAR_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${GAR_REPOSITORY}"
+          for image in steel-browser steel-mcp session-viewer; do
+            docker push "${registry}/${image}:${IMAGE_TAG}"
+            docker push "${registry}/${image}:latest"
+          done
+
+      - name: Publish build summary
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          registry="${GAR_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${GAR_REPOSITORY}"
+          {
+            echo '### Published browser images'
+            echo
+            for image in steel-browser steel-mcp session-viewer; do
+              echo "- \`${registry}/${image}:${IMAGE_TAG}\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
