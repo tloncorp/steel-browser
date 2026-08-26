@@ -508,7 +508,7 @@
           let activeTabId = null;
 
           // WebSocket connection management
-          const baseWsUrl = '<%= wsUrl %>';
+          const baseWsUrl = <%- JSON.stringify(wsUrl) %>;
           let tabDiscoveryWebSocket = null; // WebSocket for discovering tabs (multi-page mode)
           let activeConnectionRetries = {}; // Track reconnection attempts
 
