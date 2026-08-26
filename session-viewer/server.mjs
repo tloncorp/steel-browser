@@ -285,15 +285,14 @@ export function createGateway(config) {
       const capability = verifyCapability(entry[1], config.secret);
       if (!capability) return sendPublicError(response, 401, "Viewer link is invalid or expired.");
       const maxAge = Math.max(1, Math.floor((capability.expiresAt - Date.now()) / 1000));
-      response.writeHead(302, {
-        location: `/viewer?sessionId=${encodeURIComponent(capability.sessionId)}`,
-        "set-cookie": `${cookieName(capability.sessionId)}=${entry[1]}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Strict`,
-        "cache-control": "no-store",
-        "referrer-policy": "no-referrer",
-        "x-content-type-options": "nosniff",
+      response.setHeader(
+        "set-cookie",
+        `${cookieName(capability.sessionId)}=${entry[1]}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Strict`,
+      );
+      return proxyHttp(request, response, safeViewerTarget(request.url, capability.sessionId, upstreamOrigin), {
+        publicResponse: true,
+        stripCredentials: true,
       });
-      response.end();
-      return;
     }
 
     if (request.method === "GET" && url.pathname === "/viewer") {

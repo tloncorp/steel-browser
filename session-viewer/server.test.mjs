@@ -132,24 +132,20 @@ test("the public listener exposes only a capability-scoped viewer", async (conte
   assert.equal(denied.status, 404);
 
   const entryPath = new URL(created.sessionViewerUrl).pathname;
-  const entry = await fetch(`${publicBase}${entryPath}`, { redirect: "manual" });
-  assert.equal(entry.status, 302);
-  assert.equal(entry.headers.get("location"), `/viewer?sessionId=${sessionId}`);
-  assert.match(entry.headers.get("set-cookie"), /^sv_[0-9a-f]+=.+; Path=\/;/);
-  assert.match(entry.headers.get("set-cookie"), /HttpOnly; Secure; SameSite=Strict$/);
-
-  const cookie = entry.headers.get("set-cookie").split(";", 1)[0];
-  const viewer = await fetch(`${publicBase}/viewer?sessionId=${sessionId}&theme=dark`, {
+  const viewer = await fetch(`${publicBase}${entryPath}?theme=dark`, {
     headers: {
-      cookie,
       authorization: "Bearer must-not-reach-browser",
       "x-api-key": "must-not-reach-browser",
     },
   });
   assert.equal(viewer.status, 200);
+  assert.equal(viewer.url, `${publicBase}${entryPath}?theme=dark`);
+  assert.equal(viewer.headers.get("location"), null);
   assert.match(await viewer.text(), /Scoped viewer/);
   assert.equal(viewer.headers.get("cache-control"), "no-store");
   assert.equal(viewer.headers.get("referrer-policy"), "no-referrer");
+  assert.match(viewer.headers.get("set-cookie"), /^sv_[0-9a-f]+=.+; Path=\/;/);
+  assert.match(viewer.headers.get("set-cookie"), /HttpOnly; Secure; SameSite=Strict$/);
   assert.equal(debugRequest.headers.cookie, undefined);
   assert.equal(debugRequest.headers.authorization, undefined);
   assert.equal(debugRequest.headers["x-api-key"], undefined);
