@@ -224,6 +224,9 @@ spec:
             - name: mcp
               containerPort: 8000
               protocol: TCP
+            - name: artifacts
+              containerPort: 8001
+              protocol: TCP
           env:
             - name: HOST
               value: 0.0.0.0
@@ -247,6 +250,19 @@ spec:
               value: "900000"
             - name: STEEL_INACTIVITY_TIMEOUT_MS
               value: "300000"
+            # Short-lived capability URLs let another bot tool fetch screenshot
+            # or PDF bytes without exposing MCP or any tenant credential.
+            - name: BROWSER_ARTIFACT_PUBLIC_ORIGIN
+              value: https://browser-session-ovh1.tlon.network
+            - name: BROWSER_ARTIFACT_PORT
+              value: "8001"
+            - name: BROWSER_ARTIFACT_TTL_MS
+              value: "300000"
+            - name: BROWSER_ARTIFACT_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: session-viewer-secrets
+                  key: signing-key
             - name: HOME
               value: /tmp
             - name: TMPDIR
@@ -432,6 +448,10 @@ spec:
       port: 8080
       targetPort: viewer
       protocol: TCP
+    - name: artifacts
+      port: 8001
+      targetPort: artifacts
+      protocol: TCP
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -473,6 +493,13 @@ spec:
     - host: browser-session-ovh1.tlon.network
       http:
         paths:
+          - path: /artifacts
+            pathType: Prefix
+            backend:
+              service:
+                name: session-viewer
+                port:
+                  name: artifacts
           - path: /
             pathType: Prefix
             backend:
@@ -509,4 +536,6 @@ spec:
         - namespaceSelector: {}
       ports:
         - port: 8080
+          protocol: TCP
+        - port: 8001
           protocol: TCP
