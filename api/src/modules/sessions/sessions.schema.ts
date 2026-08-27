@@ -27,6 +27,11 @@ export const SessionCredentials = z
 
 const CreateSession = z.object({
   sessionId: z.string().uuid().optional().describe("Unique identifier for the session"),
+  profileId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe("Stable profile identifier, independent of the live session identifier"),
   proxyUrl: z.string().optional().describe("Proxy URL to use for the session"),
   userAgent: z.string().optional().describe("User agent string to use for the session"),
   sessionContext: SessionContextSchema.optional().describe(

@@ -18,6 +18,7 @@ export const handleLaunchBrowserSession = async (
   try {
     const {
       sessionId,
+      profileId,
       proxyUrl,
       userDataDir,
       persist,
@@ -41,6 +42,7 @@ export const handleLaunchBrowserSession = async (
 
     return await server.sessionService.startSession({
       sessionId,
+      profileId,
       proxyUrl,
       userDataDir,
       persist,
@@ -67,11 +69,12 @@ export const handleLaunchBrowserSession = async (
   } catch (e: unknown) {
     server.log.error({ err: e }, "Failed launching browser session");
     const error = getErrors(e);
-    const status = error.includes("already exists")
-      ? 409
-      : error.includes("Maximum concurrent")
-      ? 429
-      : 500;
+    const status =
+      error.includes("already exists") || error.includes("already in use")
+        ? 409
+        : error.includes("Maximum concurrent")
+        ? 429
+        : 500;
     return reply.code(status).send({ success: false, message: error });
   }
 };

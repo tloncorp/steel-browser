@@ -1,4 +1,4 @@
-import { mkdtemp, stat, rm } from "fs/promises";
+import { mkdtemp, stat, rm, writeFile } from "fs/promises";
 import os from "os";
 import path from "path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -128,5 +128,60 @@ describe("SessionService multi-session isolation", () => {
 
     expect(() => sessionService.getCDPService()).toThrow(/sessionId is required/);
     await expect(sessionService.endSession()).rejects.toThrow(/sessionId is required/);
+  });
+
+  it("reuses a persistent profile across short-lived sessions and fences concurrent writers", async () => {
+    const profileRoot = await mkdtemp(path.join(os.tmpdir(), "steel-profile-test-"));
+    roots.push(profileRoot);
+    const { sessionService, runtimes } = makeSessionService();
+    const profileId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const firstId = "55555555-5555-4555-8555-555555555555";
+    const secondId = "66666666-6666-4666-8666-666666666666";
+
+    await sessionService.startSession({
+      sessionId: firstId,
+      profileId,
+      persist: true,
+      userDataDir: profileRoot,
+      timezone: "UTC",
+      credentials: undefined,
+    });
+
+    await expect(
+      sessionService.startSession({
+        sessionId: secondId,
+        profileId,
+        persist: true,
+        userDataDir: profileRoot,
+        timezone: "UTC",
+        credentials: undefined,
+      }),
+    ).rejects.toThrow(/already in use/);
+
+    expect(runtimes[0].launchConfigs[0].userDataDir).toBe(path.join(profileRoot, profileId));
+    await sessionService.endSession(firstId);
+    await expect(stat(path.join(profileRoot, profileId))).resolves.toBeDefined();
+    await Promise.all(
+      ["SingletonCookie", "SingletonLock", "SingletonSocket"].map((name) =>
+        writeFile(path.join(profileRoot, profileId, name), "stale"),
+      ),
+    );
+
+    await sessionService.startSession({
+      sessionId: secondId,
+      profileId,
+      persist: true,
+      userDataDir: profileRoot,
+      timezone: "UTC",
+      credentials: undefined,
+    });
+    expect(runtimes[1].launchConfigs[0].userDataDir).toBe(path.join(profileRoot, profileId));
+    await Promise.all(
+      ["SingletonCookie", "SingletonLock", "SingletonSocket"].map((name) =>
+        expect(stat(path.join(profileRoot, profileId, name))).rejects.toThrow(),
+      ),
+    );
+    await sessionService.endSession(secondId);
+    await expect(stat(path.join(profileRoot, profileId))).resolves.toBeDefined();
   });
 });

@@ -33,6 +33,7 @@ type SessionRuntime = {
   cdpService: CDPService;
   userDataDir: string;
   removeUserDataDir: boolean;
+  profileId?: string;
   cleanupTimer?: NodeJS.Timeout;
   ending?: Promise<SessionDetails>;
 };
@@ -82,6 +83,7 @@ export class SessionService {
   private seleniumService: SeleniumService;
   private timezoneFetcher: TimezoneFetcher;
   private sessions = new Map<string, SessionRuntime>();
+  private activeProfiles = new Map<string, string>();
   private idleSession: Session;
   public proxyFactory: ProxyFactory = (proxyUrl) => new ProxyServer(proxyUrl);
 
@@ -143,6 +145,7 @@ export class SessionService {
 
   public async startSession(options: {
     sessionId?: string;
+    profileId?: string;
     proxyUrl?: string;
     userAgent?: string;
     sessionContext?: {
@@ -174,6 +177,12 @@ export class SessionService {
     if (!uuidValidate(id)) {
       throw new Error(`Invalid session ID: ${id}`);
     }
+    if (options.profileId && !uuidValidate(options.profileId)) {
+      throw new Error(`Invalid profile ID: ${options.profileId}`);
+    }
+    if (options.profileId && options.persist !== true) {
+      throw new Error("A stable profile ID requires persist=true");
+    }
     if (
       env.MAX_CONCURRENT_SESSIONS !== undefined &&
       this.sessions.size >= env.MAX_CONCURRENT_SESSIONS
@@ -182,6 +191,9 @@ export class SessionService {
     }
     if (this.sessions.has(id)) {
       throw new Error(`Session ${id} already exists`);
+    }
+    if (options.profileId && this.activeProfiles.has(options.profileId)) {
+      throw new Error(`Profile ${options.profileId} is already in use`);
     }
     if (options.isSelenium && this.getActiveSessions().some((session) => session.isSelenium)) {
       throw new Error("Only one Selenium session can run at a time");
@@ -248,17 +260,20 @@ export class SessionService {
       (options.persist === true
         ? path.join(dirname(fileURLToPath(import.meta.url)), "..", "..", "user-data-dir")
         : path.join(os.tmpdir(), "steel-sessions"));
-    // A caller-supplied path is a root, never the profile itself. The UUID suffix
-    // prevents accidental profile sharing while allowing persistence by session ID.
-    const userDataDir = path.join(configuredProfileRoot, id);
+    // The root is never itself a Chrome profile. A stable profile ID deliberately
+    // survives across otherwise-independent live session IDs, while the default
+    // remains isolated to the disposable session ID.
+    const userDataDir = path.join(configuredProfileRoot, options.profileId ?? id);
 
     const runtime: SessionRuntime = {
       session,
       cdpService: runtimeCDPService,
       userDataDir,
       removeUserDataDir: options.persist !== true,
+      profileId: options.profileId,
     };
     this.sessions.set(id, runtime);
+    if (options.profileId) this.activeProfiles.set(options.profileId, id);
     if (env.SESSION_TTL_MS) {
       session.timeout = env.SESSION_TTL_MS;
       runtime.cleanupTimer = setTimeout(() => {
@@ -285,6 +300,16 @@ export class SessionService {
 
     try {
       await mkdir(userDataDir, { recursive: true });
+      if (options.profileId) {
+        // A Pod or Chrome crash can leave host/PID-scoped singleton files behind on
+        // the durable volume. The in-process profile fence above proves there is no
+        // live owner before these stale launch locks are removed.
+        await Promise.all(
+          ["SingletonCookie", "SingletonLock", "SingletonSocket"].map((name) =>
+            rm(path.join(userDataDir, name), { force: true }),
+          ),
+        );
+      }
 
       if (proxyUrl) {
         session.proxyServer = await this.proxyFactory(proxyUrl, normalizedOptimize);
@@ -354,6 +379,7 @@ export class SessionService {
       session.complete();
       if (runtime.cleanupTimer) clearTimeout(runtime.cleanupTimer);
       this.sessions.delete(id);
+      this.releaseProfile(runtime, id);
       await session.proxyServer?.close(true).catch(() => undefined);
       if (!isSelenium) {
         await runtimeCDPService.shutdown(ShutdownReason.LAUNCH_FAILURE).catch(() => undefined);
@@ -414,6 +440,7 @@ export class SessionService {
       session.proxyServer = undefined;
       await this.cleanupProfile(runtime);
       this.sessions.delete(sessionId);
+      this.releaseProfile(runtime, sessionId);
       this.recordPastSession(session);
     }
 
@@ -426,6 +453,12 @@ export class SessionService {
       await rm(runtime.userDataDir, { recursive: true, force: true });
     } catch (error) {
       this.logger.warn({ err: error, userDataDir: runtime.userDataDir }, "Profile cleanup failed");
+    }
+  }
+
+  private releaseProfile(runtime: SessionRuntime, sessionId: string): void {
+    if (runtime.profileId && this.activeProfiles.get(runtime.profileId) === sessionId) {
+      this.activeProfiles.delete(runtime.profileId);
     }
   }
 

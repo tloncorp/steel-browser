@@ -69,11 +69,14 @@ replica shown here. `REDIS_URL` plus a shared `STEEL_REQUEST_STATE_SECRET` can p
 across an MCP-sidecar restart while its browser stays alive. Redis alone does not make this combined
 Deployment horizontally scalable: each handle still belongs to the browser in the Pod that created
 it. Multiple replicas also require a shared/routable Steel backend or tenant/session-aware routing
-to the owning Pod. Browser profiles remain disposable `emptyDir` data and do not survive Pod
-replacement.
+to the owning Pod. Each MCP credential transparently reuses one browser profile after its live
+Chrome session is released. The standalone YAML manifests still place those profiles on an
+`emptyDir`, so they survive idle/release but not Pod replacement. The Terraform cluster-services
+deployment mounts `browser-profiles`, a configurable persistent volume claim, instead.
 
 The manifest admits four browser sessions, expires them after 15 minutes, retains at most 20
-released-session records, and bounds disposable profile storage to 8 GiB.
+released-session records, and admits at most one live session per credential so a Chrome profile
+never has concurrent writers.
 
 ## Bare-metal GAR authentication
 

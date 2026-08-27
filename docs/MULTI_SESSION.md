@@ -3,7 +3,7 @@
 Steel Browser can run multiple concurrent CDP sessions in one API process. Each session owns:
 
 - a dedicated `CDPService` and Chrome process;
-- a profile at `<profile-root>/<session-id>`;
+- a profile at `<profile-root>/<profile-id-or-session-id>`;
 - a download directory inside that profile; and
 - session-addressed CDP, debugger, cast, page, recording, and log WebSockets.
 
@@ -26,8 +26,10 @@ for a session to the pod that owns it. Set `SESSION_TTL_MS` as a backstop for cl
 release their sessions.
 
 Profiles and downloads are removed after release unless the session was created with
-`persist: true`. Persistent profiles survive under the same session ID and need a PVC quota and a
-separate retention policy.
+`persist: true`. A persistent session may also provide a UUID `profileId` independent of its live
+session ID. Later sessions using that profile ID reopen the same cookies and browser state without
+keeping Chrome running between them. Only one live session may use a profile ID at a time.
+Persistent profiles need durable storage, a PVC quota, and a separate retention policy.
 
 ## Routing and trust boundary
 
