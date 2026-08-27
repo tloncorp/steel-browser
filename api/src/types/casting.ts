@@ -26,6 +26,12 @@ export type KeyEvent = {
   };
 };
 
+export type InsertTextEvent = {
+  type: "insertText";
+  pageId: string;
+  text: string;
+};
+
 export type NavigationEvent = {
   type: "navigation";
   pageId: string;

@@ -91,7 +91,9 @@ export function rewriteSession(record, config, now = Date.now()) {
 
   const expiresAt = sessionExpiry(record, now, config.maximumTtlMs);
   const capability = mintCapability({ sessionId: record.id, expiresAt }, config.secret);
-  const entry = new URL(`/s/${capability}`, config.publicOrigin).toString();
+  const entryUrl = new URL(`/s/${capability}`, config.publicOrigin);
+  entryUrl.searchParams.set("clipboardBridge", "true");
+  const entry = entryUrl.toString();
   const cdp = new URL("/cdp", config.publicOrigin);
   cdp.protocol = cdp.protocol === "https:" ? "wss:" : "ws:";
   cdp.searchParams.set("sessionId", record.id);

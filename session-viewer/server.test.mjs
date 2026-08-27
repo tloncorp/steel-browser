@@ -31,6 +31,7 @@ test("live session responses receive neutral capability and scoped CDP URLs", ()
   );
 
   assert.match(rewritten.sessionViewerUrl, /^https:\/\/session-viewer\.test\.tlon\.systems\/s\//);
+  assert.equal(new URL(rewritten.sessionViewerUrl).searchParams.get("clipboardBridge"), "true");
   assert.equal(rewritten.debugUrl, rewritten.sessionViewerUrl);
   assert.equal(rewritten.debuggerUrl, rewritten.sessionViewerUrl);
   const websocket = new URL(rewritten.websocketUrl);
@@ -56,7 +57,8 @@ test("a zero browser timeout uses the viewer TTL instead of expiring immediately
     { secret, publicOrigin: "https://viewer.test", maximumTtlMs: 900_000 },
     now,
   );
-  const capability = rewritten.sessionViewerUrl.split("/s/")[1];
+  const entry = new URL(rewritten.sessionViewerUrl);
+  const capability = entry.pathname.split("/s/")[1];
   assert.deepEqual(verifyCapability(capability, secret, now), {
     sessionId,
     expiresAt: now + 900_000,
@@ -125,6 +127,7 @@ test("the public listener exposes only a capability-scoped viewer", async (conte
   assert.equal(createdResponse.status, 200);
   const created = await createdResponse.json();
   assert.match(created.sessionViewerUrl, /^https:\/\/viewer\.example\/s\//);
+  assert.equal(new URL(created.sessionViewerUrl).searchParams.get("clipboardBridge"), "true");
   assert.match(created.websocketUrl, /^wss:\/\/viewer\.example\/cdp\?/);
 
   const publicBase = `http://127.0.0.1:${publicPort}`;
@@ -155,4 +158,5 @@ test("the public listener exposes only a capability-scoped viewer", async (conte
   assert.equal(debugUrl.searchParams.get("interactive"), "true");
   assert.equal(debugUrl.searchParams.get("showControls"), "true");
   assert.equal(debugUrl.searchParams.get("theme"), "dark");
+  assert.equal(debugUrl.searchParams.get("clipboardBridge"), null);
 });

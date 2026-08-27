@@ -1124,11 +1124,21 @@
 
           // Add tab navigation and keyboard event listeners (global)
           if (interactive) {
+              const directClipboardBridge =
+                  new URLSearchParams(window.location.search).get('clipboardBridge') === 'true' &&
+                  window.parent === window;
+
               document.addEventListener('keydown', (e) => {
                   // Skip if URL input is focused
                   if (urlText && document.activeElement === urlText){
                     console.log("URL input is focused, skipping keydown event");
                     return;
+                  }
+
+                  // Let the local browser dispatch a real paste event. Forwarding
+                  // Ctrl/Cmd+V as an ordinary remote key would type a literal "v".
+                  if (directClipboardBridge && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
+                      return;
                   }
 
                   if (!activeTabId || !tabs[activeTabId] || !tabs[activeTabId].websocket) return;
@@ -1152,6 +1162,7 @@
               document.addEventListener('keyup', (e) => {
                   // Skip if URL input is focused
                   if (urlText && document.activeElement === urlText) return;
+                  if (directClipboardBridge && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') return;
                   if (!activeTabId || !tabs[activeTabId] || !tabs[activeTabId].websocket) return;
 
                   const ws = tabs[activeTabId].websocket;
@@ -1532,6 +1543,21 @@
                   return;
               }
 
+              // The public session viewer is top-level rather than embedded in the
+              // Steel dashboard. A paste event already carries the user-selected
+              // clipboard text, so it needs no clipboard permission or parent app.
+              if (window.parent === window) {
+                  document.addEventListener('paste', (event) => {
+                      if (urlText && document.activeElement === urlText) return;
+                      const text = event.clipboardData?.getData('text/plain');
+                      if (!text) return;
+                      event.preventDefault();
+                      event.stopPropagation();
+                      handlePasteEvent(text);
+                  }, true);
+                  return;
+              }
+
               window.parent.postMessage({
                   type: 'clipboardBridgeReady'
               }, '*');
@@ -1578,45 +1604,11 @@
                       return;
                   }
 
-                  // Send each character as individual key events
-                  for (let i = 0; i < text.length; i++) {
-                      const char = text[i];
-                      const charCode = char.charCodeAt(0);
-
-                      ws.send(JSON.stringify({
-                          type: 'keyEvent',
-                          pageId: activeTabId,
-                          event: {
-                              type: 'keyDown',
-                              text: char,
-                              code: getKeyCode(char),
-                              key: char,
-                              keyCode: charCode
-                          }
-                      }));
-
-                      ws.send(JSON.stringify({
-                          type: 'keyEvent',
-                          pageId: activeTabId,
-                          event: {
-                              type: 'keyUp',
-                              text: char,
-                              code: getKeyCode(char),
-                              key: char,
-                              keyCode: charCode
-                          }
-                      }));
-                  }
-              }
-
-              function getKeyCode(char) {
-                  // Simple key code mapping for common characters
-                  if (char === ' ') return 'Space';
-                  if (char === '\n') return 'Enter';
-                  if (char === '\t') return 'Tab';
-                  if (/[a-zA-Z]/.test(char)) return `Key${char.toUpperCase()}`;
-                  if (/[0-9]/.test(char)) return `Digit${char}`;
-                  return `Key${char.toUpperCase()}`;
+                  ws.send(JSON.stringify({
+                      type: 'insertText',
+                      pageId: activeTabId,
+                      text: text
+                  }));
               }
 
               function handleClipboardResponse(data) {

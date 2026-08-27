@@ -8,6 +8,7 @@ import { SessionService } from "../../services/session.service.js";
 import {
   CloseTabEvent,
   GetSelectedTextEvent,
+  InsertTextEvent,
   KeyEvent,
   MouseEvent,
   NavigationEvent,
@@ -285,6 +286,7 @@ export async function handleCastSession(
             const data:
               | MouseEvent
               | KeyEvent
+              | InsertTextEvent
               | NavigationEvent
               | CloseTabEvent
               | GetSelectedTextEvent = JSON.parse(message.toString());
@@ -326,6 +328,11 @@ export async function handleCastSession(
                   isKeypad: false,
                   isSystemKey: false,
                 });
+                break;
+              }
+              case "insertText": {
+                const { text } = data as InsertTextEvent;
+                await targetClient.send("Input.insertText", { text });
                 break;
               }
               case "navigation": {
