@@ -295,9 +295,15 @@ export const handleFillCredentialForm = async (
   request: FastifyRequest<{
     Params: { sessionId: string };
     Body: {
-      target: { pageId: string; frameUrl: string; origin: string };
+      target: {
+        pageId: string;
+        frameUrl: string;
+        origin: string;
+        kind: "password" | "otp";
+      };
       username?: string;
-      password: string;
+      password?: string;
+      code?: string;
       submit?: boolean;
     };
   }>,
@@ -317,6 +323,7 @@ export const handleFillCredentialForm = async (
       {
         username: request.body.username,
         password: request.body.password,
+        code: request.body.code,
         submit: request.body.submit,
       },
     );

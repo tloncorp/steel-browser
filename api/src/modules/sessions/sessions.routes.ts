@@ -121,7 +121,8 @@ async function routes(server: FastifyInstance) {
     {
       schema: {
         operationId: "discover_session_credential_form",
-        description: "Discover a visible password form for a trusted session viewer handoff",
+        description:
+          "Discover a visible password or one-time-code form for a trusted session viewer handoff",
         tags: ["Sessions"],
         summary: "Discover a credential form",
       },
@@ -141,20 +142,22 @@ async function routes(server: FastifyInstance) {
         body: {
           type: "object",
           additionalProperties: false,
-          required: ["target", "password"],
+          required: ["target"],
           properties: {
             target: {
               type: "object",
               additionalProperties: false,
-              required: ["pageId", "frameUrl", "origin"],
+              required: ["pageId", "frameUrl", "origin", "kind"],
               properties: {
                 pageId: { type: "string", minLength: 1, maxLength: 256 },
                 frameUrl: { type: "string", minLength: 1, maxLength: 4096 },
                 origin: { type: "string", minLength: 1, maxLength: 512 },
+                kind: { type: "string", enum: ["password", "otp"] },
               },
             },
             username: { type: "string", maxLength: 1024 },
             password: { type: "string", minLength: 1, maxLength: 4096 },
+            code: { type: "string", minLength: 1, maxLength: 128 },
             submit: { type: "boolean" },
           },
         },
@@ -164,9 +167,15 @@ async function routes(server: FastifyInstance) {
       request: FastifyRequest<{
         Params: { sessionId: string };
         Body: {
-          target: { pageId: string; frameUrl: string; origin: string };
+          target: {
+            pageId: string;
+            frameUrl: string;
+            origin: string;
+            kind: "password" | "otp";
+          };
           username?: string;
-          password: string;
+          password?: string;
+          code?: string;
           submit?: boolean;
         };
       }>,

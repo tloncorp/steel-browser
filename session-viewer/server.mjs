@@ -459,12 +459,19 @@ export function createGateway(config) {
               discovered.body?.error ?? "No live credential form is available.",
           });
         }
-        const { pageId, frameUrl, origin, hasUsername } = discovered.body ?? {};
+        const { pageId, frameUrl, origin, kind, hasUsername, codeLength } =
+          discovered.body ?? {};
         if (
           typeof pageId !== "string" ||
           typeof frameUrl !== "string" ||
           typeof origin !== "string" ||
-          typeof hasUsername !== "boolean"
+          (kind !== "password" && kind !== "otp") ||
+          (kind === "password" && typeof hasUsername !== "boolean") ||
+          (kind === "otp" &&
+            codeLength !== undefined &&
+            (!Number.isSafeInteger(codeLength) ||
+              codeLength < 1 ||
+              codeLength > 12))
         ) {
           return sendCredentialJson(response, 502, {
             error: "Browser returned an invalid credential form.",
@@ -493,14 +500,17 @@ export function createGateway(config) {
         );
         credentialHandoffs.set(handoffId, {
           sessionId: capability.sessionId,
-          target: { pageId, frameUrl, origin },
+          target: { pageId, frameUrl, origin, kind },
+          ...(kind === "otp" && codeLength !== undefined ? { codeLength } : {}),
           expiresAt,
           status: "ready",
         });
         return sendCredentialJson(response, 200, {
           handoffId,
           origin,
-          hasUsername,
+          kind,
+          ...(kind === "password" ? { hasUsername } : {}),
+          ...(kind === "otp" && codeLength !== undefined ? { codeLength } : {}),
           expiresAt,
         });
       } catch {
@@ -534,14 +544,26 @@ export function createGateway(config) {
             : "Credential submission is invalid.",
         });
       }
-      if (
-        (body.username !== undefined &&
+      const commonInvalid =
+        body.submit !== undefined && typeof body.submit !== "boolean";
+      const passwordInvalid =
+        handoff.target.kind === "password" &&
+        ((body.username !== undefined &&
           (typeof body.username !== "string" || body.username.length > 1024)) ||
-        typeof body.password !== "string" ||
-        body.password.length < 1 ||
-        body.password.length > 4096 ||
-        (body.submit !== undefined && typeof body.submit !== "boolean")
-      ) {
+          typeof body.password !== "string" ||
+          body.password.length < 1 ||
+          body.password.length > 4096 ||
+          body.code !== undefined);
+      const otpInvalid =
+        handoff.target.kind === "otp" &&
+        (typeof body.code !== "string" ||
+          body.code.length < 1 ||
+          body.code.length > 128 ||
+          (handoff.codeLength !== undefined &&
+            body.code.length !== handoff.codeLength) ||
+          body.username !== undefined ||
+          body.password !== undefined);
+      if (commonInvalid || passwordInvalid || otpInvalid) {
         return sendCredentialJson(response, 400, {
           error: "Credential submission is invalid.",
         });
@@ -560,8 +582,14 @@ export function createGateway(config) {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
             target: handoff.target,
-            ...(body.username === undefined ? {} : { username: body.username }),
-            password: body.password,
+            ...(handoff.target.kind === "password"
+              ? {
+                  ...(body.username === undefined
+                    ? {}
+                    : { username: body.username }),
+                  password: body.password,
+                }
+              : { code: body.code }),
             submit: body.submit === true,
           }),
         });

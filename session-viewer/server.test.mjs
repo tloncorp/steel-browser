@@ -225,6 +225,7 @@ test("credential handoffs are one-use and return no field values", async (contex
           pageId: "page-1",
           frameUrl: "https://www.are.na/login",
           origin: "https://www.are.na",
+          kind: "password",
           hasUsername: true,
         }),
       );
@@ -280,9 +281,11 @@ test("credential handoffs are one-use and return no field values", async (contex
     "expiresAt",
     "handoffId",
     "hasUsername",
+    "kind",
     "origin",
   ]);
   assert.equal(discovered.origin, "https://www.are.na");
+  assert.equal(discovered.kind, "password");
   assert.equal(discovered.hasUsername, true);
 
   const values = {
@@ -305,6 +308,7 @@ test("credential handoffs are one-use and return no field values", async (contex
       pageId: "page-1",
       frameUrl: "https://www.are.na/login",
       origin: "https://www.are.na",
+      kind: "password",
     },
     ...values,
   });
@@ -322,5 +326,104 @@ test("credential handoffs are one-use and return no field values", async (contex
     JSON.stringify(await replay.json()).includes(values.password),
     false,
   );
+  assert.ok(internalPort);
+});
+
+test("one-time-code handoffs accept only an OTP value", async (context) => {
+  let filledBody;
+  const upstream = http.createServer((request, response) => {
+    if (
+      request.method === "GET" &&
+      request.url === `/v1/sessions/${sessionId}/credential-form`
+    ) {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          pageId: "page-otp",
+          frameUrl: "https://accounts.example/verify",
+          origin: "https://accounts.example",
+          kind: "otp",
+          codeLength: 6,
+        }),
+      );
+      return;
+    }
+    if (
+      request.method === "POST" &&
+      request.url === `/v1/sessions/${sessionId}/credential-form`
+    ) {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(chunk));
+      request.on("end", () => {
+        filledBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: true, submitted: true }));
+      });
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  const upstreamPort = await listen(upstream);
+  const { internal, publicServer } = createGateway({
+    secret,
+    publicOrigin: "https://viewer.example",
+    upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
+    maximumTtlMs: 900_000,
+  });
+  const [internalPort, publicPort] = await Promise.all([
+    listen(internal),
+    listen(publicServer),
+  ]);
+  context.after(async () =>
+    Promise.all([close(internal), close(publicServer), close(upstream)]),
+  );
+
+  const capability = mintCapability(
+    { sessionId, expiresAt: Date.now() + 60_000 },
+    secret,
+  );
+  const publicBase = `http://127.0.0.1:${publicPort}`;
+  const discoveredResponse = await fetch(
+    `${publicBase}/credentials/${capability}`,
+  );
+  assert.equal(discoveredResponse.status, 200);
+  const discovered = await discoveredResponse.json();
+  assert.deepEqual(discovered, {
+    handoffId: discovered.handoffId,
+    origin: "https://accounts.example",
+    kind: "otp",
+    codeLength: 6,
+    expiresAt: discovered.expiresAt,
+  });
+
+  const rejected = await fetch(
+    `${publicBase}/credential-fills/${discovered.handoffId}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: "must-not-be-accepted" }),
+    },
+  );
+  assert.equal(rejected.status, 400);
+
+  const fillResponse = await fetch(
+    `${publicBase}/credential-fills/${discovered.handoffId}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: "123456", submit: true }),
+    },
+  );
+  assert.equal(fillResponse.status, 200);
+  assert.deepEqual(filledBody, {
+    target: {
+      pageId: "page-otp",
+      frameUrl: "https://accounts.example/verify",
+      origin: "https://accounts.example",
+      kind: "otp",
+    },
+    code: "123456",
+    submit: true,
+  });
   assert.ok(internalPort);
 });
