@@ -2,6 +2,11 @@ import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { CookieData } from "../../services/context/types.js";
 import { getErrors } from "../../utils/errors.js";
 import { getBaseUrl, getUrl } from "../../utils/url.js";
+import {
+  CredentialFormError,
+  discoverCredentialForm,
+  fillCredentialForm,
+} from "../../services/credential-form.service.js";
 import { CreateSessionRequest, SessionDetails, SessionStreamRequest } from "./sessions.schema.js";
 
 const sessionUrl = (url: string, sessionId: string): string => {
@@ -257,5 +262,69 @@ export const handleGetSessionLiveDetails = async (
       message: "Failed to get session state",
       error: getErrors(error),
     });
+  }
+};
+
+export const handleDiscoverCredentialForm = async (
+  server: FastifyInstance,
+  request: FastifyRequest<{ Params: { sessionId: string } }>,
+  reply: FastifyReply,
+) => {
+  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.ip)) {
+    return reply.code(404).send({ error: "Not found." });
+  }
+  try {
+    const session = server.sessionService.getSession(request.params.sessionId);
+    if (!session || session.status !== "live") {
+      return reply.code(404).send({ error: "Session not found." });
+    }
+    const description = await discoverCredentialForm(
+      server.sessionService.getCDPService(request.params.sessionId),
+    );
+    return reply.send(description);
+  } catch (error) {
+    const status = error instanceof CredentialFormError ? error.statusCode : 500;
+    const message =
+      error instanceof CredentialFormError ? error.message : "Credential form discovery failed.";
+    return reply.code(status).send({ error: message });
+  }
+};
+
+export const handleFillCredentialForm = async (
+  server: FastifyInstance,
+  request: FastifyRequest<{
+    Params: { sessionId: string };
+    Body: {
+      target: { pageId: string; frameUrl: string; origin: string };
+      username?: string;
+      password: string;
+      submit?: boolean;
+    };
+  }>,
+  reply: FastifyReply,
+) => {
+  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.ip)) {
+    return reply.code(404).send({ error: "Not found." });
+  }
+  try {
+    const session = server.sessionService.getSession(request.params.sessionId);
+    if (!session || session.status !== "live") {
+      return reply.code(404).send({ error: "Session not found." });
+    }
+    const result = await fillCredentialForm(
+      server.sessionService.getCDPService(request.params.sessionId),
+      request.body.target,
+      {
+        username: request.body.username,
+        password: request.body.password,
+        submit: request.body.submit,
+      },
+    );
+    return reply.send({ ok: true, ...result });
+  } catch (error) {
+    const status = error instanceof CredentialFormError ? error.statusCode : 500;
+    const message =
+      error instanceof CredentialFormError ? error.message : "Credential form fill failed.";
+    return reply.code(status).send({ error: message });
   }
 };

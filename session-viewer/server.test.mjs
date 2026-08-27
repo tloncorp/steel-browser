@@ -2,16 +2,27 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { test } from "node:test";
 
-import { createGateway, mintCapability, rewriteSession, verifyCapability } from "./server.mjs";
+import {
+  createGateway,
+  mintCapability,
+  rewriteSession,
+  verifyCapability,
+} from "./server.mjs";
 
 const secret = "test-secret-that-is-at-least-thirty-two-bytes-long";
 const sessionId = "123e4567-e89b-42d3-a456-426614174000";
 
 test("capabilities authenticate one session until their expiration", () => {
   const token = mintCapability({ sessionId, expiresAt: 20_000 }, secret);
-  assert.deepEqual(verifyCapability(token, secret, 10_000), { sessionId, expiresAt: 20_000 });
+  assert.deepEqual(verifyCapability(token, secret, 10_000), {
+    sessionId,
+    expiresAt: 20_000,
+  });
   assert.equal(verifyCapability(token, secret, 20_000), undefined);
-  assert.equal(verifyCapability(`${token.slice(0, -1)}x`, secret, 10_000), undefined);
+  assert.equal(
+    verifyCapability(`${token.slice(0, -1)}x`, secret, 10_000),
+    undefined,
+  );
 });
 
 test("live session responses receive neutral capability and scoped CDP URLs", () => {
@@ -26,26 +37,44 @@ test("live session responses receive neutral capability and scoped CDP URLs", ()
       debuggerUrl: "http://browser.invalid/v1/devtools/inspector.html",
       websocketUrl: "ws://browser.invalid/",
     },
-    { secret, publicOrigin: "https://session-viewer.test.tlon.systems", maximumTtlMs: 900_000 },
+    {
+      secret,
+      publicOrigin: "https://session-viewer.test.tlon.systems",
+      maximumTtlMs: 900_000,
+    },
     20_000,
   );
 
-  assert.match(rewritten.sessionViewerUrl, /^https:\/\/session-viewer\.test\.tlon\.systems\/s\//);
-  assert.equal(new URL(rewritten.sessionViewerUrl).searchParams.get("clipboardBridge"), "true");
+  assert.match(
+    rewritten.sessionViewerUrl,
+    /^https:\/\/session-viewer\.test\.tlon\.systems\/s\//,
+  );
+  assert.equal(
+    new URL(rewritten.sessionViewerUrl).searchParams.get("clipboardBridge"),
+    "true",
+  );
   assert.equal(rewritten.debugUrl, rewritten.sessionViewerUrl);
   assert.equal(rewritten.debuggerUrl, rewritten.sessionViewerUrl);
   const websocket = new URL(rewritten.websocketUrl);
   assert.equal(websocket.protocol, "wss:");
   assert.equal(websocket.pathname, "/cdp");
   assert.equal(websocket.searchParams.get("sessionId"), sessionId);
-  const verified = verifyCapability(websocket.searchParams.get("cap"), secret, 20_000);
+  const verified = verifyCapability(
+    websocket.searchParams.get("cap"),
+    secret,
+    20_000,
+  );
   assert.deepEqual(verified, { sessionId, expiresAt: 70_000 });
 });
 
 test("released sessions are not given viewer capabilities", () => {
   const record = { id: sessionId, status: "released", debugUrl: "internal" };
   assert.equal(
-    rewriteSession(record, { secret, publicOrigin: "https://viewer.test", maximumTtlMs: 900_000 }),
+    rewriteSession(record, {
+      secret,
+      publicOrigin: "https://viewer.test",
+      maximumTtlMs: 900_000,
+    }),
     record,
   );
 });
@@ -53,7 +82,12 @@ test("released sessions are not given viewer capabilities", () => {
 test("a zero browser timeout uses the viewer TTL instead of expiring immediately", () => {
   const now = 20_000;
   const rewritten = rewriteSession(
-    { id: sessionId, status: "live", createdAt: new Date(now).toISOString(), timeout: 0 },
+    {
+      id: sessionId,
+      status: "live",
+      createdAt: new Date(now).toISOString(),
+      timeout: 0,
+    },
     { secret, publicOrigin: "https://viewer.test", maximumTtlMs: 900_000 },
     now,
   );
@@ -100,7 +134,10 @@ test("the public listener exposes only a capability-scoped viewer", async (conte
       );
       return;
     }
-    if (request.method === "GET" && request.url.startsWith("/v1/sessions/debug?")) {
+    if (
+      request.method === "GET" &&
+      request.url.startsWith("/v1/sessions/debug?")
+    ) {
       debugRequest = request;
       response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       response.end("<!doctype html><title>Scoped viewer</title>");
@@ -116,18 +153,29 @@ test("the public listener exposes only a capability-scoped viewer", async (conte
     maximumTtlMs: 900_000,
   };
   const { internal, publicServer } = createGateway(config);
-  const [internalPort, publicPort] = await Promise.all([listen(internal), listen(publicServer)]);
-  context.after(async () => Promise.all([close(internal), close(publicServer), close(upstream)]));
+  const [internalPort, publicPort] = await Promise.all([
+    listen(internal),
+    listen(publicServer),
+  ]);
+  context.after(async () =>
+    Promise.all([close(internal), close(publicServer), close(upstream)]),
+  );
 
-  const createdResponse = await fetch(`http://127.0.0.1:${internalPort}/v1/sessions`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ sessionId }),
-  });
+  const createdResponse = await fetch(
+    `http://127.0.0.1:${internalPort}/v1/sessions`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId }),
+    },
+  );
   assert.equal(createdResponse.status, 200);
   const created = await createdResponse.json();
   assert.match(created.sessionViewerUrl, /^https:\/\/viewer\.example\/s\//);
-  assert.equal(new URL(created.sessionViewerUrl).searchParams.get("clipboardBridge"), "true");
+  assert.equal(
+    new URL(created.sessionViewerUrl).searchParams.get("clipboardBridge"),
+    "true",
+  );
   assert.match(created.websocketUrl, /^wss:\/\/viewer\.example\/cdp\?/);
 
   const publicBase = `http://127.0.0.1:${publicPort}`;
@@ -148,7 +196,10 @@ test("the public listener exposes only a capability-scoped viewer", async (conte
   assert.equal(viewer.headers.get("cache-control"), "no-store");
   assert.equal(viewer.headers.get("referrer-policy"), "no-referrer");
   assert.match(viewer.headers.get("set-cookie"), /^sv_[0-9a-f]+=.+; Path=\/;/);
-  assert.match(viewer.headers.get("set-cookie"), /HttpOnly; Secure; SameSite=Strict$/);
+  assert.match(
+    viewer.headers.get("set-cookie"),
+    /HttpOnly; Secure; SameSite=Strict$/,
+  );
   assert.equal(debugRequest.headers.cookie, undefined);
   assert.equal(debugRequest.headers.authorization, undefined);
   assert.equal(debugRequest.headers["x-api-key"], undefined);
@@ -159,4 +210,117 @@ test("the public listener exposes only a capability-scoped viewer", async (conte
   assert.equal(debugUrl.searchParams.get("showControls"), "true");
   assert.equal(debugUrl.searchParams.get("theme"), "dark");
   assert.equal(debugUrl.searchParams.get("clipboardBridge"), null);
+});
+
+test("credential handoffs are one-use and return no field values", async (context) => {
+  let filledBody;
+  const upstream = http.createServer((request, response) => {
+    if (
+      request.method === "GET" &&
+      request.url === `/v1/sessions/${sessionId}/credential-form`
+    ) {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          pageId: "page-1",
+          frameUrl: "https://www.are.na/login",
+          origin: "https://www.are.na",
+          hasUsername: true,
+        }),
+      );
+      return;
+    }
+    if (
+      request.method === "POST" &&
+      request.url === `/v1/sessions/${sessionId}/credential-form`
+    ) {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(chunk));
+      request.on("end", () => {
+        filledBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({ ok: true, filledUsername: true, submitted: true }),
+        );
+      });
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  const upstreamPort = await listen(upstream);
+  const { internal, publicServer } = createGateway({
+    secret,
+    publicOrigin: "https://viewer.example",
+    upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
+    maximumTtlMs: 900_000,
+  });
+  const [internalPort, publicPort] = await Promise.all([
+    listen(internal),
+    listen(publicServer),
+  ]);
+  context.after(async () =>
+    Promise.all([close(internal), close(publicServer), close(upstream)]),
+  );
+
+  const capability = mintCapability(
+    { sessionId, expiresAt: Date.now() + 60_000 },
+    secret,
+  );
+  const publicBase = `http://127.0.0.1:${publicPort}`;
+  const discoveredResponse = await fetch(
+    `${publicBase}/credentials/${capability}`,
+  );
+  assert.equal(discoveredResponse.status, 200);
+  assert.equal(
+    discoveredResponse.headers.get("access-control-allow-origin"),
+    "*",
+  );
+  const discovered = await discoveredResponse.json();
+  assert.deepEqual(Object.keys(discovered).sort(), [
+    "expiresAt",
+    "handoffId",
+    "hasUsername",
+    "origin",
+  ]);
+  assert.equal(discovered.origin, "https://www.are.na");
+  assert.equal(discovered.hasUsername, true);
+
+  const values = {
+    username: "person@example.com",
+    password: "not-in-a-chat",
+    submit: true,
+  };
+  const fillResponse = await fetch(
+    `${publicBase}/credential-fills/${discovered.handoffId}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(values),
+    },
+  );
+  assert.equal(fillResponse.status, 200);
+  assert.deepEqual(await fillResponse.json(), { ok: true, submitted: true });
+  assert.deepEqual(filledBody, {
+    target: {
+      pageId: "page-1",
+      frameUrl: "https://www.are.na/login",
+      origin: "https://www.are.na",
+    },
+    ...values,
+  });
+
+  const replay = await fetch(
+    `${publicBase}/credential-fills/${discovered.handoffId}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(values),
+    },
+  );
+  assert.equal(replay.status, 401);
+  assert.equal(
+    JSON.stringify(await replay.json()).includes(values.password),
+    false,
+  );
+  assert.ok(internalPort);
 });

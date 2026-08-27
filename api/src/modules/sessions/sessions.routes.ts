@@ -7,6 +7,8 @@ import {
   handleGetSessions,
   handleGetSessionStream,
   handleGetSessionLiveDetails,
+  handleDiscoverCredentialForm,
+  handleFillCredentialForm,
 } from "./sessions.controller.js";
 import { handleScrape, handleScreenshot, handlePDF } from "../actions/actions.controller.js";
 import { $ref } from "../../plugins/schemas.js";
@@ -112,6 +114,64 @@ async function routes(server: FastifyInstance) {
     },
     async (request: FastifyRequest<{ Params: { sessionId: string } }>, reply: FastifyReply) =>
       handleGetBrowserContext(server, request, reply),
+  );
+
+  server.get(
+    "/sessions/:sessionId/credential-form",
+    {
+      schema: {
+        operationId: "discover_session_credential_form",
+        description: "Discover a visible password form for a trusted session viewer handoff",
+        tags: ["Sessions"],
+        summary: "Discover a credential form",
+      },
+    },
+    async (request: FastifyRequest<{ Params: { sessionId: string } }>, reply: FastifyReply) =>
+      handleDiscoverCredentialForm(server, request, reply),
+  );
+
+  server.post(
+    "/sessions/:sessionId/credential-form",
+    {
+      schema: {
+        operationId: "fill_session_credential_form",
+        description: "Fill a previously discovered credential form without returning its values",
+        tags: ["Sessions"],
+        summary: "Fill a credential form",
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: ["target", "password"],
+          properties: {
+            target: {
+              type: "object",
+              additionalProperties: false,
+              required: ["pageId", "frameUrl", "origin"],
+              properties: {
+                pageId: { type: "string", minLength: 1, maxLength: 256 },
+                frameUrl: { type: "string", minLength: 1, maxLength: 4096 },
+                origin: { type: "string", minLength: 1, maxLength: 512 },
+              },
+            },
+            username: { type: "string", maxLength: 1024 },
+            password: { type: "string", minLength: 1, maxLength: 4096 },
+            submit: { type: "boolean" },
+          },
+        },
+      },
+    },
+    async (
+      request: FastifyRequest<{
+        Params: { sessionId: string };
+        Body: {
+          target: { pageId: string; frameUrl: string; origin: string };
+          username?: string;
+          password: string;
+          submit?: boolean;
+        };
+      }>,
+      reply: FastifyReply,
+    ) => handleFillCredentialForm(server, request, reply),
   );
 
   server.post(
