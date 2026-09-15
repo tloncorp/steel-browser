@@ -14,9 +14,13 @@ RUN npm ci --ignore-scripts
 RUN npm run build
 RUN IOREDIS="$(node -p "require('./package.json').peerDependencies.ioredis")" \
  && MCP_NODE="$(node -p "require('./package.json').peerDependencies['@modelcontextprotocol/node']")" \
+ && OTEL_SDK="$(node -p "require('./package.json').peerDependencies['@opentelemetry/sdk-node']")" \
+ && OTLP_EXPORTER="$(node -p "require('./package.json').peerDependencies['@opentelemetry/exporter-trace-otlp-http']")" \
  && npm pkg delete devDependencies peerDependencies peerDependenciesMeta \
  && npm prune --omit=dev \
- && npm install --no-save --ignore-scripts "ioredis@$IOREDIS" "@modelcontextprotocol/node@$MCP_NODE"
+ && npm install --no-save --ignore-scripts \
+      "ioredis@$IOREDIS" "@modelcontextprotocol/node@$MCP_NODE" \
+      "@opentelemetry/sdk-node@$OTEL_SDK" "@opentelemetry/exporter-trace-otlp-http@$OTLP_EXPORTER"
 
 FROM node:22-alpine
 
@@ -25,6 +29,9 @@ WORKDIR /app
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json ./package.json
+
+# Verify tracing starts with the dependencies shipped in the runtime image.
+RUN node --input-type=module -e "import { startTracing } from './dist/tracing.js'; const tracing = await startTracing({ OTEL_TRACES_EXPORTER: 'otlp' }, { onWarn(message) { throw new Error(message); } }); await tracing.shutdown();"
 
 EXPOSE 8000 8001
 
