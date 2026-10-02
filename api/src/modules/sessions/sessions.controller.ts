@@ -6,6 +6,7 @@ import {
   CredentialFormError,
   discoverCredentialForm,
   fillCredentialForm,
+  getCredentialContinuation,
 } from "../../services/credential-form.service.js";
 import { CreateSessionRequest, SessionDetails, SessionStreamRequest } from "./sessions.schema.js";
 
@@ -288,6 +289,25 @@ export const handleDiscoverCredentialForm = async (
       error instanceof CredentialFormError ? error.message : "Credential form discovery failed.";
     return reply.code(status).send({ error: message });
   }
+};
+
+export const handleGetCredentialContinuation = async (
+  server: FastifyInstance,
+  request: FastifyRequest<{ Params: { sessionId: string } }>,
+  reply: FastifyReply,
+) => {
+  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.ip)) {
+    return reply.code(404).send({ error: "Not found." });
+  }
+  const session = server.sessionService.getSession(request.params.sessionId);
+  if (!session || session.status !== "live") {
+    return reply.code(404).send({ error: "Session not found." });
+  }
+  reply.header("Cache-Control", "no-store");
+  const continuation = await getCredentialContinuation(
+    server.sessionService.getCDPService(request.params.sessionId),
+  );
+  return reply.send({ continuation });
 };
 
 export const handleFillCredentialForm = async (

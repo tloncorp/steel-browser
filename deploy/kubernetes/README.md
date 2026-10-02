@@ -97,7 +97,11 @@ bare-metal cluster's `WORKLOAD_IDENTITY_POOL_AUDIENCE` when deploying elsewhere;
 must also provide its corresponding `pioneer-wid-config` ConfigMap.
 
 The patched self-hosted Steel MCP server honors `STEEL_MAX_SESSIONS`, so the sidecar and browser both
-admit four sessions. Keep the Deployment at one replica while MCP handles are process-local.
+admit 20 concurrent sessions. Sessions have a two-hour hard lifetime and a 30-minute idle timeout.
+Explicit session requests can choose a shorter lifetime. The per-credential request-rate budget
+is separate from these settings. Keep the Deployment at one replica while MCP handles are
+process-local. Monitor browser memory usage: the concurrency ceiling does not reserve memory
+for 20 heavy pages.
 
 The NetworkPolicy limits ingress to Pods in `tlon`; `X-Api-Key` provides the tenant boundary within
 that network. Requests without a supported credential are rejected before a tenant runtime exists.

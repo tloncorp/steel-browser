@@ -9,6 +9,7 @@ import {
   handleGetSessionLiveDetails,
   handleDiscoverCredentialForm,
   handleFillCredentialForm,
+  handleGetCredentialContinuation,
 } from "./sessions.controller.js";
 import { handleScrape, handleScreenshot, handlePDF } from "../actions/actions.controller.js";
 import { $ref } from "../../plugins/schemas.js";
@@ -129,6 +130,13 @@ async function routes(server: FastifyInstance) {
     },
     async (request: FastifyRequest<{ Params: { sessionId: string } }>, reply: FastifyReply) =>
       handleDiscoverCredentialForm(server, request, reply),
+  );
+
+  server.get(
+    "/sessions/:sessionId/credential-continuation",
+    {},
+    async (request: FastifyRequest<{ Params: { sessionId: string } }>, reply: FastifyReply) =>
+      handleGetCredentialContinuation(server, request, reply),
   );
 
   server.post(
