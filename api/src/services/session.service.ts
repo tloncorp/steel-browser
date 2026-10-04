@@ -423,11 +423,6 @@ export class SessionService {
     session.status = "released";
     session.duration = Date.now() - new Date(session.createdAt).getTime();
 
-    if (session.proxyServer) {
-      session.proxyTxBytes = session.proxyServer.txBytes;
-      session.proxyRxBytes = session.proxyServer.rxBytes;
-    }
-
     try {
       if (session.isSelenium) {
         this.seleniumService.close();
@@ -436,7 +431,13 @@ export class SessionService {
         await cdpService.endSession();
       }
     } finally {
-      await session.proxyServer?.close(true).catch(() => undefined);
+      const proxyServer = session.proxyServer;
+      await proxyServer?.close(true).catch(() => undefined);
+      // Long-lived tunnels settle their byte counters when the proxy closes.
+      if (proxyServer) {
+        session.proxyTxBytes = proxyServer.txBytes;
+        session.proxyRxBytes = proxyServer.rxBytes;
+      }
       session.proxyServer = undefined;
       await this.cleanupProfile(runtime);
       this.sessions.delete(sessionId);

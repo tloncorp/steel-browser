@@ -2,6 +2,7 @@ import { mkdtemp, stat, rm, writeFile } from "fs/promises";
 import os from "os";
 import path from "path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { IProxyServer } from "../utils/proxy.js";
 import { CDPService } from "./cdp/cdp.service.js";
 import { SessionService } from "./session.service.js";
 
@@ -183,5 +184,91 @@ describe("SessionService multi-session isolation", () => {
     );
     await sessionService.endSession(secondId);
     await expect(stat(path.join(profileRoot, profileId))).resolves.toBeDefined();
+  });
+});
+
+/** Proxy counters include long-lived tunnels only after the proxy closes. */
+function createProxyServer() {
+  const proxy: IProxyServer & { close: ReturnType<typeof vi.fn> } = {
+    url: "http://127.0.0.1:0",
+    upstreamProxyUrl: "",
+    txBytes: 1_000,
+    rxBytes: 2_000,
+    listen: vi.fn().mockResolvedValue(undefined),
+    close: vi.fn().mockImplementation(async () => {
+      Object.assign(proxy, { txBytes: 3_000, rxBytes: 400_000 });
+    }),
+  };
+  return proxy;
+}
+
+async function startProxySession(withProxy = true) {
+  const profileRoot = await mkdtemp(path.join(os.tmpdir(), "steel-proxy-session-test-"));
+  roots.push(profileRoot);
+  const { sessionService, runtimes } = makeSessionService();
+  const proxy = createProxyServer();
+  sessionService.proxyFactory = () => proxy;
+  const session = await sessionService.startSession({
+    userDataDir: profileRoot,
+    timezone: "UTC",
+    credentials: undefined,
+    ...(withProxy ? { proxyUrl: "http://proxy.test:8080" } : {}),
+  });
+  return { sessionService, session, proxy, cdp: runtimes[0].mocks };
+}
+
+describe("SessionService proxy accounting", () => {
+  it("records the counters the session's proxy settles on close", async () => {
+    const { sessionService, session, proxy } = await startProxySession();
+
+    const released = await sessionService.endSession(session.id);
+
+    expect(proxy.close).toHaveBeenCalledExactlyOnceWith(true);
+    expect(released.proxyRxBytes).toBe(400_000);
+    expect(released.proxyTxBytes).toBe(3_000);
+    expect(sessionService.getSession(session.id)).toMatchObject({
+      proxyRxBytes: 400_000,
+      proxyTxBytes: 3_000,
+      status: "released",
+    });
+  });
+
+  it("closes the session's proxy only after its browser is torn down", async () => {
+    const { sessionService, session, proxy, cdp } = await startProxySession();
+    const order: string[] = [];
+    cdp.endSession.mockImplementation(async () => {
+      order.push("cdp");
+    });
+    proxy.close.mockImplementation(async () => {
+      order.push("proxy");
+    });
+
+    await sessionService.endSession(session.id);
+
+    expect(order).toEqual(["cdp", "proxy"]);
+  });
+
+  it("leaves counters at zero for a session without a proxy", async () => {
+    const { sessionService, session, proxy } = await startProxySession(false);
+
+    const released = await sessionService.endSession(session.id);
+
+    expect(released.proxyRxBytes).toBe(0);
+    expect(released.proxyTxBytes).toBe(0);
+    expect(proxy.close).not.toHaveBeenCalled();
+  });
+
+  it("settles proxy counters during cleanup when browser teardown fails", async () => {
+    const { sessionService, session, proxy, cdp } = await startProxySession();
+    cdp.endSession.mockRejectedValue(new Error("browser teardown failed"));
+
+    await expect(sessionService.endSession(session.id)).rejects.toThrow("browser teardown failed");
+
+    expect(proxy.close).toHaveBeenCalledExactlyOnceWith(true);
+    expect(sessionService.getActiveSessions()).toEqual([]);
+    expect(sessionService.getSession(session.id)).toMatchObject({
+      proxyRxBytes: 400_000,
+      proxyTxBytes: 3_000,
+    });
   });
 });

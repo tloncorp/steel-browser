@@ -39,13 +39,15 @@ import {
 import { filterHeaders, getChromeExecutablePath, installMouseHelper } from "../../utils/browser.js";
 import {
   deepMerge,
-  extractStorageForPage,
+  extractStorageForPageWithTimeout,
   getProfilePath,
   groupSessionStorageByOrigin,
   handleFrameNavigated,
+  safePageUrl,
 } from "../../utils/context.js";
 import { getExtensionPaths } from "../../utils/extensions.js";
 import { RetryManager, RetryOptions } from "../../utils/retry.js";
+import { isTargetClosedError } from "../../utils/target-closed.js";
 import { ChromeContextService } from "../context/chrome-context.service.js";
 import { SessionData } from "../context/types.js";
 import { FileService } from "../file.service.js";
@@ -99,6 +101,7 @@ export class CDPService extends EventEmitter {
   private defaultTimezone: string;
   private pluginManager: PluginManager;
   private trackedOrigins: Set<string> = new Set<string>();
+  private crashedPages: WeakSet<Page> = new WeakSet<Page>();
   private chromeSessionService: ChromeContextService;
   private retryManager: RetryManager;
   private targetInstrumentationManager: TargetInstrumentationManager;
@@ -180,6 +183,8 @@ export class CDPService extends EventEmitter {
     this.targetInstrumentationManager = new TargetInstrumentationManager(
       this.instrumentationLogger,
       this.logger,
+      undefined,
+      this.pluginManager.onTargetSession.bind(this.pluginManager),
     );
     this.instrumentationLogger?.on?.(EmitEvent.Log, (event, context) => {
       this.emit(EmitEvent.Log, event);
@@ -324,16 +329,38 @@ export class CDPService extends EventEmitter {
     try {
       await this.targetInstrumentationManager.attach(target, target.type() as TargetType);
     } catch (error) {
+      if (isTargetClosedError(error)) {
+        this.logger.debug(
+          { err: error },
+          "[CDPService] Target closed while attaching instrumentation",
+        );
+        return;
+      }
       this.logger.error({ err: error }, `[CDPService] Error attaching target instrumentation`);
     }
 
     if (target.type() === TargetType.PAGE) {
       const page = await target.page().catch((e) => {
+        if (isTargetClosedError(e)) {
+          this.logger.debug({ err: e }, "[CDPService] Target closed before page handle was ready");
+          return null;
+        }
         this.logger.error(`Error handling new target in CDPService: ${e}`);
         return null;
       });
 
-      if (page) {
+      if (!page || page.isClosed()) {
+        return;
+      }
+
+      // Puppeteer emits "error" when the renderer for this page crashes. The browser
+      // process survives, so CDP calls against the page hang instead of rejecting.
+      page.on("error", (err) => {
+        this.crashedPages.add(page);
+        this.logger.error({ err, url: safePageUrl(page) }, "[CDPService] Page renderer crashed");
+      });
+
+      try {
         try {
           const url = page.url();
           if (url && url.startsWith("http")) {
@@ -347,6 +374,10 @@ export class CDPService extends EventEmitter {
 
         // Notify plugins about the new page
         await this.pluginManager.onPageCreated(page);
+
+        if (page.isClosed()) {
+          return;
+        }
 
         // Only install mouse helper in headless mode
         if (this.launchConfig?.options?.headless) {
@@ -375,6 +406,10 @@ export class CDPService extends EventEmitter {
           );
         }
 
+        if (page.isClosed()) {
+          return;
+        }
+
         await page.setRequestInterception(true);
 
         page.on("request", (request) => this.handlePageRequest(request, page));
@@ -388,6 +423,15 @@ export class CDPService extends EventEmitter {
             this.endSession(ShutdownReason.SECURITY_VIOLATION);
           }
         });
+      } catch (error) {
+        if (isTargetClosedError(error) || page.isClosed()) {
+          this.logger.debug(
+            { err: error },
+            "[CDPService] Target closed while configuring a new page",
+          );
+          return;
+        }
+        this.logger.error({ err: error }, "[CDPService] Error configuring new page");
       }
     } else if (target.type() === TargetType.BACKGROUND_PAGE) {
       this.logger.info(`[CDPService] Background page created: ${target.url()}`);
@@ -466,6 +510,7 @@ export class CDPService extends EventEmitter {
   public async shutdown(reason: ShutdownReason): Promise<void> {
     this.shuttingDown = true;
     this.logger.info(`[CDPService] Shutting down and cleaning up resources (reason: ${reason})`);
+    this.chromeSessionService.invalidate();
 
     try {
       if (this.browserInstance) {
@@ -1031,7 +1076,18 @@ export class CDPService extends EventEmitter {
           "Failed to configure download behavior",
         );
 
-        this.browserInstance.on("targetcreated", this.handleNewTarget.bind(this));
+        this.browserInstance.on("targetcreated", (target) => {
+          void this.handleNewTarget(target).catch((error) => {
+            if (isTargetClosedError(error)) {
+              this.logger.debug(
+                { err: error },
+                "[CDPService] Target closed while handling targetcreated",
+              );
+              return;
+            }
+            this.logger.error({ err: error }, "[CDPService] Unhandled error in handleNewTarget");
+          });
+        });
         this.browserInstance.on("targetchanged", this.handleTargetChange.bind(this));
         this.browserInstance.on("targetdestroyed", (target) => {
           const targetId = (target as any)._targetId;
@@ -1262,8 +1318,13 @@ export class CDPService extends EventEmitter {
     try {
       const pages = await this.browserInstance.pages();
 
+      let crashedCount = 0;
       const validPages = pages.filter((page) => {
         try {
+          if (this.crashedPages.has(page)) {
+            crashedCount++;
+            return false;
+          }
           const url = page.url();
           return url && url.startsWith("http");
         } catch (e) {
@@ -1272,11 +1333,12 @@ export class CDPService extends EventEmitter {
       });
 
       this.logger.info(
-        `[CDPService] Processing ${validPages.length} valid pages out of ${pages.length} total for storage extraction`,
+        `[CDPService] Processing ${validPages.length} valid pages out of ${pages.length} total for storage extraction` +
+          (crashedCount > 0 ? ` (skipped ${crashedCount} crashed)` : ""),
       );
 
       const results = await Promise.all(
-        validPages.map((page) => extractStorageForPage(page, this.logger)),
+        validPages.map((page) => extractStorageForPageWithTimeout(page, this.logger)),
       );
 
       // Merge all results
@@ -1327,6 +1389,7 @@ export class CDPService extends EventEmitter {
         dangerouslyLogRequestDetails: sessionConfig.dangerouslyLogRequestDetails,
         captureWorkerNetwork: sessionConfig.captureWorkerNetwork,
       },
+      this.pluginManager.onTargetSession.bind(this.pluginManager),
     );
 
     // Notify plugins that a session is starting, before any launch/reuse work begins.
@@ -1366,6 +1429,8 @@ export class CDPService extends EventEmitter {
       this.targetInstrumentationManager = new TargetInstrumentationManager(
         this.instrumentationLogger,
         this.logger,
+        undefined,
+        this.pluginManager.onTargetSession.bind(this.pluginManager),
       );
     } finally {
       await this.pluginManager.onAfterSessionEnd(sessionConfig);
@@ -1466,14 +1531,15 @@ export class CDPService extends EventEmitter {
         await session.send("Emulation.setUserAgentOverride", {
           userAgent: userAgent,
           acceptLanguage: headers["accept-language"],
-          platform: fingerprint.navigator.platform || "Linux x86_64",
+          platform: userAgentMetadata.platform || fingerprint.navigator.platform || "Linux x86_64",
           userAgentMetadata: {
             brands:
               userAgentMetadata.brands as unknown as Protocol.Emulation.UserAgentMetadata["brands"],
             fullVersionList:
               userAgentMetadata.fullVersionList as unknown as Protocol.Emulation.UserAgentMetadata["fullVersionList"],
             fullVersion: userAgentMetadata.uaFullVersion,
-            platform: fingerprint.navigator.platform || "Linux x86_64",
+            platform:
+              userAgentMetadata.platform || fingerprint.navigator.platform || "Linux x86_64",
             platformVersion: userAgentMetadata.platformVersion || "",
             architecture: userAgentMetadata.architecture || "x86",
             model: userAgentMetadata.model || "",
@@ -1508,6 +1574,10 @@ export class CDPService extends EventEmitter {
         }),
       );
     } catch (error) {
+      if (isTargetClosedError(error) || page.isClosed()) {
+        this.logger.debug({ err: error }, "[Fingerprint] Skipping injection; target closed");
+        return;
+      }
       this.logger.error({ error }, `[Fingerprint] Error injecting fingerprint safely`);
       const fingerprintInjector = new FingerprintInjector();
       // @ts-ignore - Ignore type mismatch between puppeteer versions
@@ -1533,7 +1603,6 @@ export class CDPService extends EventEmitter {
         screenHeight: screen.height,
         width: screen.width,
         height: screen.height,
-        viewport: { width: screen.availWidth, height: screen.availHeight, scale: 1, x: 0, y: 0 },
         mobile: /phone|android|mobile/i.test(userAgent),
         screenOrientation:
           screen.height > screen.width
@@ -1541,8 +1610,24 @@ export class CDPService extends EventEmitter {
             : { angle: 90, type: "landscapePrimary" },
         deviceScaleFactor: screen.devicePixelRatio,
       });
-    } finally {
+
+      if (/phone|android|mobile/i.test(userAgent)) {
+        const maxTouchPoints =
+          (this.fingerprintData?.fingerprint.navigator as { maxTouchPoints?: number })
+            .maxTouchPoints ?? 1;
+        await session.send("Emulation.setTouchEmulationEnabled", {
+          enabled: true,
+          maxTouchPoints,
+        });
+      }
+      // Emulation belongs to this CDP connection and resets when it detaches.
+      // Keep it for the page's lifetime so layout and touch signals stay active.
+      page.once("close", () => {
+        void session.detach().catch(() => {});
+      });
+    } catch (error) {
       await session.detach().catch(() => {});
+      throw error;
     }
   }
 

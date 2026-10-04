@@ -6,7 +6,7 @@ echo "🎨 Running code formatting..."
 npm run pretty -w api
 
 echo "🔍 Running linting..."
-npm run lint -w ui --fix
+npm run lint -w ui -- --fix
 
 # Type checking
 echo "🔧 Running type checking..."
