@@ -332,7 +332,7 @@ spec:
             - name: SESSION_VIEWER_PUBLIC_PORT
               value: "8080"
             - name: SESSION_VIEWER_MAX_TTL_MS
-              value: "900000"
+              value: "7200000"
             - name: SESSION_VIEWER_SIGNING_KEY
               valueFrom:
                 secretKeyRef:
