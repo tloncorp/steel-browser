@@ -74,9 +74,15 @@ Chrome session is released. The standalone YAML manifests still place those prof
 `emptyDir`, so they survive idle/release but not Pod replacement. The Terraform cluster-services
 deployment mounts `browser-profiles`, a configurable persistent volume claim, instead.
 
-The manifest admits four browser sessions, expires them after 15 minutes, retains at most 20
+The manifest admits 20 browser sessions, expires them after two hours, retains at most 20
 released-session records, and admits at most one live session per credential so a Chrome profile
 never has concurrent writers.
+
+Viewer and credential-entry links expire at the earlier of the session's hard deadline and
+`SESSION_VIEWER_MAX_TTL_MS` after issuance (two hours by default). The bot's
+`browser handoff <session_id>` tool resolves a fresh signed link through its configured MCP
+connection and passes it directly to the native login card. The model supplies only the session
+handle, never the signed URL. A released session is unavailable even if its link has time remaining.
 
 ## Bare-metal GAR authentication
 
