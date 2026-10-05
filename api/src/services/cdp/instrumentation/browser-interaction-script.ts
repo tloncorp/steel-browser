@@ -260,6 +260,7 @@ export function installBrowserInteractionLogger(options: BrowserInteractionLogge
 
   const isSensitiveField = (target: unknown) => {
     if (!(target instanceof Element)) return false;
+    if (target.getAttribute("data-tlon-sensitive") === "true") return true;
     if (target instanceof HTMLInputElement && target.type.toLowerCase() === "password") return true;
     const autocomplete = (target.getAttribute("autocomplete") || "").toLowerCase().split(/\s+/);
     if (

@@ -45,6 +45,7 @@ function createLogger() {
   const records: BrowserEventUnion[] = [];
   const logger: BrowserLogger = {
     record: (event) => records.push(event),
+    protectValues: () => {},
     resetContext: () => {},
     setContext: () => {},
     getContext: () => ({}),

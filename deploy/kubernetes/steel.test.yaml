@@ -236,6 +236,29 @@ spec:
             # Steel MCP. It is never forwarded to the local browser API.
             - name: STEEL_ALLOWED_HOSTS
               value: steel-mcp,steel-mcp.tlon.svc.cluster.local
+            # Enable after Pioneer and the durable vault secrets are provisioned.
+            - name: BROWSER_VAULT_ENABLED
+              value: "false"
+            - name: BROWSER_VAULT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: browser-vault-secrets
+                  key: encryption-key
+                  optional: true
+            - name: BROWSER_VAULT_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: browser-vault-secrets
+                  key: key-id
+                  optional: true
+            - name: BROWSER_VAULT_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: browser-vault-secrets
+                  key: service-token
+                  optional: true
+            - name: BROWSER_VAULT_PIONEER_ORIGIN
+              value: https://{planet}-feds.internal.test.tlon.systems
             - name: STEEL_LOCAL
               value: "true"
             - name: STEEL_BASE_URL
@@ -319,6 +342,16 @@ spec:
               containerPort: 3001
               protocol: TCP
           env:
+            - name: BROWSER_VAULT_ENABLED
+              value: "false"
+            - name: BROWSER_VAULT_MCP_ORIGIN
+              value: http://127.0.0.1:8000
+            - name: BROWSER_VAULT_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: browser-vault-secrets
+                  key: service-token
+                  optional: true
             - name: SESSION_VIEWER_PUBLIC_ORIGIN
               value: https://browser-session-ovh-test-1.test.tlon.systems
             - name: SESSION_VIEWER_UPSTREAM_ORIGIN

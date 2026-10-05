@@ -111,3 +111,51 @@ for 20 heavy pages.
 
 The NetworkPolicy limits ingress to Pods in `tlon`; `X-Api-Key` provides the tenant boundary within
 that network. Requests without a supported credential are rejected before a tenant runtime exists.
+
+## Planet-backed saved logins
+
+`BROWSER_VAULT_ENABLED=true` on both the MCP and viewer containers enables saved logins.
+The manifests leave it disabled until the service and secrets are configured. Native secure
+forms offer an unchecked save option and an owner-only account chooser. Bot settings lists and
+deletes saved logins. `browser_login` fills through the private browser API and returns only a
+status; it never exposes an account list or password to the model. OTPs, new-password fields,
+cards, cross-origin frames/actions, and HTTP origins are excluded.
+
+Provision `browser-vault-secrets` in each Steel deployment with these keys:
+
+- `encryption-key`: a persistent, base64-encoded 32-byte random key, used only by Steel MCP.
+- `key-id`: the identifier for that encryption key, such as `primary`.
+- `service-token`: a separate random secret of at least 32 characters, shared by the viewer,
+  Steel MCP, and Pioneer. Set Pioneer's `BROWSER_VAULT_SERVICE_TOKEN` to this value.
+
+Use the same encryption key and key ID across browser clusters in one environment, and keep a
+secure backup. Test and production use separate keys. There is no generated startup key or
+plaintext fallback. Changing the encryption key requires a deliberate authenticated re-encryption
+migration of stored records; replacing or losing it makes those records unreadable. Rotating a
+moon's login code or the planet owner token does not require re-encryption.
+
+MCP derives an AES-256-GCM key for each `(planet, moon)` pair using HKDF-SHA256. Pioneer verifies
+the moon's current browser key, derived locally from its login code, before any browser retrieval.
+The code stays in Pioneer. The configured `X-Tlon-Parent-Ship` and `X-Tlon-Ship` upstream headers
+are routing hints until this verification succeeds. Native owner requests additionally prove the
+planet's authenticated `%genuine` token before listing, saving, choosing, or deleting a login.
+A signed viewer link alone grants no durable-vault authority.
+
+Pioneer stores only encrypted records in the **parent planet's** `%settings` bucket
+`%moltbot/%browser-logins`. Each entry is scoped to one bot moon and exact HTTPS origin, with
+version, record ID, revision, timestamps, and key ID authenticated by the cipher. Sibling bots do
+not share entries. Updates and deletes check the record revision under the planet's writer lock.
+Save acknowledgement waits until the planet's scry observes the write; successful form filling
+and successful saving are reported separately. Neither result proves sign-in.
+
+Deploy Pioneer with the service token, then the matching MCP/browser/viewer images, then enable
+both feature flags. Start with synthetic accounts for two bot moons: verify isolation, owner
+selection, username/password steps, deletion, rejected retries, expired/replayed handoffs, and
+browser-key/owner-token rotation. The viewer-to-MCP route and browser REST API remain private;
+Pioneer routing uses the fixed operator-controlled HTTPS origin template. Owner tokens and
+credential payloads are excluded from request logs. Secure fills redact known values from browser
+logs and stop recording that session's remaining DOM/image events.
+Chrome password-manager and autofill saving are disabled; existing profile data is preserved.
+
+Turning both flags off disables saving and reuse while preserving ciphertext on the planet.
+Existing browser cookies are separate: deleting a saved login does not sign out a browser.

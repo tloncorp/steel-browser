@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { CDPService } from "./cdp/cdp.service.js";
+import { createBrowserLogger } from "./cdp/instrumentation/browser-logger.js";
 import {
   discoverCredentialForm,
   fillCredentialForm,
@@ -39,7 +40,14 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
   beforeEach(async () => {
     requests.length = 0;
     page = await browser.newPage();
-    service = { getAllPages: async () => [page] } as unknown as CDPService;
+    const logger = createBrowserLogger({
+      baseLogger: { info() {}, error() {} },
+      enableConsoleLogging: false,
+    });
+    service = {
+      getAllPages: async () => [page],
+      getInstrumentationLogger: () => logger,
+    } as unknown as CDPService;
   });
   afterEach(async () => {
     await page.close();
@@ -68,6 +76,116 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       submit,
     });
   }
+
+  async function loadSecure(body: string) {
+    await page.setRequestInterception(true);
+    page.on(
+      "request",
+      (request) => void request.respond({ status: 200, contentType: "text/html", body }),
+    );
+    await page.goto("https://login.example/signin");
+  }
+
+  it("fills saved HTTPS logins and marks both fields sensitive before any input events", async () => {
+    await loadSecure(`<form onsubmit="event.preventDefault()">${fields}<button>Sign in</button></form>
+      <script>window.leaked=false; document.addEventListener('input',e=>{if(e.target.dataset.tlonSensitive!=='true')window.leaked=true})</script>`);
+    const target = await discoverCredentialForm(service);
+    expect(target.vaultEligible).toBe(true);
+    const result = await fillCredentialForm(service, target, {
+      vault: true,
+      values: { f0: "fixture-user", f1: "fixture-secret" },
+      submit: true,
+    });
+    expect(result.submitted).toBe(true);
+    expect(
+      await page.evaluate(() =>
+        Array.from(document.querySelectorAll("input")).map((input) => [
+          input.value,
+          input.dataset.tlonSensitive,
+        ]),
+      ),
+    ).toEqual([
+      ["fixture-user", "true"],
+      ["fixture-secret", "true"],
+    ]);
+    expect(await page.evaluate("window.leaked")).toBe(false);
+    expect(JSON.stringify(result)).not.toContain("fixture-secret");
+  });
+
+  it("rejects saved credentials for HTTP, cross-origin actions, OTP, and cross-origin frames", async () => {
+    await load(`<form>${fields}</form>`);
+    let target = await discoverCredentialForm(service);
+    expect(target.vaultEligible).toBe(false);
+    await expect(
+      fillCredentialForm(service, target, {
+        vault: true,
+        values: { f0: "fixture-user", f1: "fixture-secret" },
+      }),
+    ).rejects.toThrow("destination changed");
+    await loadSecure(`<form action="https://different.example/receive">${fields}</form>`);
+    expect((await discoverCredentialForm(service)).vaultEligible).toBe(false);
+    await page.setContent('<input autocomplete="one-time-code" required>');
+    expect((await discoverCredentialForm(service)).vaultEligible).toBe(false);
+    await page.setContent(
+      '<iframe src="https://different.example/form" width="600" height="300"></iframe>',
+    );
+    await page.waitForFunction(() => document.querySelector("iframe")?.contentWindow !== null);
+    // Each intercepted document has the login form; the top page contains only the frame.
+    target = await discoverCredentialForm(service);
+    expect(target.origin).toBe("https://different.example");
+    expect(target.vaultEligible).toBe(false);
+  });
+
+  it("refuses a stale destination before disclosing a password, including synchronous field handlers", async () => {
+    await loadSecure(
+      `<form onsubmit="event.preventDefault()">${fields}<button>Sign in</button></form>`,
+    );
+    let target = await discoverCredentialForm(service);
+    await page.evaluate(() => {
+      document.querySelector("form")!.action = "https://different.example/receive";
+    });
+    await expect(
+      fillCredentialForm(service, target, {
+        vault: true,
+        values: { f0: "fixture-user", f1: "fixture-secret" },
+      }),
+    ).rejects.toThrow();
+    expect(await page.$eval("[type=password]", (input) => (input as HTMLInputElement).value)).toBe(
+      "",
+    );
+    await page.evaluate(() => {
+      document.querySelector("form")!.action = "/signin";
+      document.querySelector("[name=username]")!.addEventListener("input", () => {
+        document.querySelector("form")!.action = "https://different.example/receive";
+      });
+    });
+    target = await discoverCredentialForm(service);
+    await expect(
+      fillCredentialForm(service, target, {
+        vault: true,
+        values: { f0: "fixture-user", f1: "fixture-secret" },
+      }),
+    ).rejects.toThrow();
+    expect(await page.$eval("[type=password]", (input) => (input as HTMLInputElement).value)).toBe(
+      "",
+    );
+  });
+
+  it("checks the destination again after focus handlers run", async () => {
+    await loadSecure(`<form>${fields}<button>Sign in</button></form><script>
+      document.querySelector('[type=password]').onfocus=()=>{document.querySelector('form').action='https://different.example/receive'}
+    </script>`);
+    const target = await discoverCredentialForm(service);
+    await expect(
+      fillCredentialForm(service, target, {
+        vault: true,
+        values: { f0: "fixture-user", f1: "fixture-secret" },
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(await page.$eval("[type=password]", (input) => (input as HTMLInputElement).value)).toBe(
+      "",
+    );
+  });
 
   it("activates click-only handlers with trusted browser input", async () => {
     await load(`<form onsubmit="event.preventDefault()">${fields}<button type="button"

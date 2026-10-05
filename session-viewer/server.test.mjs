@@ -284,6 +284,7 @@ async function secureGateway(
   fields,
   kind = "login",
   fillStatus = 200,
+  vault,
 ) {
   const posted = [];
   const metadata = {
@@ -324,6 +325,7 @@ async function secureGateway(
     publicOrigin: "https://viewer.example",
     upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
     maximumTtlMs: 900_000,
+    vault,
   });
   const publicPort = await listen(publicServer);
   context.after(() => Promise.all([close(publicServer), close(upstream)]));
@@ -333,13 +335,15 @@ async function secureGateway(
   );
   const base = `http://127.0.0.1:${publicPort}`;
   const discover = () => fetch(`${base}/credentials/${capability}`);
+  const cancel = () =>
+    fetch(`${base}/credentials/${capability}`, { method: "DELETE" });
   const fill = (id, body) =>
     fetch(`${base}/credential-fills/${id}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     });
-  return { metadata, posted, discover, fill, internal };
+  return { metadata, posted, discover, fill, cancel, internal, base };
 }
 
 test("secure handoffs expose metadata and a one-use endpoint, never values or selectors", async (context) => {
@@ -493,3 +497,200 @@ for (const fields of [
     assert.equal((await gateway.discover()).status, 502);
   });
 }
+
+test("saved-login requests require the private service and a one-use prepared handoff", async (context) => {
+  const calls = [];
+  const vault = http.createServer(async (request, response) => {
+    assert.equal(request.headers["x-browser-vault-service"], secret);
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+    calls.push({ path: request.url, body });
+    const answer = request.url.endsWith("/prepare")
+      ? {
+          available: true,
+          planet: "sampel-palnet",
+          moon: "pinser-botter-sampel-palnet",
+        }
+      : request.url.endsWith("/authorize")
+      ? {
+          grant: "g".repeat(43),
+          accounts: [{ id: sessionId, label: "Personal", revision: 1 }],
+        }
+      : { ok: true, submitted: true, saveStatus: "failed" };
+    response
+      .writeHead(200, { "content-type": "application/json" })
+      .end(JSON.stringify(answer));
+  });
+  const port = await listen(vault);
+  context.after(() => close(vault));
+  const gateway = await secureGateway(
+    context,
+    [
+      {
+        id: "f0",
+        purpose: "current-password",
+        label: "Password",
+        inputType: "password",
+        required: true,
+      },
+    ],
+    "login",
+    200,
+    { origin: `http://127.0.0.1:${port}`, token: secret },
+  );
+  gateway.metadata.vaultEligible = true;
+  const handoff = await (await gateway.discover()).json();
+  assert.deepEqual(handoff.vault, {
+    available: true,
+    planet: "sampel-palnet",
+    moon: "pinser-botter-sampel-palnet",
+  });
+  assert.equal(calls[0].body.sessionId, sessionId);
+  const authorize = await fetch(
+    `${gateway.base}/credential-vault/${handoff.handoffId}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        planet: "sampel-palnet",
+        ownerToken: "owner-private",
+      }),
+    },
+  );
+  const auth = await authorize.json();
+  assert.equal(calls[1].path, "/internal/vault/authorize");
+  assert.equal(calls[1].body.ownerToken, "owner-private");
+  for (const values of [null, [], {}, "unexpected"]) {
+    assert.equal(
+      (
+        await gateway.fill(handoff.handoffId, {
+          use: { id: sessionId, revision: 1 },
+          grant: auth.grant,
+          values,
+        })
+      ).status,
+      400,
+    );
+  }
+  const result = await gateway.fill(handoff.handoffId, {
+    grant: auth.grant,
+    values: { f0: "fixture-password" },
+    submit: true,
+    save: { label: "Personal" },
+  });
+  assert.deepEqual(await result.json(), {
+    ok: true,
+    submitted: true,
+    saveStatus: "failed",
+  });
+  assert.equal(calls[2].path, "/internal/vault/fill");
+  assert.equal(calls[2].body.handoffId, handoff.handoffId);
+  assert.equal(
+    gateway.posted.length,
+    0,
+    "the vault owns the single private browser fill",
+  );
+  assert.equal(
+    (
+      await gateway.fill(handoff.handoffId, {
+        use: { id: sessionId, revision: 1 },
+        grant: auth.grant,
+      })
+    ).status,
+    401,
+  );
+  assert.equal(
+    (
+      await fetch(`${gateway.base}/credential-vault/${handoff.handoffId}`, {
+        method: "POST",
+        body: "{}",
+      })
+    ).status,
+    404,
+  );
+  assert.equal(JSON.stringify(handoff).includes("owner-private"), false);
+  const abandoned = await (await gateway.discover()).json();
+  assert.equal((await gateway.cancel()).status, 200);
+  assert.deepEqual(calls.at(-1), {
+    path: "/internal/vault/cancel",
+    body: { sessionId },
+  });
+  assert.equal(
+    (
+      await gateway.fill(abandoned.handoffId, {
+        use: { id: sessionId, revision: 1 },
+        grant: auth.grant,
+      })
+    ).status,
+    401,
+  );
+});
+
+test("manual entry discards pending save consent and unavailable vaults do not block it", async (context) => {
+  const paths = [];
+  let available = true;
+  const vault = http.createServer(async (request, response) => {
+    paths.push(request.url);
+    for await (const _ of request) {
+      /* drain bounded fixture body */
+    }
+    response
+      .writeHead(available ? 200 : 503, { "content-type": "application/json" })
+      .end(
+        JSON.stringify(
+          request.url.endsWith("/prepare")
+            ? {
+                available: true,
+                planet: "sampel-palnet",
+                moon: "pinser-botter-sampel-palnet",
+              }
+            : { ok: true },
+        ),
+      );
+  });
+  const port = await listen(vault);
+  context.after(() => close(vault));
+  const gateway = await secureGateway(
+    context,
+    [
+      {
+        id: "f0",
+        purpose: "username",
+        label: "Username",
+        inputType: "text",
+        required: true,
+      },
+    ],
+    "login",
+    200,
+    { origin: `http://127.0.0.1:${port}`, token: secret },
+  );
+  gateway.metadata.vaultEligible = true;
+  const handoff = await (await gateway.discover()).json();
+  assert.equal(
+    (
+      await gateway.fill(handoff.handoffId, {
+        values: { f0: "manual-user" },
+        submit: true,
+      })
+    ).status,
+    200,
+  );
+  assert.deepEqual(paths, [
+    "/internal/vault/prepare",
+    "/internal/vault/discard",
+  ]);
+  assert.equal(gateway.posted.length, 1);
+  available = false;
+  const withoutVault = await (await gateway.discover()).json();
+  assert.equal(withoutVault.vault, undefined);
+  assert.equal(
+    (
+      await gateway.fill(withoutVault.handoffId, {
+        values: { f0: "manual-user" },
+      })
+    ).status,
+    200,
+  );
+});

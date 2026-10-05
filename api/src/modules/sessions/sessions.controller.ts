@@ -324,6 +324,7 @@ export const handleFillCredentialForm = async (
       };
       values: Record<string, string>;
       submit?: boolean;
+      vault?: boolean;
     };
   }>,
   reply: FastifyReply,
@@ -342,6 +343,7 @@ export const handleFillCredentialForm = async (
       {
         values: request.body.values,
         submit: request.body.submit,
+        vault: request.body.vault,
       },
     );
     return reply.send({ ok: true, ...result });

@@ -12,10 +12,12 @@ export interface CredentialFormTarget {
 }
 export interface CredentialFormDescription extends CredentialFormTarget {
   fields: SecureFormField[];
+  vaultEligible: boolean;
 }
 export interface CredentialFormValues {
   values: Record<string, string>;
   submit?: boolean;
+  vault?: boolean;
 }
 export class CredentialFormError extends Error {
   constructor(
@@ -566,6 +568,34 @@ async function discoverBoundForm(cdpService: CDPService): Promise<CredentialForm
       origin: httpOrigin(frame.url())!,
       kind,
       fields,
+      vaultEligible:
+        kind === "login" &&
+        new URL(frame.url()).protocol === "https:" &&
+        httpOrigin(page.url()) === httpOrigin(frame.url()) &&
+        fields.every((field) => ["username", "current-password"].includes(field.purpose)) &&
+        new Set(fields.map((field) => field.purpose)).size === fields.length &&
+        (await handle
+          .evaluate((form) =>
+            form.controls.every(({ input }) => {
+              if (
+                input.form &&
+                new URL(input.form.action, document.baseURI).origin !== location.origin
+              )
+                return false;
+              return (
+                !input.form ||
+                Array.from(
+                  document.querySelectorAll<HTMLButtonElement | HTMLInputElement>("[formaction]"),
+                )
+                  .filter((button) => button.form === input.form)
+                  .every(
+                    (button) =>
+                      new URL(button.formAction, document.baseURI).origin === location.origin,
+                  )
+              );
+            }),
+          )
+          .catch(() => false)),
     };
     await releaseForm(cdpService);
     const timer = setTimeout(() => {
@@ -599,6 +629,12 @@ async function fillBoundForm(
     throw new CredentialFormError("The form is no longer available. Reconnect to continue.", 409);
   }
   const { values } = request;
+  if (
+    request.vault &&
+    (!located.description.vaultEligible || httpOrigin(located.frame.page().url()) !== target.origin)
+  ) {
+    throw new CredentialFormError("The login destination changed. Reconnect to continue.", 409);
+  }
   const fields = located.description.fields;
   if (
     !values ||
@@ -624,12 +660,37 @@ async function fillBoundForm(
       throw new CredentialFormError("A field does not match the form's requirements.", 400);
   }
   await clearContinuation(cdpService);
+  cdpService.getInstrumentationLogger().protectValues(Object.values(values));
   const anchorHandle = await located.handle
     .evaluateHandle(
-      (form, target, values) => {
+      (form, target, values, vault) => {
         const valid = () =>
           location.href === target.frameUrl &&
           location.origin === target.origin &&
+          (!vault ||
+            (location.protocol === "https:" &&
+              (() => {
+                try {
+                  return top?.location.origin === location.origin;
+                } catch {
+                  return false;
+                }
+              })() &&
+              form.controls.every(
+                ({ input }) =>
+                  !input.form ||
+                  (new URL(input.form.action, document.baseURI).origin === location.origin &&
+                    Array.from(
+                      document.querySelectorAll<HTMLButtonElement | HTMLInputElement>(
+                        "[formaction]",
+                      ),
+                    )
+                      .filter((button) => button.form === input.form)
+                      .every(
+                        (button) =>
+                          new URL(button.formAction, document.baseURI).origin === location.origin,
+                      )),
+              ))) &&
           form.controls.every(({ input, form, attributes, action, options }) => {
             const rect = input.getBoundingClientRect();
             return (
@@ -675,7 +736,9 @@ async function fillBoundForm(
             // Event handlers can replace another field synchronously. Stop before
             // delivering any value to a replacement or a different destination.
             if (!valid()) return null;
+            input.setAttribute("data-tlon-sensitive", "true");
             input.focus();
+            if (!valid()) return null;
             if (input instanceof HTMLSelectElement) {
               const setter = Object.getOwnPropertyDescriptor(
                 HTMLSelectElement.prototype,
@@ -704,6 +767,7 @@ async function fillBoundForm(
       },
       target,
       values,
+      request.vault === true,
     )
     .catch(() => undefined);
   const anchor = anchorHandle?.asElement() as ElementHandle<FormControl> | null;

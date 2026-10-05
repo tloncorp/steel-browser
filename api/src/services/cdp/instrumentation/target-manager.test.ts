@@ -24,6 +24,7 @@ describe("TargetInstrumentationManager", () => {
     } as unknown as Target;
     const logger = {
       record: vi.fn(),
+      protectValues: () => {},
       resetContext: vi.fn(),
       setContext: vi.fn(),
       getContext: vi.fn().mockReturnValue({}),
@@ -93,6 +94,7 @@ describe("TargetInstrumentationManager", () => {
     } as unknown as Target;
     const logger = {
       record: vi.fn(),
+      protectValues: () => {},
       resetContext: vi.fn(),
       setContext: vi.fn(),
       getContext: vi.fn().mockReturnValue({}),
@@ -139,6 +141,7 @@ describe("TargetInstrumentationManager", () => {
     } as unknown as Target;
     const logger = {
       record: vi.fn(),
+      protectValues: () => {},
       resetContext: vi.fn(),
       setContext: vi.fn(),
       getContext: vi.fn().mockReturnValue({}),
