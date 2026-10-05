@@ -4,6 +4,7 @@ import { test } from "node:test";
 
 import {
   createGateway,
+  DEFAULT_SESSION_VIEWER_MAX_TTL_MS,
   mintCapability,
   rewriteSession,
   verifyCapability,
@@ -11,6 +12,62 @@ import {
 
 const secret = "test-secret-that-is-at-least-thirty-two-bytes-long";
 const sessionId = "123e4567-e89b-42d3-a456-426614174000";
+
+test("viewer links last through a two-hour session, never beyond its deadline", () => {
+  const startedAt = Date.parse("2026-10-03T12:00:00Z");
+  const timeout = 7_200_000;
+  const now = startedAt + 1_800_000;
+  const rewritten = rewriteSession(
+    {
+      id: sessionId,
+      status: "live",
+      createdAt: new Date(startedAt).toISOString(),
+      timeout,
+    },
+    {
+      secret,
+      publicOrigin: "https://viewer.test",
+      maximumTtlMs: DEFAULT_SESSION_VIEWER_MAX_TTL_MS,
+    },
+    now,
+  );
+  const capability = new URL(rewritten.sessionViewerUrl).pathname.split(
+    "/s/",
+  )[1];
+  assert.deepEqual(verifyCapability(capability, secret, now + 3_600_000), {
+    sessionId,
+    expiresAt: startedAt + timeout,
+  });
+  assert.equal(
+    verifyCapability(capability, secret, startedAt + timeout),
+    undefined,
+  );
+});
+
+test("viewer link lifetime is capped for sessions longer than the configured maximum", () => {
+  const now = 20_000;
+  const rewritten = rewriteSession(
+    {
+      id: sessionId,
+      status: "live",
+      createdAt: new Date(now).toISOString(),
+      timeout: 86_400_000,
+    },
+    {
+      secret,
+      publicOrigin: "https://viewer.test",
+      maximumTtlMs: DEFAULT_SESSION_VIEWER_MAX_TTL_MS,
+    },
+    now,
+  );
+  const capability = new URL(rewritten.sessionViewerUrl).pathname.split(
+    "/s/",
+  )[1];
+  assert.deepEqual(verifyCapability(capability, secret, now), {
+    sessionId,
+    expiresAt: now + 7_200_000,
+  });
+});
 
 test("capabilities authenticate one session until their expiration", () => {
   const token = mintCapability({ sessionId, expiresAt: 20_000 }, secret);

@@ -15,6 +15,7 @@ import {
   PageInfo,
 } from "../../types/casting.js";
 import { getPageFavicon, getPageTitle, navigatePage } from "../../utils/casting.js";
+import { getPageViewport, PageViewport } from "./casting-viewport.js";
 
 export async function handleCastSession(
   request: IncomingMessage,
@@ -56,12 +57,15 @@ export async function handleCastSession(
     let targetPage: Page | null = null;
     let targetClient: CDPSession | null = null;
     let targetPageId: string | null = null;
+    let viewportClient: ReturnType<PageViewport["attach"]> | null = null;
 
     const activePages = new Map<string, Page>();
 
     let heartbeatInterval: NodeJS.Timeout | null = null;
 
     const handleSessionCleanup = () => {
+      viewportClient?.close();
+      viewportClient = null;
       if (heartbeatInterval) {
         clearInterval(heartbeatInterval);
         heartbeatInterval = null;
@@ -115,6 +119,8 @@ export async function handleCastSession(
         }
       }
     };
+
+    ws.once("close", handleSessionCleanup);
 
     const sendTabList = async () => {
       try {
@@ -176,11 +182,18 @@ export async function handleCastSession(
     try {
       const browserEndpoint = new URL(`ws://${env.HOST}:${env.PORT}`);
       browserEndpoint.searchParams.set("sessionId", id);
-      browser = await puppeteer.connect({ browserWSEndpoint: browserEndpoint.toString() });
+      browser = await puppeteer.connect({
+        browserWSEndpoint: browserEndpoint.toString(),
+        defaultViewport: null,
+      });
 
       if (!browser) {
         console.error("Failed to connect to browser");
         socket.destroy();
+        return;
+      }
+      if (ws.readyState !== WebSocket.OPEN) {
+        handleSessionCleanup();
         return;
       }
 
@@ -250,10 +263,6 @@ export async function handleCastSession(
           }
         }, 30000);
 
-        ws.on("close", () => {
-          handleSessionCleanup();
-        });
-
         ws.on("error", (err) => {
           console.error("Tab discovery WebSocket error:", err);
           handleSessionCleanup();
@@ -280,6 +289,17 @@ export async function handleCastSession(
 
         // Setup screencast for the target page
         targetClient = await targetPage.target().createCDPSession();
+        if (ws.readyState !== WebSocket.OPEN) {
+          handleSessionCleanup();
+          return;
+        }
+        viewportClient = getPageViewport(sessionService.getCDPService(id), targetPageId, {
+          width,
+          height,
+          mobile: isMobile,
+        }).attach((message) => {
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
+        });
 
         ws.on("message", async (message) => {
           try {
@@ -289,13 +309,48 @@ export async function handleCastSession(
               | InsertTextEvent
               | NavigationEvent
               | CloseTabEvent
-              | GetSelectedTextEvent = JSON.parse(message.toString());
+              | GetSelectedTextEvent
+              | { type: "viewport" } = JSON.parse(message.toString());
             const { type } = data;
 
             if (!targetClient || !targetPage) {
               console.error("No target page or client available for input handling");
               return;
             }
+
+            if (type === "viewport") {
+              await viewportClient?.resize(data, async (viewport, reload) => {
+                if (!targetClient || !targetPage || ws.readyState !== WebSocket.OPEN)
+                  throw new Error("Viewer disconnected");
+                await targetClient.send("Emulation.setDeviceMetricsOverride", {
+                  width: viewport.width,
+                  height: viewport.height,
+                  screenWidth: viewport.width,
+                  screenHeight: viewport.height,
+                  mobile: viewport.mobile,
+                  deviceScaleFactor: 1,
+                  screenOrientation:
+                    viewport.width > viewport.height
+                      ? { angle: 90, type: "landscapePrimary" }
+                      : { angle: 0, type: "portraitPrimary" },
+                });
+                await targetClient.send("Emulation.setTouchEmulationEnabled", {
+                  enabled: viewport.mobile,
+                  maxTouchPoints: 1,
+                });
+                if (reload)
+                  await targetPage.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
+                await targetClient.send("Page.stopScreencast");
+                await targetClient.send("Page.startScreencast", {
+                  format: "jpeg",
+                  quality: 75,
+                  maxWidth: 2560,
+                  maxHeight: 1600,
+                });
+              });
+              return;
+            }
+            if (!viewportClient?.canControl()) return;
 
             switch (type) {
               case "mouseEvent": {
@@ -385,28 +440,8 @@ export async function handleCastSession(
           }
         });
 
-        // Setup device metrics and start screencast
-        await targetClient.send("Page.setDeviceMetricsOverride", {
-          screenHeight: height,
-          screenWidth: width,
-          width,
-          height,
-          mobile: isMobile,
-          screenOrientation: isMobile
-            ? { angle: 0, type: "portraitPrimary" }
-            : { angle: 90, type: "landscapePrimary" },
-          deviceScaleFactor: isMobile ? 3 : 1,
-        });
-
-        await targetClient.send("Page.startScreencast", {
-          format: "jpeg",
-          quality: 75,
-          maxWidth: width,
-          maxHeight: height,
-        });
-
         // Handle screencast frames
-        targetClient.on("Page.screencastFrame", async ({ data, sessionId }) => {
+        targetClient.on("Page.screencastFrame", async ({ data, sessionId, metadata }) => {
           try {
             // Acknowledge the frame right away to free up memory
             await targetClient?.send("Page.screencastFrameAck", { sessionId });
@@ -424,13 +459,24 @@ export async function handleCastSession(
                   title,
                   favicon,
                   data,
+                  metadata,
                 }),
               );
             }
           } catch (err) {
-            console.error("Error in Page.screencastFrame handler:", err);
+            if (targetClient && ws.readyState === WebSocket.OPEN) {
+              console.error("Error in Page.screencastFrame handler:", err);
+            }
           }
         });
+
+        await targetClient.send("Page.startScreencast", {
+          format: "jpeg",
+          quality: 75,
+          maxWidth: 2560,
+          maxHeight: 1600,
+        });
+        viewportClient.ready();
 
         // Cleanup when target is destroyed
         browser.on("targetdestroyed", async (target) => {
@@ -472,11 +518,6 @@ export async function handleCastSession(
             handleSessionCleanup();
           }
         }, 30000);
-
-        // Cleanup on WebSocket closure
-        ws.on("close", () => {
-          handleSessionCleanup();
-        });
 
         // Handle errors
         ws.on("error", (err) => {

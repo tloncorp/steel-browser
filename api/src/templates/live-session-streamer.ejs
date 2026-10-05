@@ -67,6 +67,7 @@
             box-sizing: border-box;
         }
         .url-bar {
+            min-width: 0;
               width: 100%;
             height: 28px;
             padding: 0 12px;
@@ -127,7 +128,39 @@
             left: 50%;
             transform: translateX(-50%);
             object-fit: contain;
+            touch-action: none;
           }
+
+          .viewport-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 8px;
+            flex: 0 0 auto;
+            color: var(--text-color);
+            background: var(--bg-secondary);
+            font-size: 12px;
+          }
+          .viewport-controls select {
+            font: inherit;
+            font-size: 16px;
+            color: inherit;
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            min-height: 32px;
+          }
+          .viewport-confirm {
+            max-width: min(360px, calc(100% - 64px));
+            padding: 20px;
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            background: var(--bg-primary);
+            color: var(--text-color);
+          }
+          .viewport-confirm::backdrop { background: rgba(0, 0, 0, .45); }
+          .viewport-confirm p { line-height: 1.5; }
+          .viewport-confirm button { font: inherit; padding: 10px 14px; }
 
           /* Tab bar styles */
           .tab-bar {
@@ -484,6 +517,23 @@
               </div>
           </div>
         <% } %>
+        <% if (interactive && showControls) { %>
+        <div class="viewport-controls">
+            <label for="viewport-mode">View</label>
+            <select id="viewport-mode" disabled>
+                <option value="auto">Auto</option>
+                <option value="mobile">Mobile</option>
+                <option value="desktop">Desktop</option>
+            </select>
+            <span id="viewport-status" role="status">Connecting…</span>
+        </div>
+        <dialog id="viewport-confirm" class="viewport-confirm" aria-labelledby="viewport-confirm-title">
+            <strong id="viewport-confirm-title">Reload to change mobile emulation?</strong>
+            <p>The remote page will reload. Unsent form input may be lost.</p>
+            <button id="viewport-cancel" type="button">Cancel</button>
+            <button id="viewport-reload" type="button">Reload page</button>
+        </dialog>
+        <% } %>
         <div class="content" id="content">
             <!-- Canvas containers will be dynamically added here -->
         </div>
@@ -503,6 +553,10 @@
           const forwardButton = document.getElementById('forward-button');
           const refreshButton = document.getElementById('refresh-button');
           const connectionStatus = document.getElementById('connection-status');
+          const viewportMode = document.getElementById('viewport-mode');
+          const viewportStatus = document.getElementById('viewport-status');
+          const viewportConfirm = document.getElementById('viewport-confirm');
+          let pendingConfirmation = null;
 
           let tabs = {};
           let activeTabId = null;
@@ -514,7 +568,55 @@
 
           // Default dimensions until we get first image
           const defaultWidth = <%= dimensions?.width || 1920 %>;
-          const defaultHeight = <%= dimensions?.width || 1080 %>;
+          const defaultHeight = <%= dimensions?.height || 1080 %>;
+
+          function requestViewport(pageId, mode, reload = false) {
+              const tab = tabs[pageId];
+              if (!interactive || !tab?.viewportReady || tab.websocket?.readyState !== WebSocket.OPEN) return;
+              if (!mode && tab.pendingMode) return;
+              if (!contentContainer.clientWidth || !contentContainer.clientHeight) return;
+              tab.websocket.send(JSON.stringify({
+                  type: 'viewport',
+                  mode: mode || tab.viewportMode,
+                  width: Math.round(contentContainer.clientWidth),
+                  height: Math.round(contentContainer.clientHeight),
+                  reload,
+              }));
+          }
+
+          viewportMode?.addEventListener('change', () => {
+              tabs[activeTabId].pendingMode = viewportMode.value;
+              requestViewport(activeTabId, viewportMode.value);
+          });
+          function finishViewportConfirmation(reload) {
+              const pending = pendingConfirmation;
+              pendingConfirmation = null;
+              viewportConfirm?.close();
+              if (!pending || !tabs[pending.pageId]) return;
+              if (reload) {
+                  requestViewport(pending.pageId, pending.mode, true);
+              } else {
+                  tabs[pending.pageId].pendingMode = null;
+                  if (viewportMode && activeTabId === pending.pageId) {
+                      viewportMode.value = tabs[pending.pageId].viewportMode;
+                      viewportMode.disabled = !tabs[pending.pageId].controlling;
+                  }
+              }
+          }
+          document.getElementById('viewport-cancel')?.addEventListener('click', () => finishViewportConfirmation(false));
+          document.getElementById('viewport-reload')?.addEventListener('click', () => finishViewportConfirmation(true));
+          viewportConfirm?.addEventListener('cancel', (event) => {
+              event.preventDefault();
+              finishViewportConfirmation(false);
+          });
+          let resizeTimer;
+          new ResizeObserver(() => {
+              if (activeTabId) updateCanvasSize(activeTabId);
+              clearTimeout(resizeTimer);
+              resizeTimer = setTimeout(() => {
+                  if (tabs[activeTabId]?.controlling) requestViewport(activeTabId);
+              }, 150);
+          }).observe(contentContainer);
 
           // Function to set connection status
           function setConnectionStatus(online) {
@@ -635,6 +737,14 @@
                       }
                       tabs[pageId].reconnecting = false;
                       tabs[pageId].intentionalClose = false;
+                      tabs[pageId].viewportReady = false;
+                      tabs[pageId].controlling = false;
+                      tabs[pageId].pendingMode = null;
+                      if (activeTabId === pageId && viewportMode) {
+                          viewportMode.disabled = true;
+                          viewportStatus.textContent = 'Disconnected';
+                      }
+                      if (pendingConfirmation?.pageId === pageId) finishViewportConfirmation(false);
                   }
               };
 
@@ -675,6 +785,50 @@
                   }
 
                   // For regular tabs, handle data
+                  if (payload.type === 'viewportState') {
+                      const tab = tabs[pageId];
+                      if (!tab) return;
+                      tab.viewportReady = true;
+                      tab.viewportMode = payload.mode;
+                      tab.controlling = payload.controlling;
+                      tab.viewportWidth = payload.width;
+                      tab.viewportHeight = payload.height;
+                      tab.awaitingFrame = tab.frameMetadata?.deviceWidth !== payload.width || tab.frameMetadata?.deviceHeight !== payload.height;
+                      const modeFinished = tab.pendingMode === payload.mode;
+                      if (modeFinished) tab.pendingMode = null;
+                      if (activeTabId === pageId && viewportMode) {
+                          viewportMode.value = tab.pendingMode || payload.mode;
+                          viewportMode.disabled = !!tab.pendingMode || (!payload.controlling && !payload.available);
+                          viewportStatus.textContent = payload.controlling || payload.available
+                              ? (payload.mode === 'auto' ? 'Fits this screen' : payload.mode === 'mobile' ? 'Mobile emulation' : 'Desktop layout')
+                              : 'Another viewer has control';
+                          for (const button of [backButton, forwardButton, refreshButton]) {
+                              if (button) button.disabled = !payload.controlling;
+                          }
+                          if (urlText) urlText.readOnly = !payload.controlling;
+                      }
+                      if (payload.available && activeTabId === pageId) requestViewport(pageId);
+                      else if (modeFinished && payload.controlling) requestViewport(pageId);
+                      return;
+                  }
+                  if (payload.type === 'viewportReloadRequired') {
+                      if (viewportConfirm && activeTabId === pageId) {
+                          pendingConfirmation = { pageId, mode: payload.mode };
+                          if (!viewportConfirm.open) viewportConfirm.showModal();
+                      }
+                      return;
+                  }
+                  if (payload.type === 'viewportError') {
+                      if (tabs[pageId]) {
+                          tabs[pageId].pendingMode = null;
+                          if (viewportMode && activeTabId === pageId) {
+                              viewportMode.value = tabs[pageId].viewportMode;
+                              viewportMode.disabled = !tabs[pageId].controlling;
+                          }
+                      }
+                      if (viewportStatus) viewportStatus.textContent = payload.message;
+                      return;
+                  }
                   if (payload.type === "tabUpdate") {
                       updateTabInfo(pageId, payload.url, payload.title, payload.favicon);
                       return;
@@ -688,6 +842,11 @@
                       if (!tabs[pageId]) {
                           // console.error(`Received data for nonexistent tab ${pageId}`);
                           return;
+                      }
+                      const timestamp = payload.metadata?.timestamp;
+                      if (Number.isFinite(timestamp)) {
+                          if (timestamp < (tabs[pageId].lastFrameTimestamp || 0)) return;
+                          tabs[pageId].lastFrameTimestamp = timestamp;
                       }
 
                       // Remove tab switching indicator when we receive the first frame
@@ -719,21 +878,18 @@
                       }, '*');
 
                 const img = new Image();
+                      const frameNumber = tabs[pageId].frameNumber = (tabs[pageId].frameNumber || 0) + 1;
                       const imageData = 'data:image/jpeg;base64,' + payload.data;
                       tabs[pageId].lastImageData = imageData;
 
                 img.onload = () => {
+                          if (!tabs[pageId] || tabs[pageId].frameNumber !== frameNumber) return;
                           tabs[pageId].currentImageWidth = img.naturalWidth;
                           tabs[pageId].currentImageHeight = img.naturalHeight;
+                          tabs[pageId].frameMetadata = payload.metadata;
+                          tabs[pageId].awaitingFrame = payload.metadata?.deviceWidth !== tabs[pageId].viewportWidth || payload.metadata?.deviceHeight !== tabs[pageId].viewportHeight;
+                          tabs[pageId].lastImage = img;
                           updateCanvasSize(pageId);
-
-                          tabs[pageId].ctx.drawImage(
-                        img,
-                        0,
-                        0,
-                              Math.floor(tabs[pageId].canvas.width / window.devicePixelRatio),
-                              Math.floor(tabs[pageId].canvas.height / window.devicePixelRatio)
-                          );
 
                           tabs[pageId].canvasContainer.style.backgroundColor = 'var(--bg-secondary)';
                       };
@@ -962,11 +1118,13 @@
           // Set up WebSocket-related event listeners for a canvas
           function setupCanvasEventListeners(canvas, pageId, ws) {
               if (!canvas || !ws || !interactive) return;
+              const inputReady = () => ws.readyState === WebSocket.OPEN && tabs[pageId]?.controlling && !tabs[pageId].awaitingFrame;
 
               // Remove any existing event listeners first to prevent duplicates
               canvas.removeEventListener('mousedown', canvas._mouseDownHandler);
               canvas.removeEventListener('mouseup', canvas._mouseUpHandler);
               canvas.removeEventListener('mousemove', canvas._mouseMoveHandler);
+              canvas.removeEventListener('mousemove', canvas._debouncedMouseMoveHandler);
               canvas.removeEventListener('wheel', canvas._wheelHandler);
 
               // Helper function for scaled coordinates
@@ -978,27 +1136,20 @@
                   const canvasWidth = rect.width;
                   const canvasHeight = rect.height;
 
-                  // Calculate scaling factors
-                  const scaleX = tabData.currentImageWidth / canvasWidth;
-                  const scaleY = tabData.currentImageHeight / canvasHeight;
-
-                  // Calculate the canvas offset from the left edge of the viewport
-                  const canvasLeftOffset = rect.left;
-
-                  // Calculate scaled coordinates relative to the canvas
-                  const x = Math.round((e.clientX - canvasLeftOffset) * scaleX);
-                  const y = Math.round((e.clientY - rect.top) * scaleY);
-
-                  // Ensure coordinates are within bounds
+                  const metadata = tabData.frameMetadata;
+                  if (!metadata || !canvasWidth || !canvasHeight) return { x: 0, y: 0 };
+                  const scale = metadata.pageScaleFactor || 1;
+                  const x = (e.clientX - rect.left) * metadata.deviceWidth / canvasWidth / scale;
+                  const y = ((e.clientY - rect.top) * metadata.deviceHeight / canvasHeight - metadata.offsetTop) / scale;
                   return {
-                      x: Math.max(0, Math.min(x, tabData.currentImageWidth)),
-                      y: Math.max(0, Math.min(y, tabData.currentImageHeight))
+                      x: Math.max(0, Math.round(x)),
+                      y: Math.max(0, Math.round(y))
                   };
               }
 
               // MouseDown event
               canvas._mouseDownHandler = (e) => {
-                  if (ws.readyState !== WebSocket.OPEN) return;
+                  if (!inputReady()) return;
 
                   const coords = getScaledCoordinates(e, canvas, pageId);
 
@@ -1021,7 +1172,7 @@
 
               // MouseUp event
               canvas._mouseUpHandler = (e) => {
-                  if (ws.readyState !== WebSocket.OPEN) return;
+                  if (!inputReady()) return;
 
                   const coords = getScaledCoordinates(e, canvas, pageId);
 
@@ -1044,7 +1195,7 @@
 
               // MouseMove event
               canvas._mouseMoveHandler = (e) => {
-                  if (ws.readyState !== WebSocket.OPEN) return;
+                  if (!inputReady()) return;
 
                   const coords = getScaledCoordinates(e, canvas, pageId);
 
@@ -1073,7 +1224,7 @@
 
               // Create debounced version of mouseMoveHandler
               canvas._debouncedMouseMoveHandler = debounce((e) => {
-                  if (ws.readyState !== WebSocket.OPEN) return;
+                  if (!inputReady()) return;
 
                   const coords = getScaledCoordinates(e, canvas, pageId);
 
@@ -1095,7 +1246,7 @@
 
               // Wheel event
               canvas._wheelHandler = (e) => {
-                  if (ws.readyState !== WebSocket.OPEN) return;
+                  if (!inputReady()) return;
 
                   const coords = getScaledCoordinates(e, canvas, pageId);
 
@@ -1118,6 +1269,43 @@
               };
               canvas.addEventListener('wheel', canvas._wheelHandler);
 
+              // Touch taps become clicks; drags scroll the remote page, not the local canvas.
+              canvas._touchAbort?.abort();
+              canvas._touchAbort = new AbortController();
+              const touchOptions = { signal: canvas._touchAbort.signal };
+              let touch = null;
+              canvas.addEventListener('pointerdown', (event) => {
+                  if (event.pointerType === 'mouse' || !event.isPrimary || !inputReady()) return;
+                  event.preventDefault();
+                  canvas.setPointerCapture(event.pointerId);
+                  touch = { id: event.pointerId, startX: event.clientX, startY: event.clientY, point: getScaledCoordinates(event, canvas, pageId), moved: false };
+              }, touchOptions);
+              canvas.addEventListener('pointermove', (event) => {
+                  if (!touch || event.pointerId !== touch.id || !inputReady()) return;
+                  event.preventDefault();
+                  const point = getScaledCoordinates(event, canvas, pageId);
+                  if (Math.hypot(event.clientX - touch.startX, event.clientY - touch.startY) > 6) touch.moved = true;
+                  if (touch.moved && ws.readyState === WebSocket.OPEN) {
+                      ws.send(JSON.stringify({ type: 'mouseEvent', pageId, event: {
+                          type: 'mouseWheel', x: point.x, y: point.y, button: 'none', modifiers: 0,
+                          deltaX: touch.point.x - point.x, deltaY: touch.point.y - point.y,
+                      }}));
+                  }
+                  touch.point = point;
+              }, touchOptions);
+              canvas.addEventListener('pointerup', (event) => {
+                  if (!touch || event.pointerId !== touch.id || !inputReady()) return;
+                  event.preventDefault();
+                  if (!touch.moved && ws.readyState === WebSocket.OPEN) {
+                      const point = getScaledCoordinates(event, canvas, pageId);
+                      for (const type of ['mousePressed', 'mouseReleased']) {
+                          ws.send(JSON.stringify({ type: 'mouseEvent', pageId, event: { type, ...point, button: 'left', modifiers: 0, clickCount: 1 } }));
+                      }
+                  }
+                  touch = null;
+              }, touchOptions);
+              canvas.addEventListener('pointercancel', () => { touch = null; }, touchOptions);
+
               console.log(`Event listeners set up for canvas of tab ${pageId}`);
               return true;
           }
@@ -1129,6 +1317,7 @@
                   window.parent === window;
 
               document.addEventListener('keydown', (e) => {
+                  if (e.target.closest?.('input, textarea, select, button')) return;
                   // Skip if URL input is focused
                   if (urlText && document.activeElement === urlText){
                     console.log("URL input is focused, skipping keydown event");
@@ -1160,6 +1349,7 @@
               });
 
               document.addEventListener('keyup', (e) => {
+                  if (e.target.closest?.('input, textarea, select, button')) return;
                   // Skip if URL input is focused
                   if (urlText && document.activeElement === urlText) return;
                   if (directClipboardBridge && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') return;
@@ -1478,40 +1668,12 @@
                   return;
               }
 
-              const parentHeight = container.clientHeight;
-
-              // Scale to height while maintaining aspect ratio
-              const targetHeight = parentHeight;
-              const targetWidth = targetHeight * (tabData.currentImageWidth / tabData.currentImageHeight);
-
-              // Account for device pixel ratio
-              const dpr = window.devicePixelRatio || 1;
-
-              canvas.width = targetWidth * dpr;
-              canvas.height = targetHeight * dpr;
-
-              // Reset transform before scaling
-              ctx.setTransform(1, 0, 0, 1, 0, 0);
-              ctx.scale(dpr, dpr);
-
-              // Set display size
-              canvas.style.height = '100%';
-              canvas.style.width = 'auto';
-
-              // Redraw the last image if available
-              if (tabData.lastImageData) {
-                  const img = new Image();
-                  img.onload = () => {
-                      ctx.drawImage(
-                          img,
-                          0,
-                          0,
-                          Math.floor(canvas.width / window.devicePixelRatio),
-                          Math.floor(canvas.height / window.devicePixelRatio)
-                      );
-                  };
-                  img.src = tabData.lastImageData;
-              }
+              const scale = Math.min(container.clientWidth / tabData.currentImageWidth, container.clientHeight / tabData.currentImageHeight);
+              canvas.width = tabData.currentImageWidth;
+              canvas.height = tabData.currentImageHeight;
+              canvas.style.width = `${canvas.width * scale}px`;
+              canvas.style.height = `${canvas.height * scale}px`;
+              if (tabData.lastImage) ctx.drawImage(tabData.lastImage, 0, 0);
           }
 
           // Add a function to handle tab loading state

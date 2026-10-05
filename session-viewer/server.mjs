@@ -4,6 +4,8 @@ import http from "node:http";
 import net from "node:net";
 import { pathToFileURL } from "node:url";
 
+export const DEFAULT_SESSION_VIEWER_MAX_TTL_MS = 7_200_000;
+
 const SESSION_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const HOP_BY_HOP = new Set([
@@ -738,7 +740,8 @@ export function loadConfig() {
     );
   }
   const maximumTtlMs = Number.parseInt(
-    process.env.SESSION_VIEWER_MAX_TTL_MS ?? "900000",
+    process.env.SESSION_VIEWER_MAX_TTL_MS ??
+      String(DEFAULT_SESSION_VIEWER_MAX_TTL_MS),
     10,
   );
   if (
