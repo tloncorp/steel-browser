@@ -212,41 +212,54 @@ test("the public listener exposes only a capability-scoped viewer", async (conte
   assert.equal(debugUrl.searchParams.get("clipboardBridge"), null);
 });
 
-test("credential handoffs are one-use and return no field values", async (context) => {
-  let filledBody;
+function secureField(purpose, id = "f0", extra = {}) {
+  return {
+    id,
+    purpose,
+    label: purpose,
+    inputType: "text",
+    required: true,
+    ...extra,
+  };
+}
+async function secureGateway(
+  context,
+  fields,
+  kind = "login",
+  fillStatus = 200,
+) {
+  const posted = [];
+  const metadata = {
+    formId: "bound-form",
+    pageId: "page-1",
+    frameUrl: "https://account.example/form",
+    origin: "https://account.example",
+    kind,
+    fields,
+  };
   const upstream = http.createServer((request, response) => {
-    if (
-      request.method === "GET" &&
-      request.url === `/v1/sessions/${sessionId}/credential-form`
-    ) {
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(
-        JSON.stringify({
-          pageId: "page-1",
-          frameUrl: "https://www.are.na/login",
-          origin: "https://www.are.na",
-          kind: "password",
-          hasUsername: true,
-        }),
-      );
+    if (request.url !== `/v1/sessions/${sessionId}/credential-form`)
+      return response.writeHead(404).end();
+    if (request.method === "GET") {
+      response
+        .writeHead(200, { "content-type": "application/json" })
+        .end(JSON.stringify(metadata));
       return;
     }
-    if (
-      request.method === "POST" &&
-      request.url === `/v1/sessions/${sessionId}/credential-form`
-    ) {
-      const chunks = [];
-      request.on("data", (chunk) => chunks.push(chunk));
-      request.on("end", () => {
-        filledBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-        response.writeHead(200, { "content-type": "application/json" });
-        response.end(
-          JSON.stringify({ ok: true, filledUsername: true, submitted: true }),
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(chunk));
+    request.on("end", () => {
+      posted.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      response
+        .writeHead(fillStatus, { "content-type": "application/json" })
+        .end(
+          JSON.stringify(
+            fillStatus === 200
+              ? { ok: true, submitted: kind === "login" }
+              : { error: "must-not-echo-submitted-value" },
+          ),
         );
-      });
-      return;
-    }
-    response.writeHead(404).end();
+    });
   });
   const upstreamPort = await listen(upstream);
   const { internal, publicServer } = createGateway({
@@ -255,175 +268,171 @@ test("credential handoffs are one-use and return no field values", async (contex
     upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
     maximumTtlMs: 900_000,
   });
-  const [internalPort, publicPort] = await Promise.all([
-    listen(internal),
-    listen(publicServer),
-  ]);
-  context.after(async () =>
-    Promise.all([close(internal), close(publicServer), close(upstream)]),
-  );
-
+  const publicPort = await listen(publicServer);
+  context.after(() => Promise.all([close(publicServer), close(upstream)]));
   const capability = mintCapability(
     { sessionId, expiresAt: Date.now() + 60_000 },
     secret,
   );
-  const publicBase = `http://127.0.0.1:${publicPort}`;
-  const discoveredResponse = await fetch(
-    `${publicBase}/credentials/${capability}`,
-  );
-  assert.equal(discoveredResponse.status, 200);
-  assert.equal(
-    discoveredResponse.headers.get("access-control-allow-origin"),
-    "*",
-  );
-  const discovered = await discoveredResponse.json();
-  assert.deepEqual(Object.keys(discovered).sort(), [
+  const base = `http://127.0.0.1:${publicPort}`;
+  const discover = () => fetch(`${base}/credentials/${capability}`);
+  const fill = (id, body) =>
+    fetch(`${base}/credential-fills/${id}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  return { metadata, posted, discover, fill, internal };
+}
+
+test("secure handoffs expose metadata and a one-use endpoint, never values or selectors", async (context) => {
+  const fields = [
+    secureField("username"),
+    secureField("current-password", "f1", {
+      inputType: "password",
+      value: "private-value",
+      selector: "#secret",
+    }),
+  ];
+  const gateway = await secureGateway(context, fields);
+  const response = await gateway.discover();
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("access-control-allow-origin"), "*");
+  const handoff = await response.json();
+  assert.deepEqual(Object.keys(handoff).sort(), [
     "expiresAt",
+    "fields",
+    "formId",
     "handoffId",
-    "hasUsername",
     "kind",
     "origin",
   ]);
-  assert.equal(discovered.origin, "https://www.are.na");
-  assert.equal(discovered.kind, "password");
-  assert.equal(discovered.hasUsername, true);
-
-  const values = {
-    username: "person@example.com",
-    password: "not-in-a-chat",
+  assert.equal(handoff.formId, "bound-form");
+  assert.equal(handoff.fields[1].value, undefined);
+  assert.equal(handoff.fields[1].selector, undefined);
+  const input = {
+    values: { f0: "person@example.com", f1: "not-in-chat" },
     submit: true,
   };
-  const fillResponse = await fetch(
-    `${publicBase}/credential-fills/${discovered.handoffId}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(values),
-    },
-  );
-  assert.equal(fillResponse.status, 200);
-  assert.deepEqual(await fillResponse.json(), { ok: true, submitted: true });
-  assert.deepEqual(filledBody, {
-    target: {
-      pageId: "page-1",
-      frameUrl: "https://www.are.na/login",
-      origin: "https://www.are.na",
-      kind: "password",
-    },
-    ...values,
-  });
-
-  const replay = await fetch(
-    `${publicBase}/credential-fills/${discovered.handoffId}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(values),
-    },
-  );
-  assert.equal(replay.status, 401);
-  assert.equal(
-    JSON.stringify(await replay.json()).includes(values.password),
-    false,
-  );
-  assert.ok(internalPort);
+  const filled = await gateway.fill(handoff.handoffId, input);
+  assert.equal(filled.status, 200);
+  assert.deepEqual(await filled.json(), { ok: true, submitted: true });
+  const { fields: _fields, ...target } = gateway.metadata;
+  assert.deepEqual(gateway.posted, [{ target, ...input }]);
+  assert.equal((await gateway.fill(handoff.handoffId, input)).status, 401);
 });
 
-test("one-time-code handoffs accept only an OTP value", async (context) => {
-  let filledBody;
-  const upstream = http.createServer((request, response) => {
-    if (
-      request.method === "GET" &&
-      request.url === `/v1/sessions/${sessionId}/credential-form`
-    ) {
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(
-        JSON.stringify({
-          pageId: "page-otp",
-          frameUrl: "https://accounts.example/verify",
-          origin: "https://accounts.example",
-          kind: "otp",
-          codeLength: 6,
-        }),
-      );
-      return;
-    }
-    if (
-      request.method === "POST" &&
-      request.url === `/v1/sessions/${sessionId}/credential-form`
-    ) {
-      const chunks = [];
-      request.on("data", (chunk) => chunks.push(chunk));
-      request.on("end", () => {
-        filledBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-        response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({ ok: true, submitted: true }));
-      });
-      return;
-    }
-    response.writeHead(404).end();
-  });
-  const upstreamPort = await listen(upstream);
-  const { internal, publicServer } = createGateway({
-    secret,
-    publicOrigin: "https://viewer.example",
-    upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
-    maximumTtlMs: 900_000,
-  });
-  const [internalPort, publicPort] = await Promise.all([
-    listen(internal),
-    listen(publicServer),
+test("field contracts reject wrong keys and enforce verification-code length", async (context) => {
+  const gateway = await secureGateway(context, [
+    secureField("one-time-code", "f0", { exactLength: 6 }),
   ]);
-  context.after(async () =>
-    Promise.all([close(internal), close(publicServer), close(upstream)]),
+  const handoff = await (await gateway.discover()).json();
+  for (const body of [
+    { password: "secret" },
+    { values: { f0: "123" } },
+    { values: { f0: "123456", f1: "extra" } },
+    { values: { f0: 42 } },
+  ]) {
+    assert.equal((await gateway.fill(handoff.handoffId, body)).status, 400);
+  }
+  assert.equal(gateway.posted.length, 0);
+  assert.equal(
+    (
+      await gateway.fill(handoff.handoffId, {
+        values: { f0: "aBc123" },
+        submit: true,
+      })
+    ).status,
+    200,
   );
+  assert.deepEqual(gateway.posted[0].values, { f0: "aBc123" });
+});
 
-  const capability = mintCapability(
-    { sessionId, expiresAt: Date.now() + 60_000 },
-    secret,
+test("details handoffs fill card/address values without forwarding submit authorization", async (context) => {
+  const gateway = await secureGateway(
+    context,
+    [
+      secureField("cc-number"),
+      secureField("street-address", "f1"),
+      secureField("country", "f2", {
+        inputType: "select",
+        options: [{ value: "1", label: "Canada" }],
+      }),
+    ],
+    "details",
   );
-  const publicBase = `http://127.0.0.1:${publicPort}`;
-  const discoveredResponse = await fetch(
-    `${publicBase}/credentials/${capability}`,
-  );
-  assert.equal(discoveredResponse.status, 200);
-  const discovered = await discoveredResponse.json();
-  assert.deepEqual(discovered, {
-    handoffId: discovered.handoffId,
-    origin: "https://accounts.example",
-    kind: "otp",
-    codeLength: 6,
-    expiresAt: discovered.expiresAt,
-  });
+  const handoff = await (await gateway.discover()).json();
+  const body = {
+    values: { f0: "4111111111111111", f1: "1 Test St", f2: "1" },
+    submit: true,
+  };
+  assert.equal((await gateway.fill(handoff.handoffId, body)).status, 200);
+  assert.equal(gateway.posted[0].submit, false);
+});
 
-  const rejected = await fetch(
-    `${publicBase}/credential-fills/${discovered.handoffId}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ password: "must-not-be-accepted" }),
-    },
+test("a new discovery invalidates an earlier public fill handle", async (context) => {
+  const gateway = await secureGateway(context, [secureField("username")]);
+  const first = await (await gateway.discover()).json();
+  const second = await (await gateway.discover()).json();
+  assert.equal(first.formId, second.formId);
+  assert.notEqual(first.handoffId, second.handoffId);
+  assert.equal(
+    (await gateway.fill(first.handoffId, { values: { f0: "user" } })).status,
+    401,
   );
-  assert.equal(rejected.status, 400);
+  assert.equal(gateway.posted.length, 0);
+});
 
-  const fillResponse = await fetch(
-    `${publicBase}/credential-fills/${discovered.handoffId}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ code: "123456", submit: true }),
-    },
+test("an uncertain upstream failure consumes the handle and never echoes its body", async (context) => {
+  const gateway = await secureGateway(
+    context,
+    [secureField("current-password")],
+    "login",
+    500,
   );
-  assert.equal(fillResponse.status, 200);
-  assert.deepEqual(filledBody, {
-    target: {
-      pageId: "page-otp",
-      frameUrl: "https://accounts.example/verify",
-      origin: "https://accounts.example",
-      kind: "otp",
-    },
-    code: "123456",
+  const handoff = await (await gateway.discover()).json();
+  const failed = await gateway.fill(handoff.handoffId, {
+    values: { f0: "secret" },
     submit: true,
   });
-  assert.ok(internalPort);
+  assert.equal(failed.status, 500);
+  assert.ok(!(await failed.text()).includes("must-not-echo"));
+  assert.equal(
+    (
+      await gateway.fill(handoff.handoffId, {
+        values: { f0: "secret" },
+        submit: true,
+      })
+    ).status,
+    401,
+  );
+  assert.equal(gateway.posted.length, 1);
 });
+
+test("concurrent fills consume a public handle once", async (context) => {
+  const gateway = await secureGateway(context, [
+    secureField("current-password"),
+  ]);
+  const handoff = await (await gateway.discover()).json();
+  const responses = await Promise.all([
+    gateway.fill(handoff.handoffId, { values: { f0: "secret" } }),
+    gateway.fill(handoff.handoffId, { values: { f0: "secret" } }),
+  ]);
+  assert.deepEqual(
+    responses.map((response) => response.status).sort(),
+    [200, 401],
+  );
+  assert.equal(gateway.posted.length, 1);
+});
+
+for (const fields of [
+  [],
+  [secureField("username"), secureField("username")],
+  [secureField("country", "f0", { inputType: "select", options: [] })],
+  [secureField("one-time-code", "f0", { exactLength: 0 })],
+]) {
+  test("rejects malformed field metadata", async (context) => {
+    const gateway = await secureGateway(context, fields);
+    assert.equal((await gateway.discover()).status, 502);
+  });
+}

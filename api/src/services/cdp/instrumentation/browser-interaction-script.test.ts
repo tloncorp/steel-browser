@@ -107,6 +107,28 @@ describe("browser interaction injected script", () => {
     dom.window.close();
   });
 
+  it("redacts sectioned address and card autofill controls, including textarea and select", () => {
+    const { dom, binding } = createDom(
+      `<input autocomplete="section-billing billing cc-number"><textarea autocomplete="shipping street-address"></textarea><select autocomplete="billing country"><option value="CA">Canada</option></select>`,
+    );
+    for (const control of dom.window.document.querySelectorAll<
+      HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement
+    >("input,textarea,select")) {
+      if (control.tagName !== "SELECT") control.value = "private-field-value";
+      control.dispatchEvent(new dom.window.Event("input", { bubbles: true, composed: true }));
+    }
+    const interactions = payloads(binding).map((payload) => payload.interaction);
+    expect(interactions).toHaveLength(3);
+    expect(
+      interactions.every(
+        (interaction) =>
+          interaction.value.redacted === true && interaction.value.text === undefined,
+      ),
+    ).toBe(true);
+    expect(JSON.stringify(interactions)).not.toContain("private-field-value");
+    dom.window.close();
+  });
+
   it("redacts sensitive inputs identified by test attributes", () => {
     const { dom, binding } = createDom(`
       <input data-test="credit-card-number" />
