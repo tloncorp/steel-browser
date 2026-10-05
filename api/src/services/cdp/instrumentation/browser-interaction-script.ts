@@ -249,18 +249,27 @@ export function installBrowserInteractionLogger(options: BrowserInteractionLogge
     "social",
     "otp",
     "tax",
+    "username",
+    "email",
+    "phone",
+    "address",
+    "postal",
+    "country",
+    "city",
   ];
 
   const isSensitiveField = (target: unknown) => {
     if (!(target instanceof Element)) return false;
-    if (target instanceof HTMLInputElement) {
-      const type = (target.type || "").toLowerCase();
-      if (type === "password") return true;
-      const autocomplete = (target.getAttribute("autocomplete") || "").toLowerCase();
-      if (autocomplete.startsWith("cc-")) return true;
-      if (autocomplete === "current-password" || autocomplete === "new-password") return true;
-      if (autocomplete === "one-time-code") return true;
-    }
+    if (target instanceof HTMLInputElement && target.type.toLowerCase() === "password") return true;
+    const autocomplete = (target.getAttribute("autocomplete") || "").toLowerCase().split(/\s+/);
+    if (
+      autocomplete.some((token) =>
+        /^(?:username|current-password|new-password|one-time-code|cc-[a-z-]+|name|given-name|additional-name|family-name|organization|street-address|address-(?:line[123]|level[1234])|postal-code|country(?:-name)?|email|tel(?:-[a-z-]+)?)$/.test(
+          token,
+        ),
+      )
+    )
+      return true;
     const haystacks = [
       target.getAttribute("name") || "",
       (target as HTMLElement).id || "",

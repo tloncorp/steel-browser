@@ -1,3 +1,4 @@
+import { projectFields, validValues } from "./secure-form.mjs";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import net from "node:net";
@@ -461,22 +462,21 @@ export function createGateway(config) {
               discovered.body?.error ?? "No live credential form is available.",
           });
         }
-        const { pageId, frameUrl, origin, kind, hasUsername, codeLength } =
+        const { formId, pageId, frameUrl, origin, kind } =
           discovered.body ?? {};
+        const fields = projectFields(discovered.body?.fields);
         if (
+          typeof formId !== "string" ||
+          !formId.length ||
+          formId.length > 256 ||
           typeof pageId !== "string" ||
           typeof frameUrl !== "string" ||
           typeof origin !== "string" ||
-          (kind !== "password" && kind !== "otp") ||
-          (kind === "password" && typeof hasUsername !== "boolean") ||
-          (kind === "otp" &&
-            codeLength !== undefined &&
-            (!Number.isSafeInteger(codeLength) ||
-              codeLength < 1 ||
-              codeLength > 12))
+          (kind !== "login" && kind !== "details") ||
+          !fields
         ) {
           return sendCredentialJson(response, 502, {
-            error: "Browser returned an invalid credential form.",
+            error: "Browser returned an invalid secure form.",
           });
         }
         const parsedOrigin = new URL(origin);
@@ -502,8 +502,8 @@ export function createGateway(config) {
         );
         credentialHandoffs.set(handoffId, {
           sessionId: capability.sessionId,
-          target: { pageId, frameUrl, origin, kind },
-          ...(kind === "otp" && codeLength !== undefined ? { codeLength } : {}),
+          target: { formId, pageId, frameUrl, origin, kind },
+          fields,
           expiresAt,
           status: "ready",
         });
@@ -511,8 +511,8 @@ export function createGateway(config) {
           handoffId,
           origin,
           kind,
-          ...(kind === "password" ? { hasUsername } : {}),
-          ...(kind === "otp" && codeLength !== undefined ? { codeLength } : {}),
+          formId,
+          fields,
           expiresAt,
         });
       } catch {
@@ -546,31 +546,24 @@ export function createGateway(config) {
             : "Credential submission is invalid.",
         });
       }
-      const commonInvalid =
-        body.submit !== undefined && typeof body.submit !== "boolean";
-      const passwordInvalid =
-        handoff.target.kind === "password" &&
-        ((body.username !== undefined &&
-          (typeof body.username !== "string" || body.username.length > 1024)) ||
-          typeof body.password !== "string" ||
-          body.password.length < 1 ||
-          body.password.length > 4096 ||
-          body.code !== undefined);
-      const otpInvalid =
-        handoff.target.kind === "otp" &&
-        (typeof body.code !== "string" ||
-          body.code.length < 1 ||
-          body.code.length > 128 ||
-          (handoff.codeLength !== undefined &&
-            body.code.length !== handoff.codeLength) ||
-          body.username !== undefined ||
-          body.password !== undefined);
-      if (commonInvalid || passwordInvalid || otpInvalid) {
+      if (
+        (body.submit !== undefined && typeof body.submit !== "boolean") ||
+        Object.keys(body).some((key) => key !== "values" && key !== "submit") ||
+        !validValues(handoff.fields, body.values)
+      ) {
         return sendCredentialJson(response, 400, {
-          error: "Credential submission is invalid.",
+          error: "Secure form submission is invalid.",
         });
       }
 
+      if (
+        handoff.status !== "ready" ||
+        credentialHandoffs.get(credentialFill[1]) !== handoff
+      ) {
+        return sendCredentialJson(response, 401, {
+          error: "Secure form is already used or replaced.",
+        });
+      }
       handoff.status = "submitting";
       try {
         const target = new URL(
@@ -584,22 +577,15 @@ export function createGateway(config) {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
             target: handoff.target,
-            ...(handoff.target.kind === "password"
-              ? {
-                  ...(body.username === undefined
-                    ? {}
-                    : { username: body.username }),
-                  password: body.password,
-                }
-              : { code: body.code }),
-            submit: body.submit === true,
+            values: body.values,
+            submit: handoff.target.kind === "login" && body.submit === true,
           }),
         });
         if (!filled.response.ok) {
-          if (filled.response.status >= 500) handoff.status = "ready";
-          else credentialHandoffs.delete(credentialFill[1]);
+          credentialHandoffs.delete(credentialFill[1]);
           return sendCredentialJson(response, filled.response.status, {
-            error: filled.body?.error ?? "Credential form could not be filled.",
+            error:
+              "The form could not be filled. Reconnect before trying again.",
           });
         }
         credentialHandoffs.delete(credentialFill[1]);
@@ -608,7 +594,7 @@ export function createGateway(config) {
           submitted: filled.body?.submitted === true,
         });
       } catch {
-        handoff.status = "ready";
+        credentialHandoffs.delete(credentialFill[1]);
         return sendCredentialJson(response, 502, {
           error: "Browser unavailable.",
         });

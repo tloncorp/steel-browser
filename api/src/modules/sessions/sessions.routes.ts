@@ -122,8 +122,7 @@ async function routes(server: FastifyInstance) {
     {
       schema: {
         operationId: "discover_session_credential_form",
-        description:
-          "Discover a visible password or one-time-code form for a trusted session viewer handoff",
+        description: "Discover a visible login form for a trusted session viewer handoff",
         tags: ["Sessions"],
         summary: "Discover a credential form",
       },
@@ -150,22 +149,25 @@ async function routes(server: FastifyInstance) {
         body: {
           type: "object",
           additionalProperties: false,
-          required: ["target"],
+          required: ["target", "values"],
           properties: {
             target: {
               type: "object",
               additionalProperties: false,
-              required: ["pageId", "frameUrl", "origin", "kind"],
+              required: ["formId", "pageId", "frameUrl", "origin", "kind"],
               properties: {
+                formId: { type: "string", minLength: 1, maxLength: 256 },
                 pageId: { type: "string", minLength: 1, maxLength: 256 },
                 frameUrl: { type: "string", minLength: 1, maxLength: 4096 },
                 origin: { type: "string", minLength: 1, maxLength: 512 },
-                kind: { type: "string", enum: ["password", "otp"] },
+                kind: { type: "string", enum: ["login", "details"] },
               },
             },
-            username: { type: "string", maxLength: 1024 },
-            password: { type: "string", minLength: 1, maxLength: 4096 },
-            code: { type: "string", minLength: 1, maxLength: 128 },
+            values: {
+              type: "object",
+              maxProperties: 40,
+              additionalProperties: { type: "string", maxLength: 4096 },
+            },
             submit: { type: "boolean" },
           },
         },
@@ -176,14 +178,13 @@ async function routes(server: FastifyInstance) {
         Params: { sessionId: string };
         Body: {
           target: {
+            formId: string;
             pageId: string;
             frameUrl: string;
             origin: string;
-            kind: "password" | "otp";
+            kind: "login" | "details";
           };
-          username?: string;
-          password?: string;
-          code?: string;
+          values: Record<string, string>;
           submit?: boolean;
         };
       }>,

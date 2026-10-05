@@ -1,35 +1,22 @@
-import type { ElementHandle, Frame, JSHandle, Page } from "puppeteer-core";
+import { randomUUID } from "node:crypto";
+import type { CDPSession, ElementHandle, Frame, JSHandle, Page } from "puppeteer-core";
 import type { CDPService } from "./cdp/cdp.service.js";
+import { secureFieldDefinitions, type SecureFormField } from "./secure-form-fields.js";
 
-interface CredentialFormBase {
+export interface CredentialFormTarget {
+  formId: string;
   pageId: string;
   frameUrl: string;
   origin: string;
+  kind: "login" | "details";
 }
-
-export type CredentialFormDescription = CredentialFormBase &
-  (
-    | {
-        kind: "password";
-        hasUsername: boolean;
-      }
-    | {
-        kind: "otp";
-        codeLength?: number;
-      }
-  );
-
-export interface CredentialFormTarget extends CredentialFormBase {
-  kind: "password" | "otp";
+export interface CredentialFormDescription extends CredentialFormTarget {
+  fields: SecureFormField[];
 }
-
 export interface CredentialFormValues {
-  username?: string;
-  password?: string;
-  code?: string;
+  values: Record<string, string>;
   submit?: boolean;
 }
-
 export class CredentialFormError extends Error {
   constructor(
     message: string,
@@ -39,34 +26,32 @@ export class CredentialFormError extends Error {
   }
 }
 
-type LocatedCredentialForm = CredentialFormDescription & {
-  frame: Frame;
-};
-
 export interface CredentialContinuation extends CredentialFormTarget {
+  anchorBackendNodeId: number;
   expiresAt: number;
   submissionAttempted: boolean;
 }
-
-// The receipt lives outside the page. Page scripts cannot grant permission to
-// continue a login, and navigating/replacing/clearing the filled field revokes it.
+type FormControl = HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
 const continuations = new WeakMap<
   CDPService,
   {
     receipt: CredentialContinuation;
-    anchor: ElementHandle<HTMLInputElement>;
+    anchor: ElementHandle<FormControl>;
+    bound: JSHandle<BoundForm>;
+    filledIds: string[];
     timer: ReturnType<typeof setTimeout>;
   }
 >();
-
 async function clearContinuation(cdpService: CDPService): Promise<void> {
   const state = continuations.get(cdpService);
   if (!state) return;
   continuations.delete(cdpService);
   clearTimeout(state.timer);
-  await state.anchor.dispose().catch(() => {});
+  await Promise.all([
+    state.anchor.dispose().catch(() => {}),
+    state.bound.dispose().catch(() => {}),
+  ]);
 }
-
 export async function getCredentialContinuation(
   cdpService: CDPService,
 ): Promise<CredentialContinuation | null> {
@@ -74,27 +59,44 @@ export async function getCredentialContinuation(
   if (!state) return null;
   const valid =
     Date.now() < state.receipt.expiresAt &&
-    (await state.anchor
+    (await state.bound
       .evaluate(
-        (input, target) =>
-          input.isConnected &&
-          input.value.length > 0 &&
+        (form, target, filledIds) =>
           location.href === target.frameUrl &&
-          location.origin === target.origin,
+          location.origin === target.origin &&
+          form.controls.every(
+            ({ input, form, attributes, action }) =>
+              input.isConnected &&
+              input.form === form &&
+              input.form?.action === action &&
+              JSON.stringify(
+                [
+                  "type",
+                  "name",
+                  "id",
+                  "autocomplete",
+                  "maxlength",
+                  "required",
+                  "pattern",
+                  "form",
+                ].map((name) => input.getAttribute(name)),
+              ) === attributes,
+          ) &&
+          form.fields
+            .filter((field) => filledIds.includes(field.descriptor.id))
+            .every((field) => field.inputs.every((input) => input.value.length > 0)),
         state.receipt,
+        state.filledIds,
       )
       .catch(() => false));
   if (!valid) {
-    await clearContinuation(cdpService);
+    if (continuations.get(cdpService) === state) await clearContinuation(cdpService);
     return null;
   }
   return { ...state.receipt };
 }
-
 /** Click one unambiguous login control through the browser's input pipeline. */
-async function activateCredentialControl(
-  anchor: ElementHandle<HTMLInputElement>,
-): Promise<boolean> {
+async function activateCredentialControl(anchor: ElementHandle<FormControl>): Promise<boolean> {
   const deadline = Date.now() + 2_000;
   do {
     const handle = await anchor.evaluateHandle((input) => {
@@ -171,7 +173,8 @@ async function activateCredentialControl(
         await control.scrollIntoView();
         const reachable = await control.evaluate((element) => {
           const rect = element.getBoundingClientRect();
-          const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+          const root = element.getRootNode() as Document | ShadowRoot;
+          const hit = root.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
           return (
             element.isConnected &&
             !element.matches(':disabled, [aria-disabled="true"]') &&
@@ -204,340 +207,530 @@ function httpOrigin(rawUrl: string): string | undefined {
   }
 }
 
-async function inspectFrame(
-  page: Page,
-  frame: Frame,
-  requestedKind?: "password" | "otp",
-): Promise<LocatedCredentialForm | undefined> {
-  const frameUrl = frame.url();
-  const origin = httpOrigin(frameUrl);
-  if (!origin) return undefined;
+type BoundField = { descriptor: SecureFormField; inputs: FormControl[] };
+type BoundForm = {
+  kind: "login" | "details";
+  fields: BoundField[];
+  controls: Array<{
+    input: FormControl;
+    form: HTMLFormElement | null;
+    attributes: string;
+    action?: string;
+    options?: string;
+  }>;
+};
+type LocatedCredentialForm = {
+  description: CredentialFormDescription;
+  frame: Frame;
+  handle: JSHandle<BoundForm>;
+  timer: ReturnType<typeof setTimeout>;
+};
+const forms = new WeakMap<CDPService, LocatedCredentialForm>();
 
-  const description = await frame
-    .evaluate(() => {
-      const visible = (input: HTMLInputElement) => {
-        const style = window.getComputedStyle(input);
-        const rect = input.getBoundingClientRect();
-        return (
-          !input.disabled &&
-          !input.readOnly &&
-          style.display !== "none" &&
-          style.visibility !== "hidden" &&
-          rect.width > 0 &&
-          rect.height > 0
-        );
-      };
-      const inputs = Array.from(document.querySelectorAll<HTMLInputElement>("input")).filter(
-        visible,
-      );
-      const explicitOtp = inputs.find((input) =>
-        input.autocomplete.toLowerCase().split(/\s+/).includes("one-time-code"),
-      );
-      if (explicitOtp) {
-        const maxLength = explicitOtp.maxLength;
-        return {
-          kind: "otp" as const,
-          ...(maxLength >= 1 && maxLength <= 12 ? { codeLength: maxLength } : {}),
-        };
-      }
-
-      const password = inputs.find((input) => input.type.toLowerCase() === "password");
-
-      if (password) {
-        const acceptsUsername = (input: HTMLInputElement) => {
-          const type = input.type.toLowerCase();
-          return type === "text" || type === "email" || type === "tel" || type === "";
-        };
-        const candidates = inputs.filter(
-          (input) =>
-            input !== password &&
-            acceptsUsername(input) &&
-            (!password.form || input.form === password.form),
-        );
-        const explicit = candidates.find((input) => {
-          const autocomplete = input.autocomplete.toLowerCase();
-          return autocomplete === "username" || autocomplete === "email";
-        });
-        const named = candidates.find((input) =>
-          /(?:user|email|login|account)/i.test(`${input.name} ${input.id}`),
-        );
-        const preceding = candidates.filter((input) => {
-          const position = input.compareDocumentPosition(password);
-          return Boolean(position & Node.DOCUMENT_POSITION_FOLLOWING);
-        });
-        return {
-          kind: "password" as const,
-          hasUsername: Boolean(explicit ?? named ?? preceding.at(-1) ?? candidates.at(-1)),
-        };
-      }
-
-      const acceptsCode = (input: HTMLInputElement) => {
-        const type = input.type.toLowerCase();
-        return type === "text" || type === "tel" || type === "number" || type === "";
-      };
-      const codeInputs = inputs.filter(acceptsCode);
-      const otpWords =
-        /(?:one[\s_-]*time|verification|security|auth(?:entication)?[\s_-]*code|otp|2fa|two[\s_-]*factor|passcode|login[\s_-]*code|\bcode\b)/i;
-      const inputText = (input: HTMLInputElement) => {
-        const labels = Array.from(input.labels ?? [])
-          .map((label) => label.textContent ?? "")
-          .join(" ");
-        return `${input.autocomplete} ${input.name} ${input.id} ${
-          input.getAttribute("aria-label") ?? ""
-        } ${input.placeholder} ${labels}`;
-      };
-      const namedCode = codeInputs.find((input) => otpWords.test(inputText(input)));
-      const singleCode = namedCode;
-      if (singleCode) {
-        const maxLength = singleCode.maxLength;
-        return {
-          kind: "otp" as const,
-          ...(maxLength >= 1 && maxLength <= 12 ? { codeLength: maxLength } : {}),
-        };
-      }
-
-      const groups = new Map<HTMLFormElement | null, HTMLInputElement[]>();
-      for (const input of codeInputs) {
-        if (input.maxLength !== 1) continue;
-        const group = groups.get(input.form) ?? [];
-        group.push(input);
-        groups.set(input.form, group);
-      }
-      for (const [form, group] of groups) {
-        if (group.length < 4 || group.length > 8) continue;
-        const context = `${form?.textContent ?? ""} ${group.map(inputText).join(" ")}`;
-        if (otpWords.test(context)) {
-          return { kind: "otp" as const, codeLength: group.length };
-        }
-      }
-      return undefined;
-    })
-    .catch(() => undefined);
-  if (!description) return undefined;
-
-  if (requestedKind && description.kind !== requestedKind) return undefined;
-
-  return {
-    pageId: pageId(page),
-    frameUrl,
-    origin,
-    ...description,
-    frame,
+/** Runs in the document; nothing here reads or returns the controls' values. */
+function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm | null {
+  const all = (root: Document | ShadowRoot): Element[] =>
+    Array.from(root.querySelectorAll("*")).flatMap((element) => [
+      element,
+      ...(element.shadowRoot ? all(element.shadowRoot) : []),
+    ]);
+  const elements = all(document);
+  const visible = (input: FormControl) => {
+    const style = getComputedStyle(input);
+    const rect = input.getBoundingClientRect();
+    return (
+      input.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) &&
+      !input.disabled &&
+      !("readOnly" in input && input.readOnly) &&
+      style.visibility === "visible" &&
+      style.display !== "none" &&
+      rect.width > 0 &&
+      rect.height > 0 &&
+      !input.closest('[inert], [aria-hidden="true"]')
+    );
   };
+  const text = (input: FormControl) =>
+    [
+      input.name,
+      input.id,
+      input.getAttribute("aria-label") || "",
+      input.getAttribute("placeholder") || "",
+      ...Array.from(input.labels || []).map((label) => label.textContent || ""),
+    ]
+      .map((value) => value.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_-]/g, " "))
+      .join(" ");
+  const otpWords = new RegExp(
+    definitions.find((field) => field.purpose === "one-time-code")!.pattern!,
+    "i",
+  );
+  const loginWords = /\blog\s*in\b|\bsign\s*in\b|\bauthenticate\b|\byour account\b/i;
+  const inputs = elements
+    .filter(
+      (element): element is FormControl =>
+        (element instanceof HTMLInputElement &&
+          ["text", "email", "tel", "password", "number", "month"].includes(element.type)) ||
+        element instanceof HTMLTextAreaElement ||
+        (element instanceof HTMLSelectElement && !element.multiple),
+    )
+    .filter(visible);
+  const groups = new Map<Element, FormControl[]>();
+  for (const input of inputs) {
+    let scope: Element | null = input.form;
+    if (!scope) {
+      scope = input.parentElement;
+      while (
+        scope?.parentElement &&
+        scope !== document.body &&
+        !scope.querySelector('button, [role="button"], input[type="submit"]')
+      )
+        scope = scope.parentElement;
+    }
+    if (!scope) continue;
+    const group = groups.get(scope) || [];
+    group.push(input);
+    groups.set(scope, group);
+  }
+  const matches: BoundForm[] = [];
+  for (const [scope, group] of groups) {
+    const context = [
+      scope.textContent || "",
+      ...Array.from(
+        scope.querySelectorAll('button, [role="button"], input[type="submit"], label, h1, h2'),
+      ).map((element) => element.textContent || element.getAttribute("value") || ""),
+    ].join(" ");
+    const pageContext = `${document.title} ${elements
+      .filter((el) => el.matches('h1,h2,[role="heading"]'))
+      .map((el) => el.textContent)
+      .join(" ")} ${location.pathname}`;
+    const submitLabels = Array.from(
+      scope.querySelectorAll<HTMLElement>('button, [role="button"], input[type="submit"]'),
+    ).map(
+      (control) =>
+        control.getAttribute("aria-label") ||
+        control.textContent ||
+        control.getAttribute("value") ||
+        "",
+    );
+    const nonLoginAction =
+      /\bsubscribe\b|newsletter|\bsign\s*up\b|\bregister\b|create (?:an? )?account|reset password/i;
+    // Login forms commonly contain Sign up / Forgot password links. Their
+    // presence does not change the purpose of the form's submit control.
+    const isNonLogin =
+      submitLabels.length > 0 && submitLabels.every((label) => nonLoginAction.test(label));
+    const hasLoginContext = !isNonLogin && loginWords.test(`${context} ${pageContext}`);
+    const explicitPurpose = (input: FormControl) => {
+      const tokens = input.autocomplete.toLowerCase().split(/\s+/);
+      return definitions.find((definition) => tokens.includes(definition.purpose));
+    };
+    const hasDetails =
+      group.some((input) => {
+        const purpose = explicitPurpose(input)?.purpose;
+        return purpose && /^(?:cc-|address-|street-address|postal-code|country)/.test(purpose);
+      }) || /\bshipping\b|\bbilling\b|\bcard number\b|\bstreet address\b/i.test(context);
+    const passwords = group.filter(
+      (input) =>
+        input instanceof HTMLInputElement &&
+        input.type === "password" &&
+        !["one-time-code", "cc-csc"].includes(explicitPurpose(input)?.purpose || ""),
+    );
+    const split = group.filter(
+      (input): input is HTMLInputElement =>
+        input instanceof HTMLInputElement &&
+        ["text", "tel", "number"].includes(input.type) &&
+        input.maxLength === 1,
+    );
+    const splitCode =
+      split.length >= 4 &&
+      split.length <= 8 &&
+      !hasDetails &&
+      (otpWords.test(`${context} ${pageContext}`) ||
+        split.some((input) => explicitPurpose(input)?.purpose === "one-time-code"));
+    const fields: BoundField[] = [];
+    for (const input of group) {
+      if (splitCode && split.includes(input as HTMLInputElement) && input !== split[0]) continue;
+      let definition = explicitPurpose(input);
+      if (!definition && splitCode && input === split[0])
+        definition = definitions.find((field) => field.purpose === "one-time-code");
+      if (!definition) {
+        // Heuristics resolve a semantic purpose, never a site-specific selector.
+        // Identity fields need a login context; other fields need an address/card context.
+        const candidates = definitions.filter((field) => {
+          if (!("pattern" in field)) return false;
+          if (field.purpose === "username")
+            return !hasDetails && (hasLoginContext || passwords.length === 1);
+          if (field.purpose === "one-time-code") return !hasDetails;
+          return hasDetails;
+        });
+        definition =
+          candidates.find(
+            (field) =>
+              field.purpose === "one-time-code" &&
+              "pattern" in field &&
+              new RegExp(field.pattern, "i").test(text(input)),
+          ) ??
+          candidates.find(
+            (field) => "pattern" in field && new RegExp(field.pattern, "i").test(text(input)),
+          );
+      }
+      if (!definition && input instanceof HTMLInputElement && input.type === "password")
+        definition = definitions.find((field) => field.purpose === "current-password");
+      if (!definition && passwords.length === 1 && !hasDetails) {
+        const textInputs = group.filter(
+          (candidate) =>
+            candidate instanceof HTMLInputElement &&
+            ["text", "email", "tel"].includes(candidate.type),
+        );
+        if (textInputs.length === 1 && textInputs[0] === input)
+          definition = definitions.find((field) => field.purpose === "username");
+      }
+      if (!definition) continue;
+      if (
+        !hasDetails &&
+        (hasLoginContext || passwords.length) &&
+        ["email", "tel"].includes(definition.purpose)
+      )
+        definition = definitions.find((field) => field.purpose === "username")!;
+      const tokens = input.autocomplete.toLowerCase().split(/\s+/);
+      const section = tokens.includes("shipping")
+        ? "Shipping: "
+        : tokens.includes("billing")
+        ? "Billing: "
+        : "";
+      const fieldInputs: FormControl[] = splitCode && input === split[0] ? split : [input];
+      const isLoginField = ["username", "current-password", "one-time-code"].includes(
+        definition.purpose,
+      );
+      const maxLength =
+        "maxLength" in input && input.maxLength > 0 ? Math.min(input.maxLength, 4096) : undefined;
+      const codeLength =
+        definition.purpose === "one-time-code"
+          ? splitCode
+            ? split.length
+            : maxLength && maxLength <= 12
+            ? maxLength
+            : undefined
+          : undefined;
+      const options =
+        input instanceof HTMLSelectElement
+          ? Array.from(input.options).flatMap((option, index) =>
+              option.disabled ||
+              !option.value ||
+              option.parentElement?.matches("optgroup[disabled]")
+                ? []
+                : [{ value: String(index), label: option.label.slice(0, 256) }],
+            )
+          : undefined;
+      if (options && (!options.length || options.length > 512)) continue;
+      fields.push({
+        inputs: fieldInputs,
+        descriptor: {
+          id: `f${fields.length}`,
+          purpose: definition.purpose,
+          label: section + definition.label,
+          inputType: options
+            ? "select"
+            : input instanceof HTMLTextAreaElement
+            ? "textarea"
+            : definition.inputType,
+          required: input.required || isLoginField,
+          ...(maxLength && !splitCode ? { maxLength } : {}),
+          ...(codeLength ? { exactLength: codeLength } : {}),
+          ...(options ? { options } : {}),
+        },
+      });
+    }
+    if (!fields.length || fields.length > 40) continue;
+    const purposes = fields.map((field) => field.descriptor.purpose);
+    const login =
+      purposes.every((purpose) =>
+        ["username", "current-password", "one-time-code"].includes(purpose),
+      ) &&
+      !isNonLogin &&
+      !hasDetails &&
+      (hasLoginContext ||
+        purposes.includes("current-password") ||
+        purposes.includes("one-time-code"));
+    if (login && new Set(purposes).size !== purposes.length) continue;
+    if (!login && !hasDetails && !purposes.includes("new-password")) continue;
+    // Unsupported required controls keep submission in the live browser.
+    const unsupportedRequired = group.some(
+      (input) => input.required && !fields.some((field) => field.inputs.includes(input)),
+    );
+    const controls = fields.flatMap((field) =>
+      field.inputs.map((input) => ({
+        input,
+        form: input.form,
+        attributes: JSON.stringify(
+          ["type", "name", "id", "autocomplete", "maxlength", "required", "pattern", "form"].map(
+            (name) => input.getAttribute(name),
+          ),
+        ),
+        action: input.form?.action,
+        options:
+          input instanceof HTMLSelectElement
+            ? JSON.stringify(
+                Array.from(input.options).map((option) => [
+                  option.value,
+                  option.label,
+                  option.disabled,
+                  option.parentElement?.matches("optgroup[disabled]"),
+                ]),
+              )
+            : undefined,
+      })),
+    );
+    matches.push({ kind: login && !unsupportedRequired ? "login" : "details", fields, controls });
+  }
+  return matches.length === 1 ? matches[0] : null;
 }
 
-async function locateCredentialForm(
-  cdpService: CDPService,
-  target?: CredentialFormTarget,
-): Promise<LocatedCredentialForm> {
+async function releaseForm(cdpService: CDPService) {
+  const current = forms.get(cdpService);
+  if (!current) return;
+  forms.delete(cdpService);
+  clearTimeout(current.timer);
+  await current.handle.dispose().catch(() => {});
+}
+
+async function discoverBoundForm(cdpService: CDPService): Promise<CredentialFormDescription> {
   const pages = await cdpService.getAllPages();
-  const candidates = target
-    ? pages.filter((page) => pageId(page) === target.pageId)
-    : [...pages].reverse();
-
-  let otpCandidate: LocatedCredentialForm | undefined;
-  for (const page of candidates) {
-    const frames = target
-      ? page.frames().filter((frame) => frame.url() === target.frameUrl)
-      : page.frames();
-    for (const frame of frames) {
-      const located = await inspectFrame(page, frame, target?.kind);
-      if (!located) continue;
-      if (target && located.origin !== target.origin) {
-        throw new CredentialFormError("The credential form changed origin.", 409);
+  for (const page of [...pages].reverse()) {
+    const candidates: Array<{
+      frame: Frame;
+      handle: JSHandle<BoundForm>;
+      kind: "login" | "details";
+      fields: SecureFormField[];
+    }> = [];
+    for (const frame of page.frames()) {
+      if (!httpOrigin(frame.url())) continue;
+      if (frame.parentFrame()) {
+        const owner = await frame.frameElement().catch(() => null);
+        const visible = await owner
+          ?.evaluate((element) => {
+            const rect = element.getBoundingClientRect();
+            return (
+              rect.width > 0 &&
+              rect.height > 0 &&
+              getComputedStyle(element).visibility === "visible"
+            );
+          })
+          .catch(() => false);
+        await owner?.dispose();
+        if (!visible) continue;
       }
-      if (target || located.kind === "password") return located;
-      otpCandidate ??= located;
+      const handle = (await frame
+        .evaluateHandle(inspectDocument, secureFieldDefinitions)
+        .catch(() => undefined)) as JSHandle<BoundForm | null> | undefined;
+      if (!handle) continue;
+      const metadata = await handle
+        .evaluate(
+          (form) =>
+            form && { kind: form.kind, fields: form.fields.map((field) => field.descriptor) },
+        )
+        .catch(() => undefined);
+      if (metadata) candidates.push({ frame, handle: handle as JSHandle<BoundForm>, ...metadata });
+      else await handle.dispose();
     }
+    if (candidates.length !== 1) {
+      await Promise.all(candidates.map((candidate) => candidate.handle.dispose()));
+      if (candidates.length > 1) break;
+      continue;
+    }
+    const { frame, handle, fields, kind } = candidates[0];
+    const previous = forms.get(cdpService);
+    const same =
+      previous?.frame === frame &&
+      previous.description.frameUrl === frame.url() &&
+      (await handle
+        .evaluate(
+          (next, prior) =>
+            next.kind === prior.kind &&
+            JSON.stringify(next.fields.map((field) => field.descriptor)) ===
+              JSON.stringify(prior.fields.map((field) => field.descriptor)) &&
+            next.controls.length === prior.controls.length &&
+            next.controls.every(
+              (control, i) =>
+                control.input === prior.controls[i].input &&
+                control.form === prior.controls[i].form &&
+                control.attributes === prior.controls[i].attributes &&
+                control.action === prior.controls[i].action &&
+                control.options === prior.controls[i].options,
+            ),
+          previous.handle,
+        )
+        .catch(() => false));
+    const description: CredentialFormDescription = {
+      formId: same ? previous.description.formId : randomUUID(),
+      pageId: pageId(page),
+      frameUrl: frame.url(),
+      origin: httpOrigin(frame.url())!,
+      kind,
+      fields,
+    };
+    await releaseForm(cdpService);
+    const timer = setTimeout(() => {
+      void releaseForm(cdpService);
+    }, 5 * 60_000);
+    timer.unref();
+    forms.set(cdpService, { description, frame, handle, timer });
+    return description;
   }
-
-  if (otpCandidate) return otpCandidate;
-
+  await releaseForm(cdpService);
   throw new CredentialFormError(
-    target
-      ? "The credential form is no longer available."
-      : "No visible password or one-time-code form was found.",
-    target ? 409 : 404,
+    "No unambiguous supported form was found. Open the browser to continue.",
+    404,
   );
 }
 
-export async function discoverCredentialForm(
-  cdpService: CDPService,
-): Promise<CredentialFormDescription> {
-  const { frame: _frame, ...description } = await locateCredentialForm(cdpService);
-  return description;
-}
-
-export async function fillCredentialForm(
+async function fillBoundForm(
   cdpService: CDPService,
   target: CredentialFormTarget,
-  values: CredentialFormValues,
-): Promise<{ filledUsername?: boolean; submitted: boolean }> {
-  const located = await locateCredentialForm(cdpService, target);
-  if (located.kind !== target.kind) {
-    throw new CredentialFormError("The credential form changed before it could be filled.", 409);
+  request: CredentialFormValues,
+): Promise<{ submitted: boolean }> {
+  const located = forms.get(cdpService);
+  if (
+    !located ||
+    ["formId", "pageId", "frameUrl", "origin", "kind"].some(
+      (key) =>
+        located.description[key as keyof CredentialFormTarget] !==
+        target[key as keyof CredentialFormTarget],
+    )
+  ) {
+    throw new CredentialFormError("The form is no longer available. Reconnect to continue.", 409);
   }
-  if (located.kind === "password" && located.hasUsername && values.username === undefined) {
-    throw new CredentialFormError("This credential form also requires a username.", 400);
+  const { values } = request;
+  const fields = located.description.fields;
+  if (
+    !values ||
+    typeof values !== "object" ||
+    Array.isArray(values) ||
+    Object.keys(values).some((id) => !fields.some((field) => field.id === id)) ||
+    !Object.values(values).some((value) => typeof value === "string" && value.length > 0)
+  ) {
+    throw new CredentialFormError("The submitted fields do not match this form.", 400);
   }
-  if (located.kind === "password" && !values.password) {
-    throw new CredentialFormError("A password is required for this credential form.", 400);
+  for (const field of fields) {
+    const value = values[field.id];
+    if (value === undefined || value === "") {
+      if (field.required) throw new CredentialFormError("Enter all required fields.", 400);
+      continue;
+    }
+    if (
+      typeof value !== "string" ||
+      value.length > (field.maxLength ?? 4096) ||
+      (field.exactLength !== undefined && value.length !== field.exactLength) ||
+      (field.options && !field.options.some((option) => option.value === value))
+    )
+      throw new CredentialFormError("A field does not match the form's requirements.", 400);
   }
-  if (located.kind === "otp" && !values.code) {
-    throw new CredentialFormError("A one-time code is required for this credential form.", 400);
-  }
-  if (located.kind === "otp" && located.codeLength && values.code?.length !== located.codeLength) {
+  await clearContinuation(cdpService);
+  const anchorHandle = await located.handle
+    .evaluateHandle(
+      (form, target, values) => {
+        const valid = () =>
+          location.href === target.frameUrl &&
+          location.origin === target.origin &&
+          form.controls.every(({ input, form, attributes, action, options }) => {
+            const rect = input.getBoundingClientRect();
+            return (
+              input.isConnected &&
+              input.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) &&
+              !input.disabled &&
+              !("readOnly" in input && input.readOnly) &&
+              rect.width > 0 &&
+              rect.height > 0 &&
+              getComputedStyle(input).visibility === "visible" &&
+              !input.closest('[inert], [aria-hidden="true"]') &&
+              input.form === form &&
+              input.form?.action === action &&
+              JSON.stringify(
+                [
+                  "type",
+                  "name",
+                  "id",
+                  "autocomplete",
+                  "maxlength",
+                  "required",
+                  "pattern",
+                  "form",
+                ].map((name) => input.getAttribute(name)),
+              ) === attributes &&
+              (!(input instanceof HTMLSelectElement) ||
+                JSON.stringify(
+                  Array.from(input.options).map((option) => [
+                    option.value,
+                    option.label,
+                    option.disabled,
+                    option.parentElement?.matches("optgroup[disabled]"),
+                  ]),
+                ) === options)
+            );
+          });
+        if (!valid()) return null;
+        let anchor: FormControl | null = null;
+        for (const field of form.fields) {
+          const value = values[field.descriptor.id];
+          if (value === undefined || value === "") continue;
+          for (const [index, input] of field.inputs.entries()) {
+            // Event handlers can replace another field synchronously. Stop before
+            // delivering any value to a replacement or a different destination.
+            if (!valid()) return null;
+            input.focus();
+            if (input instanceof HTMLSelectElement) {
+              const setter = Object.getOwnPropertyDescriptor(
+                HTMLSelectElement.prototype,
+                "selectedIndex",
+              )?.set;
+              if (!setter) return null;
+              setter.call(input, Number(value));
+            } else {
+              const prototype =
+                input instanceof HTMLTextAreaElement
+                  ? HTMLTextAreaElement.prototype
+                  : HTMLInputElement.prototype;
+              const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+              if (!setter) return null;
+              setter.call(input, field.inputs.length > 1 ? value[index] : value);
+            }
+            input.dispatchEvent(
+              new InputEvent("input", { bubbles: true, inputType: "insertText" }),
+            );
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+            input.blur();
+            anchor = input;
+          }
+        }
+        return anchor;
+      },
+      target,
+      values,
+    )
+    .catch(() => undefined);
+  const anchor = anchorHandle?.asElement() as ElementHandle<FormControl> | null;
+  if (!anchor) {
+    await anchorHandle?.dispose();
     throw new CredentialFormError(
-      `This credential form requires a ${located.codeLength}-character code.`,
-      400,
+      "The form changed before it could be filled. Reconnect to continue.",
+      409,
     );
   }
-
-  await clearContinuation(cdpService);
-  const resultHandle = (await located.frame.evaluateHandle(
-    ({ kind, username, password, code }) => {
-      const visible = (input: HTMLInputElement) => {
-        const style = window.getComputedStyle(input);
-        const rect = input.getBoundingClientRect();
-        return (
-          !input.disabled &&
-          !input.readOnly &&
-          style.display !== "none" &&
-          style.visibility !== "hidden" &&
-          rect.width > 0 &&
-          rect.height > 0
-        );
-      };
-      const inputs = Array.from(document.querySelectorAll<HTMLInputElement>("input")).filter(
-        visible,
-      );
-      const setValue = (input: HTMLInputElement, value: string) => {
-        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-        if (!setter) throw new Error("Browser input setter unavailable");
-        input.focus();
-        setter.call(input, value);
-        input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
-        input.dispatchEvent(new Event("change", { bubbles: true }));
-        input.blur();
-      };
-
-      let anchor: HTMLInputElement | undefined;
-      let filledUsername = false;
-      if (kind === "password") {
-        const passwordInput = inputs.find((input) => input.type.toLowerCase() === "password");
-        if (!passwordInput || password === undefined) return { status: "missing" as const };
-        const acceptsUsername = (input: HTMLInputElement) => {
-          const type = input.type.toLowerCase();
-          return type === "text" || type === "email" || type === "tel" || type === "";
-        };
-        const candidates = inputs.filter(
-          (input) =>
-            input !== passwordInput &&
-            acceptsUsername(input) &&
-            (!passwordInput.form || input.form === passwordInput.form),
-        );
-        const usernameInput =
-          candidates.find((input) => {
-            const autocomplete = input.autocomplete.toLowerCase();
-            return autocomplete === "username" || autocomplete === "email";
-          }) ??
-          candidates.find((input) =>
-            /(?:user|email|login|account)/i.test(`${input.name} ${input.id}`),
-          ) ??
-          candidates
-            .filter((input) =>
-              Boolean(
-                input.compareDocumentPosition(passwordInput) & Node.DOCUMENT_POSITION_FOLLOWING,
-              ),
-            )
-            .at(-1) ??
-          candidates.at(-1);
-        if (username !== undefined && usernameInput) {
-          setValue(usernameInput, username);
-          filledUsername = true;
-        }
-        setValue(passwordInput, password);
-        anchor = passwordInput;
-      } else {
-        if (code === undefined) return { status: "missing" as const };
-        const acceptsCode = (input: HTMLInputElement) => {
-          const type = input.type.toLowerCase();
-          return (
-            type === "text" ||
-            type === "tel" ||
-            type === "number" ||
-            type === "" ||
-            input.autocomplete.toLowerCase().split(/\s+/).includes("one-time-code")
-          );
-        };
-        const codeInputs = inputs.filter(acceptsCode);
-        const otpWords =
-          /(?:one[\s_-]*time|verification|security|auth(?:entication)?[\s_-]*code|otp|2fa|two[\s_-]*factor|passcode|login[\s_-]*code|\bcode\b)/i;
-        const inputText = (input: HTMLInputElement) =>
-          `${input.autocomplete} ${input.name} ${input.id} ${
-            input.getAttribute("aria-label") ?? ""
-          } ${input.placeholder} ${Array.from(input.labels ?? [])
-            .map((label) => label.textContent ?? "")
-            .join(" ")}`;
-        const singleCode =
-          codeInputs.find((input) =>
-            input.autocomplete.toLowerCase().split(/\s+/).includes("one-time-code"),
-          ) ?? codeInputs.find((input) => otpWords.test(inputText(input)));
-        if (singleCode) {
-          setValue(singleCode, code);
-          anchor = singleCode;
-        } else {
-          const groups = new Map<HTMLFormElement | null, HTMLInputElement[]>();
-          for (const input of codeInputs) {
-            if (input.maxLength !== 1) continue;
-            const group = groups.get(input.form) ?? [];
-            group.push(input);
-            groups.set(input.form, group);
-          }
-          const group = Array.from(groups).find(([form, fields]) => {
-            if (fields.length < 4 || fields.length > 8) return false;
-            const context = `${form?.textContent ?? ""} ${fields.map(inputText).join(" ")}`;
-            return otpWords.test(context);
-          })?.[1];
-          if (!group || group.length !== code.length) return { status: "missing" as const };
-          group.forEach((input, index) => setValue(input, code[index]));
-          anchor = group.at(-1);
-        }
-      }
-
-      return {
-        status: "filled" as const,
-        filledUsername,
-        anchor,
-      };
-    },
-    { kind: target.kind, ...values },
-  )) as JSHandle<{
-    status: "missing" | "filled";
-    filledUsername?: boolean;
-    anchor?: HTMLInputElement;
-  }>;
-
-  const result = await resultHandle.evaluate((value) => ({
-    status: value.status,
-    filledUsername: value.status === "filled" && value.filledUsername,
-  }));
-  if (result.status !== "filled") {
-    await resultHandle.dispose();
-    throw new CredentialFormError("The credential form changed before it could be filled.", 409);
-  }
-  const anchorHandle = await resultHandle.getProperty("anchor");
-  const anchor = anchorHandle.asElement() as ElementHandle<HTMLInputElement>;
-  await resultHandle.dispose();
-  if (values.submit !== true) {
+  if (request.submit !== true && located.description.kind === "login") {
     await anchor.dispose();
-    return {
-      ...(located.kind === "password" ? { filledUsername: result.filledUsername } : {}),
-      submitted: false,
-    };
+    return { submitted: false };
   }
+  // A receipt identifies an exact node, so MCP never guesses which filled form
+  // a continuation button belongs to. It carries no field values.
+  const client = (anchor as ElementHandle<FormControl> & { client: CDPSession }).client;
+  const { node } = await client.send("DOM.describeNode", {
+    objectId: anchor.remoteObject().objectId,
+  });
   const receipt: CredentialContinuation = {
-    ...target,
+    formId: target.formId,
+    pageId: target.pageId,
+    frameUrl: target.frameUrl,
+    origin: target.origin,
+    kind: target.kind,
+    anchorBackendNodeId: node.backendNodeId,
     expiresAt: Date.now() + 5 * 60_000,
     submissionAttempted: false,
   };
@@ -545,14 +738,50 @@ export async function fillCredentialForm(
     void clearContinuation(cdpService);
   }, 5 * 60_000);
   timer.unref();
-  continuations.set(cdpService, { receipt, anchor, timer });
-  // Filling does not prove authentication. An actual click is only an attempt;
-  // MCP inspects the resulting page and continues or requests the next input.
+  const bound = await located.handle.evaluateHandle((form) => form);
+  continuations.set(cdpService, {
+    receipt,
+    anchor,
+    bound,
+    filledIds: Object.keys(values).filter((id) => values[id] !== ""),
+    timer,
+  });
+  // Filling card/address fields does not authorize any transaction or save.
   const submitted =
-    values.submit === true && (await activateCredentialControl(anchor).catch(() => false));
+    request.submit === true &&
+    located.description.kind === "login" &&
+    (await activateCredentialControl(anchor).catch(() => false));
   receipt.submissionAttempted = submitted;
-  return {
-    ...(located.kind === "password" ? { filledUsername: result.filledUsername } : {}),
-    submitted,
-  };
+  return { submitted };
+}
+
+// A fill is one browser operation. Concurrent discovery must not dispose its
+// bound nodes, and concurrent POSTs must not replay the input or submit click.
+const filling = new WeakSet<CDPService>();
+export async function fillCredentialForm(
+  cdpService: CDPService,
+  target: CredentialFormTarget,
+  request: CredentialFormValues,
+): Promise<{ submitted: boolean }> {
+  if (filling.has(cdpService))
+    throw new CredentialFormError("A secure form is already being filled.", 409);
+  filling.add(cdpService);
+  try {
+    return await fillBoundForm(cdpService, target, request);
+  } finally {
+    filling.delete(cdpService);
+  }
+}
+
+export async function discoverCredentialForm(
+  cdpService: CDPService,
+): Promise<CredentialFormDescription> {
+  if (filling.has(cdpService))
+    throw new CredentialFormError("A secure form operation is already in progress.", 409);
+  filling.add(cdpService);
+  try {
+    return await discoverBoundForm(cdpService);
+  } finally {
+    filling.delete(cdpService);
+  }
 }

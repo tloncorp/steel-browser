@@ -1,0 +1,14 @@
+FROM golang:1.26 AS build
+
+ARG WIREPROXY_VERSION=v1.1.3
+RUN CGO_ENABLED=0 GOBIN=/out go install -trimpath \
+    github.com/windtf/wireproxy/cmd/wireproxy@${WIREPROXY_VERSION}
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=build /out/wireproxy /usr/local/bin/wireproxy
+
+USER nonroot:nonroot
+
+ENTRYPOINT ["/usr/local/bin/wireproxy"]
+CMD ["--silent", "--config", "/config/wireproxy.conf", "--info", "127.0.0.1:9080"]

@@ -316,14 +316,13 @@ export const handleFillCredentialForm = async (
     Params: { sessionId: string };
     Body: {
       target: {
+        formId: string;
         pageId: string;
         frameUrl: string;
         origin: string;
-        kind: "password" | "otp";
+        kind: "login" | "details";
       };
-      username?: string;
-      password?: string;
-      code?: string;
+      values: Record<string, string>;
       submit?: boolean;
     };
   }>,
@@ -341,9 +340,7 @@ export const handleFillCredentialForm = async (
       server.sessionService.getCDPService(request.params.sessionId),
       request.body.target,
       {
-        username: request.body.username,
-        password: request.body.password,
-        code: request.body.code,
+        values: request.body.values,
         submit: request.body.submit,
       },
     );
