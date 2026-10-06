@@ -30,10 +30,11 @@
       header {
         flex: none;
         display: flex;
-        flex-wrap: wrap;
+        position: relative;
+        z-index: 2;
         align-items: center;
-        gap: 8px;
-        padding: 10px;
+        gap: 4px;
+        padding: 6px;
         border-bottom: 1px solid #8885;
       }
       button,
@@ -62,17 +63,93 @@
       }
       #url {
         flex: 1;
-        min-width: 140px;
+        min-width: 0;
+        width: 0;
+        height: 36px;
+        font-size: 16px;
         border: 1px solid #8885;
         border-radius: 8px;
         padding: 9px;
         background: Canvas;
         color: CanvasText;
       }
-      #status {
+      .icon-button,
+      .viewport-control {
+        flex: none;
+        width: 32px;
+        height: 36px;
+        display: grid;
+        place-items: center;
+        padding: 0;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: CanvasText;
+        font-size: 20px;
+      }
+      .icon-button:hover,
+      .viewport-control:hover {
+        background: #8882;
+      }
+      .viewport-control {
+        position: relative;
+      }
+      .viewport-control svg {
+        width: 20px;
+        height: 20px;
+        fill: currentColor;
+      }
+      .viewport-control select {
+        position: absolute;
+        inset: 0;
         width: 100%;
-        color: #777;
+        height: 100%;
+        opacity: 0;
+        cursor: pointer;
+        font-size: 16px;
+      }
+      .viewport-control:focus-within {
+        outline: 2px solid #245de8;
+      }
+      .viewport-control:has(select:disabled) {
+        opacity: 0.5;
+      }
+      #browser-menu {
+        position: absolute;
+        top: calc(100% + 4px);
+        right: 6px;
+        width: min(280px, calc(100vw - 12px));
+        display: grid;
+        gap: 8px;
+        padding: 12px;
+        border: 1px solid #8885;
+        border-radius: 10px;
+        background: Canvas;
+        box-shadow: 0 4px 20px #0002;
+      }
+      #tabs {
+        min-width: 0;
+        width: 100%;
+      }
+      #status {
+        position: absolute;
+        top: calc(100% + 4px);
+        left: 6px;
+        max-width: calc(100vw - 12px);
+        padding: 6px 10px;
+        border-radius: 6px;
+        background: Canvas;
+        color: CanvasText;
+        box-shadow: 0 2px 8px #0002;
         font-size: 12px;
+        pointer-events: none;
+      }
+      header[data-ready="true"] #status {
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip-path: inset(50%);
+        padding: 0;
       }
       #stage {
         flex: 1;
@@ -124,6 +201,9 @@
       }
       #keyboard-panel p {
         margin: 0 0 6px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
         font-size: 12px;
       }
       dialog {
@@ -134,56 +214,30 @@
       dialog p {
         line-height: 1.5;
       }
-      .nav {
-        display: flex;
-        gap: 4px;
-      }
-      @media (max-width: 500px) {
-        header {
-          gap: 6px;
-          padding: 8px;
-        }
-        button,
-        select {
-          font-size: 13px;
-        }
-        .nav {
-          display: none;
-        }
-        #url {
-          order: 9;
-          width: 100%;
-          flex-basis: 100%;
-        }
-        #status {
-          order: 10;
-        }
-      }
     </style>
   </head>
   <body>
     <header <%= showControls ? '' : 'hidden' %>>
-      <select id="tabs" aria-label="Browser tab" <%= singlePageMode ? 'hidden' : '' %>></select>
-      <button id="close-tab" aria-label="Close tab" <%= singlePageMode ? 'hidden' : '' %>>Close tab</button>
-      <div class="nav">
-        <button id="back" aria-label="Back">←</button
-        ><button id="forward" aria-label="Forward">→</button
-        ><button id="refresh" aria-label="Reload">↻</button>
-      </div>
+      <button id="back" class="icon-button" aria-label="Back" title="Back">‹</button>
+      <button id="forward" class="icon-button" aria-label="Forward" title="Forward">›</button>
       <input id="url" aria-label="Browser address" autocomplete="off" spellcheck="false" readonly />
-      <button id="control" type="button" disabled>Take control</button>
-      <button id="keyboard" type="button" disabled>Keyboard</button>
-      <select id="viewport-mode" aria-label="Page layout" disabled>
-        <option value="auto">Auto layout</option>
-        <option value="mobile">Mobile layout</option>
-        <option value="desktop">Desktop layout</option>
-      </select>
-      <select id="interaction-mode" aria-label="Touch interaction">
-        <option value="touch">Touch</option>
-        <option value="drag">Drag</option>
-        <option value="scroll">Scroll</option>
-      </select>
-      <button id="reconnect" type="button" hidden>Reconnect</button>
+      <button id="keyboard" class="icon-button" type="button" aria-label="Keyboard" title="Keyboard" disabled>⌨️</button>
+      <div class="viewport-control" title="Page layout">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 3H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h6v2H7v2h10v-2h-3v-2h6a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm0 14H4V5h16v12z"/></svg>
+        <select id="viewport-mode" aria-label="Page layout" disabled>
+          <option value="auto">Auto</option>
+          <option value="mobile">Mobile</option>
+          <option value="desktop">Desktop</option>
+        </select>
+      </div>
+      <button id="menu-toggle" class="icon-button" type="button" aria-label="Browser options" title="Browser options" aria-expanded="false" aria-controls="browser-menu">⋯</button>
+      <div id="browser-menu" hidden>
+        <select id="tabs" aria-label="Browser tab" <%= singlePageMode ? 'hidden' : '' %>></select>
+        <button id="close-tab" aria-label="Close tab" <%= singlePageMode ? 'hidden' : '' %>>Close tab</button>
+        <button id="refresh" aria-label="Reload">Reload</button>
+        <button id="control" type="button" disabled>Take control</button>
+        <button id="reconnect" type="button" hidden>Reconnect</button>
+      </div>
       <span id="status" role="status" aria-live="polite">Connecting…</span>
     </header>
     <main id="stage" data-ready="false">
@@ -191,7 +245,7 @@
       <div id="keyboard-panel" hidden>
         <p>
           Type into the selected browser field.
-          <button id="keyboard-close" type="button">Hide keyboard</button>
+          <button id="keyboard-close" class="icon-button" type="button" aria-label="Hide keyboard" title="Hide keyboard">×</button>
         </p>
         <textarea
           id="keyboard-input"
@@ -228,7 +282,28 @@
         const controlButton = $("control");
         const status = $("status");
         const layout = $("viewport-mode");
-        const interaction = $("interaction-mode");
+        const menu = $("browser-menu");
+        function closeMenu() {
+          menu.hidden = true;
+          $("menu-toggle").setAttribute("aria-expanded", "false");
+        }
+        $("menu-toggle").addEventListener("click", () => {
+          menu.hidden = !menu.hidden;
+          $("menu-toggle").setAttribute("aria-expanded", String(!menu.hidden));
+        });
+        document.addEventListener("pointerdown", (event) => {
+          if (!menu.contains(event.target) && !$("menu-toggle").contains(event.target))
+            closeMenu();
+        });
+        document.addEventListener("keydown", (event) => {
+          if (event.key === "Escape" && !menu.hidden) {
+            closeMenu();
+            $("menu-toggle").focus();
+          }
+        });
+        menu.addEventListener("click", (event) => {
+          if (event.target.closest("button")) closeMenu();
+        });
         const keyboard = $("keyboard-input");
         const panel = $("keyboard-panel");
         let socket,
@@ -259,8 +334,11 @@
           pendingMove,
           moveTimer,
           composing = false,
-          compositionCommit,
-          handledInput = false;
+          keyboardText = "",
+          keyboardCaret = 0;
+        const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+        const characters = (value) =>
+          Array.from(graphemes.segment(value), (part) => part.segment);
         let discoverySocket,
           discoveryTimer,
           discoveryRetries = 0,
@@ -282,9 +360,11 @@
         function setReady(value, message) {
           ready = value;
           stage.dataset.ready = String(value);
+          document.querySelector("header").dataset.ready = String(value);
           $("keyboard").disabled = !value;
           layout.disabled = !controlling;
-          for (const name of ["back", "forward", "refresh", "close-tab"]) $(name).disabled = !value;
+          for (const name of ["back", "forward", "refresh", "close-tab"])
+            $(name).disabled = !value;
           $("url").readOnly = !value;
           if (message) status.textContent = message;
         }
@@ -303,8 +383,7 @@
           clearTimeout(moveTimer);
           moveTimer = undefined;
           composing = false;
-          compositionCommit = undefined;
-          keyboard.value = "\u200b";
+          clearKeyboard();
           clipboardRequests.clear();
         }
         function cancelInput() {
@@ -409,7 +488,8 @@
               return;
             }
             if (data.type === "controlState") {
-              const gained = data.controlling && (!controlling || generation !== data.generation);
+              const gained =
+                data.controlling && (!controlling || generation !== data.generation);
               if (
                 generation !== data.generation ||
                 controlling !== data.controlling ||
@@ -429,7 +509,11 @@
               else if (!controlling) {
                 setReady(
                   false,
-                  acquiring ? "Connecting control…" : data.available ? "Watching the browser." : "Another viewer has control.",
+                  acquiring
+                    ? "Connecting control…"
+                    : data.available
+                    ? "Watching the browser."
+                    : "Another viewer has control.",
                 );
                 if (desiredControl && data.available && supported) takeControl();
               }
@@ -464,7 +548,10 @@
               return;
             }
             if (data.type === "inputError") {
-              if (data.code === "session_expired" || data.code === "unsupported_input_version") {
+              if (
+                data.code === "session_expired" ||
+                data.code === "unsupported_input_version"
+              ) {
                 expired = true;
                 terminalMessage =
                   data.code === "session_expired"
@@ -544,7 +631,8 @@
             controlling = false;
             acquiring = false;
             controlButton.disabled = true;
-            if ((event.code === 4001 && singlePageMode) || Date.now() >= expiresAt) expired = true;
+            if ((event.code === 4001 && singlePageMode) || Date.now() >= expiresAt)
+              expired = true;
             if (expired)
               setReady(
                 false,
@@ -613,7 +701,8 @@
                 return option;
               }),
             );
-            if (data.tabs.some((tab) => tab.id === selectedPage)) $("tabs").value = selectedPage;
+            if (data.tabs.some((tab) => tab.id === selectedPage))
+              $("tabs").value = selectedPage;
             else if (data.tabs.length) selectPage(data.firstTabId || data.tabs[0].id);
             else setReady(false, "No browser tabs are open.");
           };
@@ -665,7 +754,6 @@
           requestViewport(pendingMode, true);
           pendingMode = undefined;
         });
-        interaction.addEventListener("change", cancelInput);
 
         function coordinates(event) {
           if (!metadata) return null;
@@ -707,17 +795,15 @@
               button,
               modifiers: modifiers(event),
               clickCount: Math.min(3, event.detail || 1),
-              ...(type === "mouseWheel" ? { deltaX: event.deltaX, deltaY: event.deltaY } : {}),
+              ...(type === "mouseWheel"
+                ? { deltaX: event.deltaX, deltaY: event.deltaY }
+                : {}),
             },
           });
         }
-        function touch(type, point, id) {
-          action({ type: "touchEvent", event: { type, ...point, id, modifiers: 0 } });
-        }
         function move(point) {
           if (!gesture || !ready) return;
-          if (gesture.kind === "touch") touch("touchMove", point, gesture.id);
-          else if (gesture.kind === "drag") mouse("mouseMoved", point);
+          if (gesture.kind === "drag") mouse("mouseMoved", point);
           else {
             if (Math.hypot(point.x - gesture.start.x, point.y - gesture.start.y) > 6)
               gesture.moved = true;
@@ -746,7 +832,7 @@
           const point = coordinates(event);
           if (!point) return;
           canvas.setPointerCapture(event.pointerId);
-          const kind = event.pointerType === "mouse" ? "drag" : interaction.value;
+          const kind = event.pointerType === "mouse" ? "drag" : "scroll";
           gesture = {
             id: event.pointerId,
             kind,
@@ -755,8 +841,7 @@
             button: event.pointerType === "mouse" ? mouseButton(event.button) : "left",
             moved: false,
           };
-          if (kind === "touch") touch("touchStart", point, event.pointerId);
-          else if (kind === "drag") mouse("mousePressed", point, gesture.button, event);
+          if (kind === "drag") mouse("mousePressed", point, gesture.button, event);
         });
         canvas.addEventListener("pointermove", (event) => {
           if (!ready) return;
@@ -782,8 +867,7 @@
           flushMove();
           const point = coordinates(event) || gesture.point;
           if (point.x !== gesture.point.x || point.y !== gesture.point.y) move(point);
-          if (gesture.kind === "touch") touch("touchEnd", point, gesture.id);
-          else if (gesture.kind === "drag") mouse("mouseReleased", point, gesture.button, event);
+          if (gesture.kind === "drag") mouse("mouseReleased", point, gesture.button, event);
           else if (!gesture.moved) {
             mouse("mousePressed", point, "left");
             mouse("mouseReleased", point, "left");
@@ -822,22 +906,43 @@
         function text(value) {
           if (value) action({ type: "insertText", text: value });
         }
-        function composition(value) {
-          action({
-            type: "composition",
-            text: value,
-            selectionStart: value.length,
-            selectionEnd: value.length,
-          });
-        }
         function clearKeyboard() {
-          keyboard.value = "\u200b";
-          keyboard.setSelectionRange(1, 1);
+          keyboard.value = "";
+          keyboardText = "";
+          keyboardCaret = 0;
+        }
+        function syncKeyboard() {
+          if (!ready || composing || keyboard.value === keyboardText) return;
+          const before = characters(keyboardText);
+          const after = characters(keyboard.value);
+          let start = 0;
+          while (
+            start < before.length &&
+            start < after.length &&
+            before[start] === after[start]
+          )
+            start++;
+          let end = before.length;
+          let nextEnd = after.length;
+          while (end > start && nextEnd > start && before[end - 1] === after[nextEnd - 1]) {
+            end--;
+            nextEnd--;
+          }
+          // The local draft starts at the remote field's caret when the keyboard opens.
+          const direction = end < keyboardCaret ? "ArrowLeft" : "ArrowRight";
+          for (let i = 0; i < Math.abs(end - keyboardCaret); i++)
+            press(direction, direction, direction === "ArrowLeft" ? 37 : 39);
+          for (let i = start; i < end; i++) press("ArrowLeft", "ArrowLeft", 37, 8);
+          const inserted = after.slice(start, nextEnd).join("");
+          if (inserted) text(inserted);
+          else if (end > start) press("Backspace", "Backspace", 8);
+          keyboardText = keyboard.value;
+          keyboardCaret = nextEnd;
         }
         $("keyboard").addEventListener("click", () => {
           if (!ready) return;
+          if (panel.hidden) clearKeyboard();
           panel.hidden = false;
-          clearKeyboard();
           keyboard.focus();
         });
         $("keyboard-close").addEventListener("click", () => {
@@ -847,76 +952,61 @@
         });
         keyboard.addEventListener("compositionstart", () => {
           composing = true;
-          compositionCommit = undefined;
-          keyboard.value = "";
         });
-        keyboard.addEventListener("compositionupdate", (event) => {
-          if (ready) composition(event.data || "");
-        });
-        keyboard.addEventListener("compositionend", (event) => {
+        keyboard.addEventListener("compositionend", () => {
           composing = false;
-          compositionCommit = event.data || "";
-          if (compositionCommit) text(compositionCommit);
-          else composition("");
-          queueMicrotask(clearKeyboard);
+          syncKeyboard();
         });
-        function edit(inputType, value) {
-          if (inputType.startsWith("delete"))
-            press(
-              inputType.includes("Forward") ? "Delete" : "Backspace",
-              inputType.includes("Forward") ? "Delete" : "Backspace",
-              inputType.includes("Forward") ? 46 : 8,
-              inputType.includes("Word") ? 2 : 0,
-            );
-          else if (inputType === "insertLineBreak" || inputType === "insertParagraph")
-            press("Enter", "Enter", 13);
-          else text(value);
-        }
         keyboard.addEventListener("beforeinput", (event) => {
           if (!ready) {
             event.preventDefault();
-            clearKeyboard();
             return;
           }
-          if (composing || event.isComposing || event.inputType.includes("Composition")) return;
-          if (compositionCommit !== undefined && event.data === compositionCommit) {
-            compositionCommit = undefined;
+          if (composing || event.isComposing) return;
+          if (
+            event.inputType === "insertLineBreak" ||
+            event.inputType === "insertParagraph"
+          ) {
             event.preventDefault();
-            return;
-          }
-          compositionCommit = undefined;
-          edit(event.inputType, event.data || "");
-          handledInput = true;
-          if (event.cancelable) {
-            event.preventDefault();
-            handledInput = false;
+            press("Enter", "Enter", 13);
             clearKeyboard();
+          } else if (!keyboard.value && event.inputType.startsWith("delete")) {
+            const forward = event.inputType.includes("Forward");
+            press(
+              forward ? "Delete" : "Backspace",
+              forward ? "Delete" : "Backspace",
+              forward ? 46 : 8,
+            );
           }
         });
         keyboard.addEventListener("input", (event) => {
-          if (composing || event.isComposing) return;
-          if (!handledInput) {
-            const value = event.data ?? keyboard.value.replace(/\u200b/g, "");
-            if (compositionCommit !== value) edit(event.inputType || "insertText", value);
-          }
-          handledInput = false;
-          compositionCommit = undefined;
-          clearKeyboard();
+          if (!event.isComposing) syncKeyboard();
         });
         document.addEventListener("paste", (event) => {
           if (
             !ready ||
-            (event.target !== keyboard && event.target !== canvas && event.target !== document.body)
+            (event.target !== keyboard &&
+              event.target !== canvas &&
+              event.target !== document.body)
           )
             return;
           event.preventDefault();
-          text(event.clipboardData?.getData("text/plain") || "");
-          if (event.target === keyboard) clearKeyboard();
+          const pasted = event.clipboardData?.getData("text/plain") || "";
+          if (event.target === keyboard) {
+            keyboard.setRangeText(
+              pasted,
+              keyboard.selectionStart,
+              keyboard.selectionEnd,
+              "end",
+            );
+            syncKeyboard();
+          } else text(pasted);
         });
         if (clipboardBridge) {
           tellParent({ type: "clipboardBridgeReady" });
           window.addEventListener("message", (event) => {
-            if (event.source !== window.parent || event.origin !== parentOrigin || !ready) return;
+            if (event.source !== window.parent || event.origin !== parentOrigin || !ready)
+              return;
             const data = event.data;
             if (data?.type === "triggerCopy") action({ type: "getSelectedText" });
             else if (data?.type === "triggerPaste" && typeof data.text === "string")
@@ -948,14 +1038,20 @@
         }
         document.addEventListener("keydown", (event) => {
           if (!ready || (event.target !== canvas && event.target !== document.body)) return;
-          if ((event.ctrlKey || event.metaKey) && ["v", "c", "x"].includes(event.key.toLowerCase()))
+          if (
+            (event.ctrlKey || event.metaKey) &&
+            ["v", "c", "x"].includes(event.key.toLowerCase())
+          )
             return;
           event.preventDefault();
           key("keyDown", event.key, event.code, event.keyCode, modifiers(event));
         });
         document.addEventListener("keyup", (event) => {
           if (!ready || (event.target !== canvas && event.target !== document.body)) return;
-          if ((event.ctrlKey || event.metaKey) && ["v", "c", "x"].includes(event.key.toLowerCase()))
+          if (
+            (event.ctrlKey || event.metaKey) &&
+            ["v", "c", "x"].includes(event.key.toLowerCase())
+          )
             return;
           event.preventDefault();
           key("keyUp", event.key, event.code, event.keyCode, modifiers(event));
@@ -1012,7 +1108,6 @@
           desiredControl = false;
           controlButton.hidden = true;
           $("keyboard").hidden = true;
-          interaction.hidden = true;
         }
         if (singlePageMode) connect();
         else discoverTabs();

@@ -268,7 +268,6 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     const point = await pointOn(phone, "#tap");
     await phone.touchscreen.tap(point.x, point.y);
     await target.waitForFunction(() => document.querySelector("#tap")!.textContent === "Tapped");
-    await phone.select("#interaction-mode", "scroll");
     const input = await phone.createCDPSession();
     const scrollPoint = await phone.$eval("canvas", (el) => {
       const r = el.getBoundingClientRect();
@@ -329,7 +328,7 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
       () => !(document.querySelector("#control") as HTMLButtonElement).disabled,
     );
     if (await observer.$eval("#control", (el) => el.textContent === "Take control"))
-      await observer.click("#control");
+      await menuAction(observer, "#control");
     await target.waitForFunction(() => innerWidth === 1200);
     const readOnly = await viewer(500, 700, "/watch");
     expect(await readOnly.$eval("#control", (el) => (el as HTMLButtonElement).hidden)).toBe(true);
@@ -369,9 +368,15 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
       await phone.click("#viewport-reload");
     await ready(phone);
   }
+  async function menuAction(page: Page, selector: string) {
+    if (await page.$eval("#browser-menu", (el) => (el as HTMLElement).hidden))
+      await page.click("#menu-toggle");
+    await page.click(selector);
+  }
+
   async function finish(phone: Page) {
     await ready(phone);
-    await phone.click("#control");
+    await menuAction(phone, "#control");
     await phone.waitForFunction(
       () => document.querySelector("#control")?.textContent === "Take control",
     );
@@ -379,25 +384,11 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
   }
 
   it.each(["auto", "mobile", "desktop"])(
-    "delivers native touch drag, timed hold, and one tap with %s layout through the public gateway",
+    "delivers one tap with %s layout through the public gateway",
     async (layout) => {
       await target.goto(`${origin}/fixture`);
       const phone = await viewer(390, 900);
       await setLayout(phone, layout);
-      await phone.select("#interaction-mode", "touch");
-      await finger(phone, "#slider", 45);
-      await expect
-        .poll(() => target.evaluate('window.points.filter(p=>p[0]==="move").length'))
-        .toBeGreaterThan(1);
-      await expect.poll(() => target.evaluate("window.points.at(-1)?.[0]")).toBe("up");
-      const points = (await target.evaluate("window.points")) as Array<[string, number]>;
-      expect(points[0][0]).toBe("down");
-      expect(points.at(-1)![0]).toBe("up");
-      expect(points.at(-1)![1]).toBeGreaterThan(points[0][1]);
-      await finger(phone, "#hold", 0, 240);
-      await expect.poll(() => target.evaluate("window.holds[0]")).toBeGreaterThanOrEqual(200);
-      await finger(phone, "#touch-only", 30);
-      await expect.poll(() => target.evaluate("window.touchMoves.length")).toBeGreaterThan(1);
       await target.$eval("#tap", (el) => {
         el.textContent = "0";
         (el as HTMLButtonElement).onclick = () => {
@@ -410,30 +401,26 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     },
   );
 
-  it("supports the drag fallback, mouse capture outside the canvas, and native nested scrolling", async () => {
+  it("supports mouse capture outside the canvas and finger scrolling inside a nested container", async () => {
     await target.goto(`${origin}/fixture`);
     const phone = await viewer(390, 1000);
     await setLayout(phone, "auto");
-    await phone.select("#interaction-mode", "drag");
-    await finger(phone, "#slider", 55);
-    await expect.poll(() => target.evaluate("window.points.at(-1)?.[0]")).toBe("up");
     const start = await pointOn(phone, "#slider");
     await phone.mouse.move(start.x, start.y);
     await phone.mouse.down();
     await phone.mouse.move(1, 1, { steps: 5 });
     await phone.mouse.up();
-    await expect.poll(() => target.evaluate('window.points.filter(p=>p[0]==="up").length')).toBe(2);
-    await phone.select("#interaction-mode", "touch");
+    await expect.poll(() => target.evaluate('window.points.filter(p=>p[0]==="up").length')).toBe(1);
     const nested = await pointOn(phone, "#nested");
     const cdp = await phone.createCDPSession();
     await cdp.send("Input.dispatchTouchEvent", {
       type: "touchStart",
       touchPoints: [{ ...nested, id: 1 }],
     });
-    for (let i = 1; i <= 5; i++) {
+    for (let i = 1; i <= 3; i++) {
       await cdp.send("Input.dispatchTouchEvent", {
         type: "touchMove",
-        touchPoints: [{ x: nested.x, y: nested.y - i * 12, id: 1 }],
+        touchPoints: [{ x: nested.x, y: nested.y - i * 10, id: 1 }],
       });
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
@@ -457,10 +444,16 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     await expect
       .poll(() => target.$eval("#draft", (el) => (el as HTMLInputElement).value))
       .toBe("hello");
+    expect(await phone.$eval("#keyboard-input", (el) => (el as HTMLTextAreaElement).value)).toBe(
+      "hello",
+    );
     await phone.keyboard.press("Backspace");
     await expect
       .poll(() => target.$eval("#draft", (el) => (el as HTMLInputElement).value))
       .toBe("hell");
+    expect(await phone.$eval("#keyboard-input", (el) => (el as HTMLTextAreaElement).value)).toBe(
+      "hell",
+    );
     await phone.evaluate(() => {
       const data = new DataTransfer();
       data.setData("text/plain", " pasted");
@@ -473,6 +466,9 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     await expect
       .poll(() => target.$eval("#draft", (el) => (el as HTMLInputElement).value))
       .toBe("hell pasted");
+    expect(await phone.$eval("#keyboard-input", (el) => (el as HTMLTextAreaElement).value)).toBe(
+      "hell pasted",
+    );
     const cdp = await phone.createCDPSession();
     await cdp.send("Input.imeSetComposition", { text: "に", selectionStart: 1, selectionEnd: 1 });
     await cdp.send("Input.insertText", { text: "日本" });
@@ -480,6 +476,31 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     await expect
       .poll(() => target.$eval("#draft", (el) => (el as HTMLInputElement).value))
       .toBe("hell pasted日本");
+    expect(await phone.$eval("#keyboard-input", (el) => (el as HTMLTextAreaElement).value)).toBe(
+      "hell pasted日本",
+    );
+    await phone.$eval("#keyboard-input", (el) =>
+      (el as HTMLTextAreaElement).setSelectionRange(0, 4),
+    );
+    await phone.keyboard.type("well");
+    await expect
+      .poll(() => target.$eval("#draft", (el) => (el as HTMLInputElement).value))
+      .toBe("well pasted日本");
+    await phone.$eval("#keyboard-input", (el) => {
+      const input = el as HTMLTextAreaElement;
+      input.setSelectionRange(5, 11);
+      input.setRangeText("edited", 5, 11, "end");
+      input.dispatchEvent(
+        new InputEvent("input", {
+          inputType: "insertReplacementText",
+          data: "edited",
+          bubbles: true,
+        }),
+      );
+    });
+    await expect
+      .poll(() => target.$eval("#draft", (el) => (el as HTMLInputElement).value))
+      .toBe("well edited日本");
     await phone.keyboard.press("Enter");
     await expect.poll(() => target.evaluate("window.enterCount")).toBe(1);
     await finish(phone);
@@ -545,7 +566,7 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     await finish(phone);
   });
 
-  it("delivers a timed touch hold inside a cross-origin iframe", async () => {
+  it("delivers a timed mouse hold inside a cross-origin iframe", async () => {
     await target.goto(`${origin}/fixture`);
     const phone = await viewer(430, 1100);
     await setLayout(phone, "auto");
@@ -579,50 +600,43 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
       },
       point,
     );
-    const cdp = await phone.createCDPSession();
-    await cdp.send("Input.dispatchTouchEvent", {
-      type: "touchStart",
-      touchPoints: [{ ...local, id: 1 }],
-    });
+    await phone.mouse.move(local.x, local.y);
+    await phone.mouse.down();
     await new Promise((resolve) => setTimeout(resolve, 240));
-    await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await phone.mouse.up();
     await expect.poll(() => framed!.evaluate("window.held")).toBeGreaterThanOrEqual(200);
-    await cdp.detach();
     await finish(phone);
   });
 
-  it("cancels held contacts on rotation, backgrounding, and pointer cancellation", async () => {
+  it("cancels held mouse buttons on rotation, backgrounding, and pointer cancellation", async () => {
     await target.goto(`${origin}/fixture`);
     const phone = await viewer(390, 900);
     await setLayout(phone, "auto");
-    const cdp = await phone.createCDPSession();
     async function start() {
       const point = await pointOn(phone, "#slider");
-      await cdp.send("Input.dispatchTouchEvent", {
-        type: "touchStart",
-        touchPoints: [{ ...point, id: 1 }],
-      });
+      await phone.mouse.move(point.x, point.y);
+      await phone.mouse.down();
       await expect.poll(() => target.evaluate("window.points.at(-1)?.[0]")).toBe("down");
     }
     await start();
     await phone.setViewport({ width: 500, height: 950, hasTouch: true, deviceScaleFactor: 3 });
-    await expect.poll(() => target.evaluate("window.points.at(-1)?.[0]")).toBe("cancel");
-    await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await expect.poll(() => target.evaluate("window.points.at(-1)?.[0]")).toBe("up");
+    await phone.mouse.up();
     await ready(phone);
     await start();
     const foreground = await phone.browser().newPage();
     await foreground.bringToFront();
-    await expect.poll(() => target.evaluate("window.points.at(-1)?.[0]")).toBe("cancel");
+    await expect.poll(() => target.evaluate("window.points.at(-1)?.[0]")).toBe("up");
     await phone.bringToFront();
-    await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await phone.mouse.up();
     await ready(phone);
     await start();
-    await cdp.send("Input.dispatchTouchEvent", { type: "touchCancel", touchPoints: [] });
-    await expect.poll(() => target.evaluate("window.points.at(-1)?.[0]")).toBe("cancel");
-    await cdp.detach();
-    await foreground.close();
-    await finger(phone, "#slider", 25);
+    await phone.$eval("canvas", (el) =>
+      el.dispatchEvent(new PointerEvent("pointercancel", { pointerId: 1 })),
+    );
     await expect.poll(() => target.evaluate("window.points.at(-1)?.[0]")).toBe("up");
+    await phone.mouse.up();
+    await foreground.close();
     await finish(phone);
   });
 
@@ -645,7 +659,7 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     expect(await phone.$eval("#url", (el) => (el as HTMLInputElement).value)).toBe(
       `${origin}/frame`,
     );
-    await phone.click("#close-tab");
+    await menuAction(phone, "#close-tab");
     await phone.waitForFunction(
       (id) => !document.querySelector(`#tabs option[value="${id}"]`),
       {},
@@ -669,19 +683,15 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     await target.goto(`${origin}/fixture`);
     const phone = await viewer(390, 900, mintViewerEntry(Date.now() + 3500));
     await setLayout(phone, "auto");
-    const cdp = await phone.createCDPSession();
     const point = await pointOn(phone, "#slider");
-    await cdp.send("Input.dispatchTouchEvent", {
-      type: "touchStart",
-      touchPoints: [{ ...point, id: 1 }],
-    });
+    await phone.mouse.move(point.x, point.y);
+    await phone.mouse.down();
     await expect.poll(() => target.evaluate("window.points.at(-1)?.[0]")).toBe("down");
     await phone.waitForFunction(
       () => document.querySelector("#status")?.textContent?.includes("expired"),
     );
-    await expect.poll(() => target.evaluate("window.points.at(-1)?.[0]")).toBe("cancel");
+    await expect.poll(() => target.evaluate("window.points.at(-1)?.[0]")).toBe("up");
     expect(await phone.$eval("#stage", (el) => el.getAttribute("data-ready"))).toBe("false");
-    await cdp.detach();
     await phone.close();
     const url = new URL(`${viewerOrigin.replace("http:", "ws:")}/v1/sessions/cast`);
     url.searchParams.set("sessionId", sessionId);

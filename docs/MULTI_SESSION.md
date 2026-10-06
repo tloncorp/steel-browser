@@ -56,10 +56,14 @@ use this browser's full concurrency.
 
 ## Streamed viewer input
 
-The session viewer supports one touch contact, mouse drag, wheel scrolling, physical keys, and
-text composition. On a phone, **Touch** sends the gesture to the page, **Drag** sends held mouse
-input, and **Scroll** turns finger movement into wheel input. To enter text, tap the browser field,
-then tap **Keyboard**. The keyboard bridge handles composition, deletion, paste, and Enter.
+The session viewer turns finger swipes into scrolling and taps into clicks. A mouse supports
+held dragging and wheel scrolling. The toolbar keeps back, forward, address, keyboard, layout,
+and browser options on one row. The screen icon selects Auto, Mobile, or Desktop layout;
+browser options contain tabs, reload, and viewer control.
+
+To enter text, tap the browser field, then tap the keyboard icon. The keyboard panel displays
+and edits the text entered during that keyboard session. It supports composition, selection,
+replacement, deletion, paste, and Enter. Enter sends the key to the page and starts a fresh draft.
 
 Each page accepts input from one viewer connection. Input carries the page ID, a control generation,
 a viewport generation, and an increasing sequence number. The viewer enables input after it paints
@@ -80,8 +84,8 @@ CHROME_EXECUTABLE_PATH=/usr/bin/google-chrome npm exec -w api -- vitest run src/
 node --test session-viewer/server.test.mjs
 ```
 
-For phone acceptance, open a viewer link in Chrome on an iPhone and verify native scrolling,
-horizontal dragging, a timed hold, text entry with the software keyboard, composition, deletion,
+For phone acceptance, open a viewer link in Chrome on an iPhone and verify tap and swipe scrolling,
+text entry with the software keyboard, composition, deletion,
 paste, rotation during a gesture, and return from backgrounding. Verify input against the same
 browser page after reconnecting. The Chrome tests use harmless page and cross-origin iframe
 fixtures; a live challenge requires separate manual verification.
