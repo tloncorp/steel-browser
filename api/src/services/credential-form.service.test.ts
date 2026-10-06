@@ -4,6 +4,7 @@ import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { CDPService } from "./cdp/cdp.service.js";
 import { createBrowserLogger } from "./cdp/instrumentation/browser-logger.js";
+import { browserMonitorStatus } from "./browser-monitor.service.js";
 import {
   discoverCredentialForm,
   fillCredentialForm,
@@ -62,6 +63,27 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     html = body;
     await page.goto(`${origin}/login`);
   }
+
+  it("keeps monitoring fill evidence after the page navigates and the app stops polling", async () => {
+    await load(
+      '<form action="/done"><input name="username" autocomplete="username"><input type="password" autocomplete="current-password"><button type="submit">Sign in</button></form>',
+    );
+    const baseline = browserMonitorStatus(service);
+    const form = await discoverCredentialForm(service);
+    const values = Object.fromEntries(
+      form.fields.map((field) => [
+        field.id,
+        field.purpose === "current-password" ? "private-password" : "private-user",
+      ]),
+    );
+    await fillCredentialForm(service, form, { values, submit: true });
+    await page.waitForFunction(() => location.pathname === "/done");
+    expect(await getCredentialContinuation(service)).toBeNull();
+    const status = browserMonitorStatus(service);
+    expect(status.fill).toMatchObject({ formId: form.formId, submitted: true });
+    expect(status.revision).toBeGreaterThan(baseline.revision);
+    expect(JSON.stringify(status)).not.toMatch(/private-password|private-user|frameUrl|origin/);
+  });
   const fields =
     '<label>Username<input name="username"></label><label>Password<input name="password" type="password"></label>';
   async function fill(submit = true) {
@@ -110,6 +132,12 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     ]);
     expect(await page.evaluate("window.leaked")).toBe(false);
     expect(JSON.stringify(result)).not.toContain("fixture-secret");
+    const status = browserMonitorStatus(service);
+    expect(status).toMatchObject({
+      form: { formId: target.formId },
+      fill: { formId: target.formId, submitted: true },
+    });
+    expect(JSON.stringify(status)).not.toMatch(/fixture-user|fixture-secret|origin|frameUrl/);
   });
 
   it("rejects saved credentials for HTTP, cross-origin actions, OTP, and cross-origin frames", async () => {
@@ -122,6 +150,8 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
         values: { f0: "fixture-user", f1: "fixture-secret" },
       }),
     ).rejects.toThrow("destination changed");
+    expect(browserMonitorStatus(service).failure).toBeDefined();
+    expect(browserMonitorStatus(service).fill).toBeUndefined();
     await loadSecure(`<form action="https://different.example/receive">${fields}</form>`);
     expect((await discoverCredentialForm(service)).vaultEligible).toBe(false);
     await page.setContent('<input autocomplete="one-time-code" required>');

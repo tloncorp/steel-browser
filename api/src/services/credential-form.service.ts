@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+import {
+  recordBrowserForm,
+  recordBrowserFill,
+  recordBrowserFillFailure,
+} from "./browser-monitor.service.js";
 import type { CDPSession, ElementHandle, Frame, JSHandle, Page } from "puppeteer-core";
 import type { CDPService } from "./cdp/cdp.service.js";
 import { secureFieldDefinitions, type SecureFormField } from "./secure-form-fields.js";
@@ -835,7 +840,12 @@ export async function fillCredentialForm(
     throw new CredentialFormError("A secure form is already being filled.", 409);
   filling.add(cdpService);
   try {
-    return await fillBoundForm(cdpService, target, request);
+    const result = await fillBoundForm(cdpService, target, request);
+    recordBrowserFill(cdpService, target.formId, result.submitted);
+    return result;
+  } catch (error) {
+    recordBrowserFillFailure(cdpService);
+    throw error;
   } finally {
     filling.delete(cdpService);
   }
@@ -848,7 +858,9 @@ export async function discoverCredentialForm(
     throw new CredentialFormError("A secure form operation is already in progress.", 409);
   filling.add(cdpService);
   try {
-    return await discoverBoundForm(cdpService);
+    const result = await discoverBoundForm(cdpService);
+    recordBrowserForm(cdpService, result.formId);
+    return result;
   } finally {
     filling.delete(cdpService);
   }
