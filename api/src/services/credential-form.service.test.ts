@@ -57,10 +57,17 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
   }
 
   it("keeps monitoring fill evidence after the page navigates and the app stops polling", async () => {
-    await load('<form action="/done"><input name="username" autocomplete="username"><input type="password" autocomplete="current-password"><button type="submit">Sign in</button></form>');
+    await load(
+      '<form action="/done"><input name="username" autocomplete="username"><input type="password" autocomplete="current-password"><button type="submit">Sign in</button></form>',
+    );
     const baseline = browserMonitorStatus(service);
     const form = await discoverCredentialForm(service);
-    const values = Object.fromEntries(form.fields.map(field => [field.id, field.purpose === "current-password" ? "private-password" : "private-user"]));
+    const values = Object.fromEntries(
+      form.fields.map((field) => [
+        field.id,
+        field.purpose === "current-password" ? "private-password" : "private-user",
+      ]),
+    );
     await fillCredentialForm(service, form, { values, submit: true });
     await page.waitForFunction(() => location.pathname === "/done");
     expect(await getCredentialContinuation(service)).toBeNull();
@@ -83,6 +90,18 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       submit,
     });
   }
+
+  it("observes a submitted login form that remains visible", async () => {
+    await load(`<form onsubmit="event.preventDefault()">${fields}<button>Sign in</button></form>`);
+    expect((await fill()).submitted).toBe(true);
+    const filled = browserMonitorStatus(service);
+    const redisplayed = await discoverCredentialForm(service);
+    const observed = browserMonitorStatus(service);
+    expect(redisplayed.formId).toBe(filled.fill!.formId);
+    expect(observed.form!.revision).toBeGreaterThan(filled.fill!.revision);
+    expect(observed.fill).toEqual(filled.fill);
+    expect(JSON.stringify(observed)).not.toMatch(/private-password|test-user/);
+  });
 
   it("activates click-only handlers with trusted browser input", async () => {
     await load(`<form onsubmit="event.preventDefault()">${fields}<button type="button"
