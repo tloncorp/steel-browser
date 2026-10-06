@@ -37,4 +37,32 @@ describe("browser monitoring receipts", () => {
     expect(browserMonitorStatus(b).fill).toBeUndefined();
     expect(Object.keys(browserMonitorStatus(a).failure!)).toEqual(["revision", "at"]);
   });
+  it.each([true, false])(
+    "records the same form when it is observed after a fill (submitted=%s)",
+    (submitted) => {
+      const browser = {};
+      recordBrowserForm(browser, "login");
+      recordBrowserFill(browser, "login", submitted);
+      const filled = browserMonitorStatus(browser);
+
+      recordBrowserForm(browser, "login");
+      const redisplayed = browserMonitorStatus(browser);
+      expect(redisplayed).toMatchObject({
+        epoch: filled.epoch,
+        revision: 3,
+        fill: filled.fill,
+        form: { formId: "login", revision: 3 },
+      });
+      recordBrowserForm(browser, "login");
+      expect(browserMonitorStatus(browser)).toEqual(redisplayed);
+
+      recordBrowserFill(browser, "login", submitted);
+      recordBrowserForm(browser, "login");
+      expect(browserMonitorStatus(browser)).toMatchObject({
+        revision: 5,
+        fill: { formId: "login", revision: 4, submitted },
+        form: { formId: "login", revision: 5 },
+      });
+    },
+  );
 });

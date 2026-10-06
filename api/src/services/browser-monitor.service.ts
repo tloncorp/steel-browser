@@ -25,7 +25,7 @@ export function browserMonitorStatus(browser: object): BrowserMonitorStatus {
 }
 export function recordBrowserForm(browser: object, formId: string) {
   const value = state(browser);
-  if (value.form?.formId === formId) return;
+  if (value.form?.formId === formId && value.form.revision > (value.fill?.revision ?? 0)) return;
   value.form = { revision: ++value.revision, at: Date.now(), formId };
 }
 export function recordBrowserFill(browser: object, formId: string, submitted: boolean) {

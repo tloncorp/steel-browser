@@ -217,6 +217,18 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     );
   });
 
+  it("observes a submitted login form that remains visible", async () => {
+    await load(`<form onsubmit="event.preventDefault()">${fields}<button>Sign in</button></form>`);
+    expect((await fill()).submitted).toBe(true);
+    const filled = browserMonitorStatus(service);
+    const redisplayed = await discoverCredentialForm(service);
+    const observed = browserMonitorStatus(service);
+    expect(redisplayed.formId).toBe(filled.fill!.formId);
+    expect(observed.form!.revision).toBeGreaterThan(filled.fill!.revision);
+    expect(observed.fill).toEqual(filled.fill);
+    expect(JSON.stringify(observed)).not.toMatch(/private-password|test-user/);
+  });
+
   it("activates click-only handlers with trusted browser input", async () => {
     await load(`<form onsubmit="event.preventDefault()">${fields}<button type="button"
       onclick="document.body.dataset.trusted = event.isTrusted; location.href='/done'">Sign in</button></form>`);
