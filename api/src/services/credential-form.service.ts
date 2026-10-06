@@ -483,6 +483,10 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
     );
     matches.push({ kind: login && !unsupportedRequired ? "login" : "details", fields, controls });
   }
+  // A page can offer both sign-in and account creation. A single login is
+  // unambiguous even when separate forms collect other account details.
+  const logins = matches.filter((form) => form.kind === "login");
+  if (logins.length === 1) return logins[0];
   return matches.length === 1 ? matches[0] : null;
 }
 
