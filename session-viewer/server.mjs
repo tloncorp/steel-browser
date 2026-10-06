@@ -364,7 +364,7 @@ function writeUpgradeError(socket, status, message) {
   );
 }
 
-function proxyUpgrade(request, socket, head, target, forwardedPath) {
+function proxyUpgrade(request, socket, head, target, forwardedPath, expiresAt) {
   const upstream = net.connect(Number(target.port), target.hostname);
   upstream.once("connect", () => {
     const lines = [
@@ -374,6 +374,7 @@ function proxyUpgrade(request, socket, head, target, forwardedPath) {
       const lower = name.toLowerCase();
       if (
         lower === "host" ||
+        lower === "x-viewer-expires-at" ||
         lower === "cookie" ||
         lower.startsWith("x-forwarded-")
       )
@@ -384,7 +385,13 @@ function proxyUpgrade(request, socket, head, target, forwardedPath) {
         lines.push(`${name}: ${value}`);
       }
     }
-    lines.push(`host: ${target.host}`, "x-forwarded-proto: https", "", "");
+    lines.push(
+      `host: ${target.host}`,
+      "x-forwarded-proto: https",
+      `x-viewer-expires-at: ${expiresAt}`,
+      "",
+      "",
+    );
     upstream.write(lines.join("\r\n"));
     if (head.length) upstream.write(head);
     socket.pipe(upstream).pipe(socket);
@@ -557,11 +564,12 @@ export function createGateway(config) {
       }
 
       if (
+        handoff.expiresAt <= Date.now() ||
         handoff.status !== "ready" ||
         credentialHandoffs.get(credentialFill[1]) !== handoff
       ) {
         return sendCredentialJson(response, 401, {
-          error: "Secure form is already used or replaced.",
+          error: "Secure form is expired, already used, or replaced.",
         });
       }
       handoff.status = "submitting";
@@ -685,7 +693,14 @@ export function createGateway(config) {
     } else {
       return writeUpgradeError(socket, 404, "Not Found");
     }
-    proxyUpgrade(request, socket, head, upstreamOrigin, forwardedPath);
+    proxyUpgrade(
+      request,
+      socket,
+      head,
+      upstreamOrigin,
+      forwardedPath,
+      capability.expiresAt,
+    );
   });
 
   return { internal, publicServer };

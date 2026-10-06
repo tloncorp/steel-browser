@@ -339,7 +339,7 @@ async function secureGateway(
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     });
-  return { metadata, posted, discover, fill, internal };
+  return { metadata, posted, discover, fill, internal, base, publicServer };
 }
 
 test("secure handoffs expose metadata and a one-use endpoint, never values or selectors", async (context) => {
@@ -493,3 +493,40 @@ for (const fields of [
     assert.equal((await gateway.discover()).status, 502);
   });
 }
+
+test("a fill admitted before its deadline cannot dispatch after a delayed body expires", async (context) => {
+  const gateway = await secureGateway(context, [secureField("username")]);
+  const handoff = await (await gateway.discover()).json();
+  let admitted;
+  const firstChunk = new Promise((resolve) => {
+    admitted = resolve;
+  });
+  gateway.publicServer.once("request", (request) =>
+    request.once("data", admitted),
+  );
+  const input = JSON.stringify({ values: { f0: "example" } });
+  let request;
+  const result = new Promise((resolve, reject) => {
+    request = http.request(
+      `${gateway.base}/credential-fills/${handoff.handoffId}`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(input),
+        },
+      },
+      (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode));
+      },
+    );
+    request.on("error", reject);
+    request.write(input.slice(0, 10));
+  });
+  await firstChunk;
+  context.mock.method(Date, "now", () => handoff.expiresAt + 1);
+  request.end(input.slice(10));
+  assert.equal(await result, 401);
+  assert.deepEqual(gateway.posted, []);
+});

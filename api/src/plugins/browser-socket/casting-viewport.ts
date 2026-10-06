@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ViewerInputError } from "./casting-input.js";
 
 const viewportRequest = z.object({
   type: z.literal("viewport"),
@@ -21,6 +22,7 @@ const bound = (value: number, min: number, max: number) => Math.max(min, Math.mi
 /** A page has one resizing/input owner; other viewers share its rendered viewport. */
 export class PageViewport {
   private owner?: symbol;
+  private generation = 0;
   private clients = new Map<symbol, Notify>();
   private pending = Promise.resolve();
   private hasApplied = false;
@@ -31,13 +33,59 @@ export class PageViewport {
     this.current = { mode: "auto", ...initial };
   }
 
-  attach(notify: Notify) {
+  attach(notify: Notify, reset: () => Promise<void> = async () => {}) {
     const token = Symbol();
     this.clients.set(token, notify);
+    let releasing = false;
     const publish = () => this.publish();
+    const canControl = () =>
+      this.clients.has(token) && this.owner === token && !this.applying && !releasing;
+    const snapshot = () => ({
+      generation: this.generation,
+      controlling: canControl(),
+      available: !this.owner,
+    });
+    const serial = <T>(operation: () => Promise<T>) => {
+      const result = this.pending.then(operation);
+      this.pending = result.then(
+        () => {},
+        () => {},
+      );
+      return result;
+    };
+    const release = () => {
+      releasing = true;
+      if (this.owner === token) this.generation++;
+      return serial(async () => {
+        if (this.owner === token) {
+          await reset();
+          this.owner = undefined;
+        }
+        releasing = false;
+        this.publish();
+      });
+    };
     return {
+      snapshot,
+      acquire: () =>
+        serial(async () => {
+          if (!this.clients.has(token)) throw new ViewerInputError("control_lost");
+          if (this.owner && this.owner !== token)
+            throw new ViewerInputError("another_viewer_controlling");
+          if (!this.owner) {
+            this.owner = token;
+            this.generation++;
+            this.hasApplied = false;
+          }
+          this.publish();
+          return snapshot();
+        }),
+      assertControl: (generation: number) => {
+        if (!canControl() || generation !== this.generation)
+          throw new ViewerInputError("control_lost");
+      },
       ready: publish,
-      canControl: () => this.owner === token && !this.applying,
+      canControl,
       resize: (
         message: unknown,
         apply: (viewport: CastingViewport, reload: boolean) => Promise<void>,
@@ -55,6 +103,7 @@ export class PageViewport {
             return;
           }
           const takingControl = this.owner !== token;
+          if (takingControl) this.generation++;
           this.owner = token;
           const request = parsed.data;
           let width = bound(request.width, 240, 2560);
@@ -105,10 +154,10 @@ export class PageViewport {
         });
         return this.pending;
       },
+      release,
       close: () => {
         this.clients.delete(token);
-        if (this.owner === token) this.owner = undefined;
-        this.publish();
+        return release();
       },
     };
   }

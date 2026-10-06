@@ -47,7 +47,7 @@ describe("casting viewport", () => {
   it("reasserts the viewport when a same-sized viewer takes control", async () => {
     const { viewport, client, apply } = setup();
     await client.resize(request(), apply);
-    client.close();
+    await client.close();
     await viewport.attach(vi.fn()).resize(request(), apply);
     expect(apply).toHaveBeenCalledTimes(2);
   });
@@ -55,7 +55,7 @@ describe("casting viewport", () => {
   it("remembers mobile mode between viewer connections", async () => {
     const { viewport, client, apply } = setup();
     await client.resize(request({ mode: "mobile", reload: true }), apply);
-    client.close();
+    await client.close();
     const notify = vi.fn();
     viewport.attach(notify).ready();
     expect(notify).toHaveBeenLastCalledWith(
@@ -120,7 +120,7 @@ describe("casting viewport", () => {
     await other.resize(request({ width: 1200 }), apply);
     expect(apply).toHaveBeenCalledTimes(1);
     expect(other.canControl()).toBe(false);
-    client.close();
+    await client.close();
     expect(notifyOther).toHaveBeenLastCalledWith(expect.objectContaining({ available: true }));
     await other.resize(request({ width: 1200 }), apply);
     expect(other.canControl()).toBe(true);
@@ -140,12 +140,12 @@ describe("casting viewport", () => {
     await Promise.resolve();
     expect(client.canControl()).toBe(false);
     const stale = client.resize(request({ width: 500 }), applying);
-    client.close();
+    const closing = client.close();
     const nextApply = vi.fn(async () => {});
     const next = viewport.attach(vi.fn()).resize(request({ width: 800 }), nextApply);
     expect(nextApply).not.toHaveBeenCalled();
     finish();
-    await Promise.all([first, stale, next]);
+    await Promise.all([first, stale, closing, next]);
     expect(applying).toHaveBeenCalledTimes(1);
     expect(nextApply).toHaveBeenCalledTimes(1);
   });
@@ -161,5 +161,31 @@ describe("casting viewport", () => {
     });
     await client.resize(request(), apply);
     expect(apply).toHaveBeenCalledTimes(1);
+  });
+  it("revokes stale input immediately and finishes cancellation before another viewer takes control", async () => {
+    const viewport = new PageViewport({ width: 1920, height: 1080, mobile: false });
+    let finish!: () => void;
+    const reset = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const first = viewport.attach(vi.fn(), reset);
+    const second = viewport.attach(vi.fn());
+    const before = await first.acquire();
+    first.assertControl(before.generation);
+    const closing = first.close();
+    expect(() => first.assertControl(before.generation)).toThrow("control_lost");
+    const acquiring = second.acquire();
+    await Promise.resolve();
+    expect(reset).toHaveBeenCalledTimes(1);
+    expect(second.canControl()).toBe(false);
+    finish();
+    await closing;
+    const after = await acquiring;
+    expect(after.generation).toBeGreaterThan(before.generation);
+    expect(second.canControl()).toBe(true);
+    expect(() => second.assertControl(before.generation)).toThrow("control_lost");
   });
 });

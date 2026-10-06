@@ -53,3 +53,35 @@ for multi-session CDP runtimes are session-scoped and follow profile cleanup.
 The Steel MCP session API and CDP URL shape are unchanged. The self-hosted Steel MCP server has its
 own concurrency limit, so it must be configured or patched separately before one MCP process can
 use this browser's full concurrency.
+
+## Streamed viewer input
+
+The session viewer supports one touch contact, mouse drag, wheel scrolling, physical keys, and
+text composition. On a phone, **Touch** sends the gesture to the page, **Drag** sends held mouse
+input, and **Scroll** turns finger movement into wheel input. To enter text, tap the browser field,
+then tap **Keyboard**. The keyboard bridge handles composition, deletion, paste, and Enter.
+
+Each page accepts input from one viewer connection. Input carries the page ID, a control generation,
+a viewport generation, and an increasing sequence number. The viewer enables input after it paints
+and acknowledges a frame with the current dimensions. Rotation, pointer cancellation, backgrounding,
+disconnection, and link expiry cancel held contacts, mouse buttons, keys, and unfinished composition.
+A reconnect obtains fresh control and frame state without replaying input. Viewer arbitration is
+page-scoped; agent and direct CDP access operate independently.
+
+The public gateway supplies the verified capability deadline to the casting service. An open viewer
+connection closes at that deadline or the session deadline, whichever comes first. Secure form fills
+also recheck their deadline after reading the request body and before dispatching to the browser.
+Deploy the API and viewer template together: the input protocol requires matching versions.
+
+Run the input, viewport, and public-gateway browser checks with a local Chrome:
+
+```sh
+CHROME_EXECUTABLE_PATH=/usr/bin/google-chrome npm exec -w api -- vitest run src/plugins/browser-socket/casting-input.test.ts src/plugins/browser-socket/casting-viewport.test.ts src/plugins/browser-socket/casting-viewer.browser.test.ts
+node --test session-viewer/server.test.mjs
+```
+
+For phone acceptance, open a viewer link in Chrome on an iPhone and verify native scrolling,
+horizontal dragging, a timed hold, text entry with the software keyboard, composition, deletion,
+paste, rotation during a gesture, and return from backgrounding. Verify input against the same
+browser page after reconnecting. The Chrome tests use harmless page and cross-origin iframe
+fixtures; a live challenge requires separate manual verification.
