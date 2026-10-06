@@ -301,9 +301,12 @@ export const handleGetBrowserMonitorStatus = async (
     return reply.code(404).send({ error: "Not found." });
   }
   const session = server.sessionService.getSession(request.params.sessionId);
-  if (!session || session.status !== "live") return reply.code(404).send({ error: "Session not found." });
+  if (!session || session.status !== "live")
+    return reply.code(404).send({ error: "Session not found." });
   reply.header("Cache-Control", "no-store");
-  return reply.send(browserMonitorStatus(server.sessionService.getCDPService(request.params.sessionId)));
+  return reply.send(
+    browserMonitorStatus(server.sessionService.getCDPService(request.params.sessionId)),
+  );
 };
 
 export const handleGetCredentialContinuation = async (
@@ -339,6 +342,7 @@ export const handleFillCredentialForm = async (
       };
       values: Record<string, string>;
       submit?: boolean;
+      vault?: boolean;
     };
   }>,
   reply: FastifyReply,
@@ -357,6 +361,7 @@ export const handleFillCredentialForm = async (
       {
         values: request.body.values,
         submit: request.body.submit,
+        vault: request.body.vault,
       },
     );
     return reply.send({ ok: true, ...result });

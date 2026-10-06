@@ -172,7 +172,7 @@ spec:
             - name: MAX_RETAINED_SESSIONS
               value: "20"
             - name: SESSION_TTL_MS
-              value: "7200000"
+              value: "3600000"
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /var/run/secrets/wid/credential-configuration.json
           resources:
@@ -236,6 +236,35 @@ spec:
             # Steel MCP. It is never forwarded to the local browser API.
             - name: STEEL_ALLOWED_HOSTS
               value: steel-mcp,steel-mcp.tlon.svc.cluster.local
+            # Enable after Pioneer and the durable vault secrets are provisioned.
+            - name: BROWSER_VAULT_ENABLED
+              value: "false"
+            - name: BROWSER_VAULT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: browser-vault-secrets
+                  key: encryption-key
+                  optional: true
+            - name: BROWSER_VAULT_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: browser-vault-secrets
+                  key: key-id
+                  optional: true
+            - name: BROWSER_VAULT_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: browser-vault-secrets
+                  key: service-token
+                  optional: true
+            - name: BROWSER_VAULT_PIONEER_ORIGIN
+              value: https://{planet}-feds.internal.test.tlon.systems
+            - name: PIONEER_SIDECAR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: voyager-env-secrets
+                  key: PIONEER_SIDECAR_TOKEN
+                  optional: true
             - name: STEEL_LOCAL
               value: "true"
             - name: STEEL_BASE_URL
@@ -247,9 +276,9 @@ spec:
             - name: STEEL_MAX_SESSIONS
               value: "20"
             - name: STEEL_SESSION_TIMEOUT_MS
-              value: "7200000"
+              value: "3600000"
             - name: STEEL_INACTIVITY_TIMEOUT_MS
-              value: "1800000"
+              value: "3600000"
             # Short-lived capability URLs let another bot tool fetch screenshot
             # or PDF bytes without exposing MCP or any tenant credential.
             - name: BROWSER_ARTIFACT_PUBLIC_ORIGIN
@@ -319,6 +348,16 @@ spec:
               containerPort: 3001
               protocol: TCP
           env:
+            - name: BROWSER_VAULT_ENABLED
+              value: "false"
+            - name: BROWSER_VAULT_MCP_ORIGIN
+              value: http://127.0.0.1:8000
+            - name: BROWSER_VAULT_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: browser-vault-secrets
+                  key: service-token
+                  optional: true
             - name: SESSION_VIEWER_PUBLIC_ORIGIN
               value: https://browser-session-ovh-test-1.test.tlon.systems
             - name: SESSION_VIEWER_UPSTREAM_ORIGIN
@@ -332,7 +371,7 @@ spec:
             - name: SESSION_VIEWER_PUBLIC_PORT
               value: "8080"
             - name: SESSION_VIEWER_MAX_TTL_MS
-              value: "7200000"
+              value: "3600000"
             - name: SESSION_VIEWER_SIGNING_KEY
               valueFrom:
                 secretKeyRef:

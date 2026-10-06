@@ -326,7 +326,7 @@ async function readCredentialBody(request) {
   let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > 16 * 1024) throw new Error("too_large");
+    if (size > 64 * 1024) throw new Error("too_large");
     chunks.push(chunk);
   }
   try {
@@ -397,6 +397,22 @@ export function createGateway(config) {
   const upstreamOrigin = new URL(config.upstreamOrigin);
   const publicOrigin = new URL(config.publicOrigin);
   const credentialHandoffs = new Map();
+  const vaultRequest = async (operation, body) => {
+    if (!config.vault) throw new Error("Vault unavailable.");
+    return upstreamJson(
+      new URL(`/internal/vault/${operation}`, config.vault.origin),
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-browser-vault-service": config.vault.token,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(20_000),
+        redirect: "error",
+      },
+    );
+  };
 
   const removeExpiredHandoffs = (now = Date.now()) => {
     for (const [id, handoff] of credentialHandoffs) {
@@ -426,13 +442,15 @@ export function createGateway(config) {
     if (
       request.method === "OPTIONS" &&
       (url.pathname.startsWith("/credentials/") ||
-        url.pathname.startsWith("/credential-fills/"))
+        url.pathname.startsWith("/credential-fills/") ||
+        url.pathname.startsWith("/credential-vault/") ||
+        url.pathname.startsWith("/vault/"))
     ) {
       response.writeHead(
         204,
         credentialApiHeaders({
           "access-control-allow-headers": "content-type",
-          "access-control-allow-methods": "GET, POST, OPTIONS",
+          "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
           "access-control-max-age": "600",
         }),
       );
@@ -440,7 +458,74 @@ export function createGateway(config) {
       return;
     }
 
+    const ownerOperation = /^\/vault\/(list|delete)$/.exec(url.pathname);
+    const vaultHandoff = /^\/credential-vault\/([A-Za-z0-9_-]{40,64})$/.exec(
+      url.pathname,
+    );
+    if (request.method === "POST" && (ownerOperation || vaultHandoff)) {
+      removeExpiredHandoffs();
+      const handoff = vaultHandoff && credentialHandoffs.get(vaultHandoff[1]);
+      if (
+        !config.vault ||
+        (vaultHandoff && (!handoff?.vault || handoff.status !== "ready"))
+      )
+        return sendCredentialJson(response, 404, {
+          error: "Saved logins are unavailable.",
+        });
+      try {
+        const body = await readCredentialBody(request);
+        const result = await vaultRequest(
+          ownerOperation?.[1] ?? "authorize",
+          vaultHandoff
+            ? {
+                planet: body.planet,
+                ownerToken: body.ownerToken,
+                handoffId: vaultHandoff[1],
+              }
+            : body,
+        );
+        return sendCredentialJson(
+          response,
+          result.response.status,
+          result.response.ok
+            ? result.body
+            : {
+                error:
+                  "Saved logins could not be accessed. Reconnect and try again.",
+              },
+        );
+      } catch {
+        return sendCredentialJson(response, 503, {
+          error: "Saved logins are unavailable.",
+        });
+      }
+    }
+
     const credentialEntry = /^\/credentials\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "DELETE" && credentialEntry) {
+      const capability = verifyCapability(credentialEntry[1], config.secret);
+      if (!capability)
+        return sendCredentialJson(response, 401, {
+          error: "Credential handoff is invalid or expired.",
+        });
+      for (const [id, handoff] of credentialHandoffs) {
+        if (handoff.sessionId === capability.sessionId)
+          credentialHandoffs.delete(id);
+      }
+      if (config.vault) {
+        try {
+          const result = await vaultRequest("cancel", {
+            sessionId: capability.sessionId,
+          });
+          if (!result.response.ok) throw new Error();
+        } catch {
+          return sendCredentialJson(response, 503, {
+            error: "The secure form could not be closed.",
+          });
+        }
+      }
+      return sendCredentialJson(response, 200, { ok: true });
+    }
     if (request.method === "GET" && credentialEntry) {
       const capability = verifyCapability(credentialEntry[1], config.secret);
       if (!capability)
@@ -500,13 +585,28 @@ export function createGateway(config) {
           capability.expiresAt,
           Date.now() + 5 * 60_000,
         );
-        credentialHandoffs.set(handoffId, {
+        const handoff = {
           sessionId: capability.sessionId,
           target: { formId, pageId, frameUrl, origin, kind },
           fields,
           expiresAt,
           status: "ready",
-        });
+        };
+        credentialHandoffs.set(handoffId, handoff);
+        if (config.vault && discovered.body.vaultEligible === true) {
+          try {
+            const prepared = await vaultRequest("prepare", {
+              sessionId: capability.sessionId,
+              handoffId,
+              target: handoff.target,
+              expiresAt,
+            });
+            if (prepared.response.ok && prepared.body?.available === true)
+              handoff.vault = prepared.body;
+          } catch {
+            /* Manual entry remains available when the vault is unreachable. */
+          }
+        }
         return sendCredentialJson(response, 200, {
           handoffId,
           origin,
@@ -514,6 +614,7 @@ export function createGateway(config) {
           formId,
           fields,
           expiresAt,
+          ...(handoff.vault ? { vault: handoff.vault } : {}),
         });
       } catch {
         return sendCredentialJson(response, 502, {
@@ -548,8 +649,13 @@ export function createGateway(config) {
       }
       if (
         (body.submit !== undefined && typeof body.submit !== "boolean") ||
-        Object.keys(body).some((key) => key !== "values" && key !== "submit") ||
-        !validValues(handoff.fields, body.values)
+        Object.keys(body).some(
+          (key) => !["values", "submit", "grant", "save", "use"].includes(key),
+        ) ||
+        (body.use
+          ? body.values !== undefined
+          : !validValues(handoff.fields, body.values)) ||
+        ((body.save || body.use || body.grant) && !handoff.vault)
       ) {
         return sendCredentialJson(response, 400, {
           error: "Secure form submission is invalid.",
@@ -565,7 +671,29 @@ export function createGateway(config) {
         });
       }
       handoff.status = "submitting";
+      credentialHandoffs.delete(credentialFill[1]);
       try {
+        if (body.save || body.use || body.grant) {
+          const filled = await vaultRequest("fill", {
+            ...body,
+            handoffId: credentialFill[1],
+            submit: body.submit === true,
+          });
+          return sendCredentialJson(
+            response,
+            filled.response.status,
+            filled.response.ok
+              ? filled.body
+              : {
+                  error:
+                    "The form could not be filled. Reconnect before trying again.",
+                },
+          );
+        }
+        if (handoff.vault)
+          await vaultRequest("discard", { handoffId: credentialFill[1] }).catch(
+            () => {},
+          );
         const target = new URL(
           `/v1/sessions/${encodeURIComponent(
             handoff.sessionId,
@@ -706,6 +834,26 @@ function port(name, fallback) {
 }
 
 export function loadConfig() {
+  let vault;
+  if (process.env.BROWSER_VAULT_ENABLED === "true") {
+    const token = required("BROWSER_VAULT_SERVICE_TOKEN");
+    const origin = new URL(
+      process.env.BROWSER_VAULT_MCP_ORIGIN ?? "http://127.0.0.1:8000",
+    );
+    if (
+      Buffer.byteLength(token) < 32 ||
+      origin.protocol !== "http:" ||
+      origin.pathname !== "/" ||
+      origin.search ||
+      origin.hash ||
+      origin.username ||
+      origin.password
+    )
+      throw new Error(
+        "The vault requires a private HTTP origin and a service token of at least 32 bytes.",
+      );
+    vault = { token, origin: origin.toString() };
+  }
   const secret = required("SESSION_VIEWER_SIGNING_KEY");
   if (Buffer.byteLength(secret) < 32)
     throw new Error(
@@ -754,6 +902,7 @@ export function loadConfig() {
     );
   }
   return {
+    vault,
     secret,
     publicOrigin: publicOrigin.toString(),
     upstreamOrigin: upstreamOrigin.toString(),
