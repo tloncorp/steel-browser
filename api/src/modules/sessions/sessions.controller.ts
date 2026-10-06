@@ -1,4 +1,5 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { browserMonitorStatus } from "../../services/browser-monitor.service.js";
 import { CookieData } from "../../services/context/types.js";
 import { getErrors } from "../../utils/errors.js";
 import { getBaseUrl, getUrl } from "../../utils/url.js";
@@ -289,6 +290,20 @@ export const handleDiscoverCredentialForm = async (
       error instanceof CredentialFormError ? error.message : "Credential form discovery failed.";
     return reply.code(status).send({ error: message });
   }
+};
+
+export const handleGetBrowserMonitorStatus = async (
+  server: FastifyInstance,
+  request: FastifyRequest<{ Params: { sessionId: string } }>,
+  reply: FastifyReply,
+) => {
+  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.ip)) {
+    return reply.code(404).send({ error: "Not found." });
+  }
+  const session = server.sessionService.getSession(request.params.sessionId);
+  if (!session || session.status !== "live") return reply.code(404).send({ error: "Session not found." });
+  reply.header("Cache-Control", "no-store");
+  return reply.send(browserMonitorStatus(server.sessionService.getCDPService(request.params.sessionId)));
 };
 
 export const handleGetCredentialContinuation = async (

@@ -10,6 +10,7 @@ import {
   handleDiscoverCredentialForm,
   handleFillCredentialForm,
   handleGetCredentialContinuation,
+  handleGetBrowserMonitorStatus,
 } from "./sessions.controller.js";
 import { handleScrape, handleScreenshot, handlePDF } from "../actions/actions.controller.js";
 import { $ref } from "../../plugins/schemas.js";
@@ -129,6 +130,13 @@ async function routes(server: FastifyInstance) {
     },
     async (request: FastifyRequest<{ Params: { sessionId: string } }>, reply: FastifyReply) =>
       handleDiscoverCredentialForm(server, request, reply),
+  );
+
+  server.get(
+    "/sessions/:sessionId/monitor-status",
+    {},
+    async (request: FastifyRequest<{ Params: { sessionId: string } }>, reply: FastifyReply) =>
+      handleGetBrowserMonitorStatus(server, request, reply),
   );
 
   server.get(
