@@ -1,0 +1,134 @@
+// Explicit, versioned interface for the Tlon native viewer. Only status leaves
+// this page; keystrokes and pasted text go straight to the session socket.
+const mobileInput = (() => {
+    if (!interactive || !window.ReactNativeWebView?.postMessage) return null;
+    // Native supplies floating controls; give the remote page the full viewport.
+    const chrome = document.createElement('style');
+    chrome.textContent = 'header { display: none !important; }';
+    document.head.appendChild(chrome);
+    // Zoom the canvas, never the surrounding document or hidden keyboard input.
+    document.querySelector('meta[name="viewport"]').content =
+        'width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover';
+    const input = document.createElement('textarea');
+    input.id = 'mobile-session-keyboard';
+    input.setAttribute('aria-label', 'Type into the remote browser');
+    input.setAttribute('autocapitalize', 'off');
+    input.setAttribute('autocorrect', 'off');
+    input.setAttribute('autocomplete', 'off');
+    input.spellcheck = false;
+    // Keep a focusable input in the viewport without covering the remote page.
+    // A sentinel lets the soft keyboard deliver Backspace even after each flush.
+    input.style.cssText = 'position:fixed;top:1px;left:1px;width:1px;height:1px;opacity:0.01;font-size:16px;padding:0;border:0;pointer-events:none;';
+    document.body.appendChild(input);
+    const sentinel = '\u200b';
+    let composing = false;
+    let discardNextInput = false;
+    let context = 0;
+    let targetId, targetConnection, availableBefore, targetGeneration, targetViewport;
+    let requestedReload = null;
+    let previousStatus;
+
+    function reset() {
+        input.value = sentinel;
+        input.setSelectionRange(1, 1);
+    }
+    function available() { return ready && controlling && socket?.readyState === WebSocket.OPEN; }
+    function update(force = false) {
+        const isReady = available();
+        if (targetId !== pageId || targetConnection !== connection || targetGeneration !== generation) requestedReload = null;
+        if (targetId !== pageId || targetConnection !== connection || availableBefore !== isReady || targetGeneration !== generation || targetViewport !== viewportGeneration) {
+            targetId = pageId; targetConnection = connection; availableBefore = isReady;
+            targetGeneration = generation; targetViewport = viewportGeneration;
+            context++;
+            composing = false;
+            reset();
+            input.blur();
+        }
+        const status = JSON.stringify({type: 'tlon.browser.input', version: 1,
+            ready: isReady, keyboardOpen: document.activeElement === input, context,
+            mode: mode === "mobile" ? "mobile" : "agent", reloadRequired: requestedReload});
+        if (force || status !== previousStatus) {
+            previousStatus = status;
+            window.ReactNativeWebView.postMessage(status);
+        }
+    }
+    function send(message) { if (available()) action(message); }
+    function key(key, code, keyCode) {
+        send({type: 'keyEvent', event: {type: 'keyDown', key, code, keyCode,
+            modifiers: 0}});
+        send({type: 'keyEvent', event: {type: 'keyUp', key, code, keyCode, modifiers: 0}});
+    }
+    function flush() {
+        const text = input.value.startsWith(sentinel) ? input.value.slice(1) : input.value;
+        if (text) send({type: 'insertText', text});
+        reset();
+    }
+    function finishComposition() {
+        if (!composing) return;
+        // Let the IME commit to the old remote field before a tap or paste.
+        // Re-focus immediately so changing remote fields keeps the keyboard up.
+        input.blur();
+        input.focus({preventScroll: true});
+    }
+    input.addEventListener('compositionstart', () => { composing = true; });
+    input.addEventListener('compositionend', () => { composing = false; flush(); });
+    input.addEventListener('input', (event) => {
+        if (discardNextInput) { discardNextInput = false; reset(); return; }
+        if (!composing && !event.isComposing) flush();
+    });
+    input.addEventListener('beforeinput', (event) => {
+        if (composing || event.isComposing) return;
+        const keys = {deleteContentBackward: ['Backspace', 'Backspace', 8],
+            deleteContentForward: ['Delete', 'Delete', 46],
+            insertLineBreak: ['Enter', 'Enter', 13], insertParagraph: ['Enter', 'Enter', 13]};
+        const value = keys[event.inputType];
+        if (value) {
+            // Some soft keyboards emit non-cancelable edits. Do not forward
+            // their local newline again after dispatching the remote key.
+            discardNextInput = !event.cancelable;
+            event.preventDefault();
+            key(...value);
+            reset();
+        }
+    });
+    input.addEventListener('keydown', (event) => {
+        if (composing || event.isComposing) return;
+        if (['Enter', 'Tab', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Escape'].includes(event.key)) {
+            event.preventDefault();
+            key(event.key, event.code, event.keyCode);
+        }
+    });
+    input.addEventListener('focus', () => update());
+    input.addEventListener('blur', () => { composing = false; reset(); update(); });
+    window.addEventListener('pagehide', () => { input.blur(); reset(); });
+    window.tlonBrowserInput = Object.freeze({
+        receive(command) {
+            if (command?.version !== 1) return;
+            update();
+            if (command.type === 'status') { update(true); return; }
+            if (command.type === 'keyboard' && command.open === false) { input.blur(); return; }
+            if (command.type === 'layout' && controlling && command.context === context && ['agent', 'mobile'].includes(command.mode)) {
+                requestedReload = null;
+                requestViewport(command.mode, command.reload === true);
+                update(true);
+                return;
+            }
+            if (!available() || command.context !== context) return;
+            if (command.type === 'keyboard' && command.open === true) {
+                reset();
+                input.focus({preventScroll: true});
+            } else if (command.type === 'paste' && typeof command.text === 'string' && command.text.length <= 65536) {
+                // Finish any pending composition before inserting the clipboard.
+                finishComposition();
+                if (command.text) send({type: 'insertText', text: command.text});
+            }
+        }
+    });
+    reset();
+    update();
+    return {update, finishComposition,
+        keyboardOpen: () => document.activeElement === input,
+        invalidate() { context++; composing = false; reset(); input.blur(); update(); },
+        reloadRequired(mode) { requestedReload = mode; update(true); }
+    };
+})();

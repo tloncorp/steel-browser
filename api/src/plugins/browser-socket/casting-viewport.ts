@@ -3,14 +3,14 @@ import { ViewerInputError } from "./casting-input.js";
 
 const viewportRequest = z.object({
   type: z.literal("viewport"),
-  mode: z.enum(["auto", "mobile", "desktop"]),
+  mode: z.enum(["agent", "auto", "mobile", "desktop"]),
   width: z.number().int().min(1).max(10_000),
   height: z.number().int().min(1).max(10_000),
   reload: z.boolean().optional().default(false),
 });
 
 export type CastingViewport = {
-  mode: "auto" | "mobile" | "desktop";
+  mode: "agent" | "auto" | "mobile" | "desktop";
   width: number;
   height: number;
   mobile: boolean;
@@ -28,9 +28,15 @@ export class PageViewport {
   private hasApplied = false;
   private applying = false;
   private current: CastingViewport;
+  private agent: { width: number; height: number; mobile: boolean };
+
+  get mode() {
+    return this.current.mode;
+  }
 
   constructor(private readonly initial: { width: number; height: number; mobile: boolean }) {
-    this.current = { mode: "auto", ...initial };
+    this.current = { mode: "agent", ...initial };
+    this.agent = { ...initial };
   }
 
   attach(notify: Notify, reset: () => Promise<void> = async () => {}) {
@@ -67,6 +73,7 @@ export class PageViewport {
     };
     return {
       snapshot,
+      mode: () => this.current.mode,
       acquire: () =>
         serial(async () => {
           if (!this.clients.has(token)) throw new ViewerInputError("control_lost");
@@ -89,6 +96,7 @@ export class PageViewport {
       resize: (
         message: unknown,
         apply: (viewport: CastingViewport, reload: boolean) => Promise<void>,
+        readAgent?: () => Promise<{ width: number; height: number; mobile: boolean }>,
       ) => {
         const parsed = viewportRequest.safeParse(message);
         if (!parsed.success) {
@@ -106,9 +114,20 @@ export class PageViewport {
           if (takingControl) this.generation++;
           this.owner = token;
           const request = parsed.data;
+          if (this.current.mode === "agent" && readAgent) {
+            try {
+              this.agent = await readAgent();
+            } catch {
+              notify({ type: "viewportError", message: "Could not read the agent viewport." });
+              return;
+            }
+          }
           let width = bound(request.width, 240, 2560);
           let height = bound(request.height, 160, 1600);
-          if (request.mode === "desktop") {
+          if (request.mode === "agent") {
+            width = this.agent.width;
+            height = this.agent.height;
+          } else if (request.mode === "desktop") {
             width = bound(this.initial.width, 1024, 2560);
             height = bound(this.initial.height, 600, 1600);
           } else if (request.mode === "mobile") {
@@ -120,9 +139,15 @@ export class PageViewport {
             mode: request.mode,
             width,
             height,
-            mobile: request.mode === "auto" ? this.initial.mobile : request.mode === "mobile",
+            mobile:
+              request.mode === "agent"
+                ? this.agent.mobile
+                : request.mode === "auto"
+                ? this.initial.mobile
+                : request.mode === "mobile",
           };
-          const reload = next.mobile !== this.current.mobile;
+          const preservingAgent = request.mode === "agent" && this.current.mode === "agent";
+          const reload = !preservingAgent && next.mobile !== this.current.mobile;
           if (reload && !request.reload) {
             notify({ type: "viewportReloadRequired", mode: request.mode });
             this.publish();
@@ -130,11 +155,12 @@ export class PageViewport {
           }
           try {
             if (
-              takingControl ||
-              !this.hasApplied ||
-              next.width !== this.current.width ||
-              next.height !== this.current.height ||
-              next.mobile !== this.current.mobile
+              !preservingAgent &&
+              (takingControl ||
+                !this.hasApplied ||
+                next.width !== this.current.width ||
+                next.height !== this.current.height ||
+                next.mobile !== this.current.mobile)
             ) {
               this.applying = true;
               try {

@@ -1,0 +1,105 @@
+// Zoom is local to the viewer; all remote input uses the PR's ordered protocol.
+const view = {zoom: 1, panX: 0, panY: 0};
+const pointers = new Map();
+let singleTouch, pinch;
+let suppressTap = false;
+let previousStageSize;
+const nativeViewer = !!window.ReactNativeWebView;
+function canvasFit(width = stage.clientWidth, height = stage.clientHeight) {
+  // On a phone, opening the keyboard crops the view instead of shrinking the
+  // remote desktop (or mobile page) a second time.
+  return Math.min(width / canvas.width, nativeViewer ? 1 : height / canvas.height, 1);
+}
+// WebKit can blur the hidden input or start its own page zoom even when the
+// pointer handler prevents default. All touch input is handled below instead.
+for (const type of ['touchstart', 'touchmove', 'gesturestart', 'gesturechange']) {
+  stage.addEventListener(type, event => event.preventDefault(), {passive: false});
+}
+function updateCanvasSize() {
+  if (!canvas.width || !canvas.height) return;
+  const size = {width: stage.clientWidth, height: stage.clientHeight};
+  if (nativeViewer && previousStageSize?.width === size.width && previousStageSize.height !== size.height) {
+    // Keep the same part of a zoomed page visible across keyboard transitions.
+    view.panY += (previousStageSize.height - size.height) / 2;
+  }
+  previousStageSize = size;
+  const fit = canvasFit();
+  const width = canvas.width * fit * view.zoom, height = canvas.height * fit * view.zoom;
+  const limitX = Math.max(0, (width - stage.clientWidth) / 2);
+  const limitY = Math.max(0, (height - stage.clientHeight) / 2);
+  view.panX = Math.max(-limitX, Math.min(limitX, view.panX));
+  view.panY = Math.max(-limitY, Math.min(limitY, view.panY));
+  canvas.style.width = width + 'px'; canvas.style.height = height + 'px';
+  canvas.style.left = `calc(50% + ${view.panX}px)`;
+  canvas.style.top = `calc(50% + ${view.panY}px)`;
+}
+function resetLocalView() {
+  view.zoom = 1; view.panX = view.panY = 0;
+  updateCanvasSize();
+}
+function cancelLocalGesture() {
+  singleTouch = pinch = undefined;
+  suppressTap = pointers.size > 0;
+}
+function touchInside(event) {
+  const rect = canvas.getBoundingClientRect();
+  return event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
+}
+function touchPair() {
+  const [a,b] = [...pointers.values()];
+  return {x:(a.x+b.x)/2, y:(a.y+b.y)/2, distance:Math.max(1,Math.hypot(a.x-b.x,a.y-b.y))};
+}
+stage.addEventListener('pointerdown', event => {
+  if (event.pointerType === 'mouse' || !metadata) return;
+  event.preventDefault();
+  stage.setPointerCapture(event.pointerId);
+  pointers.set(event.pointerId, {x:event.clientX,y:event.clientY});
+  if (pointers.size === 1 && !suppressTap) {
+    singleTouch = {id:event.pointerId, startX:event.clientX,startY:event.clientY,x:event.clientX,y:event.clientY,moved:false,inside:touchInside(event)};
+  } else if (pointers.size === 2) {
+    suppressTap = true; singleTouch = undefined;
+    const pair = touchPair(), rect = canvas.getBoundingClientRect();
+    pinch = {distance:pair.distance,zoom:view.zoom,anchorX:(pair.x-rect.left)/rect.width,anchorY:(pair.y-rect.top)/rect.height};
+  } else cancelLocalGesture();
+});
+stage.addEventListener('pointermove', event => {
+  if (!pointers.has(event.pointerId)) return;
+  event.preventDefault();
+  pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});
+  if (pointers.size === 2 && pinch) {
+    const pair = touchPair(), bounds = stage.getBoundingClientRect();
+    const fit = canvasFit(bounds.width, bounds.height);
+    view.zoom = Math.max(1,Math.min(8,pinch.zoom*pair.distance/pinch.distance));
+    view.panX = pair.x-bounds.left-bounds.width/2-(pinch.anchorX-.5)*canvas.width*fit*view.zoom;
+    view.panY = pair.y-bounds.top-bounds.height/2-(pinch.anchorY-.5)*canvas.height*fit*view.zoom;
+    updateCanvasSize(); return;
+  }
+  if (suppressTap || !singleTouch || singleTouch.id !== event.pointerId) return;
+  if (Math.hypot(event.clientX-singleTouch.startX,event.clientY-singleTouch.startY)>6) singleTouch.moved=true;
+  if (!singleTouch.moved) return;
+  let dx=event.clientX-singleTouch.x, dy=event.clientY-singleTouch.y;
+  singleTouch.x=event.clientX; singleTouch.y=event.clientY;
+  if (view.zoom > 1) {
+    const oldX=view.panX,oldY=view.panY;
+    view.panX+=dx; view.panY+=dy; updateCanvasSize();
+    dx-=view.panX-oldX;dy-=view.panY-oldY;
+  }
+  if (ready && singleTouch.inside && (Math.abs(dx)>.1 || Math.abs(dy)>.1)) {
+    const rect=canvas.getBoundingClientRect(), scale=metadata.pageScaleFactor||1;
+    mouse('mouseWheel',coordinates(event),'none',{
+      deltaX:Math.max(-10000,Math.min(10000,-dx*metadata.deviceWidth/rect.width/scale)),
+      deltaY:Math.max(-10000,Math.min(10000,-dy*metadata.deviceHeight/rect.height/scale))});
+  }
+});
+function finishLocalTouch(event) {
+  if (!pointers.has(event.pointerId)) return;
+  event.preventDefault();
+  if (event.type === 'pointerup' && !suppressTap && singleTouch?.id === event.pointerId && !singleTouch.moved && singleTouch.inside && touchInside(event) && ready) {
+    mobileInput?.finishComposition();
+    mouse('mousePressed',coordinates(event),'left');
+    mouse('mouseReleased',coordinates(event),'left');
+  }
+  pointers.delete(event.pointerId);singleTouch=pinch=undefined;suppressTap=pointers.size>0;
+}
+for (const type of ['pointerup','pointercancel','lostpointercapture']) stage.addEventListener(type,finishLocalTouch);
+new ResizeObserver(updateCanvasSize).observe(stage);

@@ -159,12 +159,15 @@
         display: flex;
         justify-content: center;
         align-items: flex-start;
+        touch-action: none;
         background: #8881;
       }
       canvas {
         display: block;
-        max-width: 100%;
-        max-height: 100%;
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
         object-fit: contain;
         touch-action: none;
         outline: none;
@@ -225,6 +228,7 @@
       <div class="viewport-control" title="Page layout">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 3H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h6v2H7v2h10v-2h-3v-2h6a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm0 14H4V5h16v12z"/></svg>
         <select id="viewport-mode" aria-label="Page layout" disabled>
+          <option value="agent">Agent View</option>
           <option value="auto">Auto</option>
           <option value="mobile">Mobile</option>
           <option value="desktop">Desktop</option>
@@ -324,7 +328,7 @@
           pageId = "";
         let serverWidth = 0,
           serverHeight = 0,
-          mode = "auto",
+          mode = "agent",
           pendingMode;
         let metadata,
           paintedFrame = 0,
@@ -357,6 +361,8 @@
           if (window.parent !== window) window.parent.postMessage(message, parentOrigin);
         };
 
+        <%- include("mobile-session-input") %>
+        <%- include("viewer-gestures") %>
         function setReady(value, message) {
           ready = value;
           stage.dataset.ready = String(value);
@@ -367,6 +373,7 @@
             $(name).disabled = !value;
           $("url").readOnly = !value;
           if (message) status.textContent = message;
+          mobileInput?.update();
         }
         function send(message) {
           if (!socket || socket.readyState !== WebSocket.OPEN) return false;
@@ -379,12 +386,14 @@
         }
         function clearLocalInput() {
           gesture = undefined;
+          cancelLocalGesture();
           pendingMove = undefined;
           clearTimeout(moveTimer);
           moveTimer = undefined;
           composing = false;
           clearKeyboard();
           clipboardRequests.clear();
+          mobileInput?.invalidate();
         }
         function cancelInput() {
           if (controlling) send({ type: "cancelInput" });
@@ -402,6 +411,7 @@
           control("acquire");
         }
         function requestViewport(nextMode = mode, reload = false) {
+          if (nextMode !== mode) resetLocalView();
           if (!controlling) return;
           cancelInput();
           setReady(false, "Waiting for a fresh frame…");
@@ -525,10 +535,12 @@
               serverHeight = data.height;
               viewportGeneration = data.viewportGeneration;
               layout.value = mode;
+              mobileInput?.update();
               return;
             }
             if (data.type === "viewportReloadRequired") {
               pendingMode = data.mode;
+              if (mobileInput) { mobileInput.reloadRequired(data.mode); return; }
               if (!$("viewport-confirm").open) $("viewport-confirm").showModal();
               return;
             }
@@ -601,21 +613,15 @@
               paintedFrame = data.frameId;
               canvas.width = image.naturalWidth;
               canvas.height = image.naturalHeight;
-              const fit = Math.min(
-                stage.clientWidth / image.naturalWidth,
-                stage.clientHeight / image.naturalHeight,
-                1,
-              );
-              canvas.style.width = image.naturalWidth * fit + "px";
-              canvas.style.height = image.naturalHeight * fit + "px";
+              updateCanvasSize();
               context.drawImage(image, 0, 0);
               metadata = data.metadata;
               if (document.activeElement !== $("url")) $("url").value = data.url || "";
               tellParent({ type: "navigation", url: data.url, favicon: data.favicon });
               if (
                 controlling &&
-                metadata.deviceWidth === serverWidth &&
-                metadata.deviceHeight === serverHeight &&
+                (mode === "agent" || (metadata.deviceWidth === serverWidth &&
+                metadata.deviceHeight === serverHeight)) &&
                 sentFrame !== data.frameId
               ) {
                 sentFrame = data.frameId;
@@ -825,7 +831,7 @@
           }
         }
         canvas.addEventListener("pointerdown", (event) => {
-          if (!ready || !event.isPrimary || gesture) return;
+          if (!ready || event.pointerType !== "mouse" || !event.isPrimary || gesture) return;
           event.preventDefault();
           canvas.focus({ preventScroll: true });
           panel.hidden = true;
@@ -844,7 +850,7 @@
           if (kind === "drag") mouse("mousePressed", point, gesture.button, event);
         });
         canvas.addEventListener("pointermove", (event) => {
-          if (!ready) return;
+          if (!ready || event.pointerType !== "mouse") return;
           if (!gesture) {
             if (event.pointerType === "mouse") {
               const point = coordinates(event);
@@ -1069,8 +1075,16 @@
           canvas.focus();
         });
         window.addEventListener("blur", cancelInput);
+        let viewerWidth = window.innerWidth;
         window.addEventListener("resize", () => {
+          const widthChanged = viewerWidth !== window.innerWidth;
+          viewerWidth = window.innerWidth;
+          updateCanvasSize();
           if (!controlling) return;
+          // Native keyboard animations change only the visible height. Neither
+          // opening nor closing it should cancel a pinch or resize the session.
+          if (mobileInput && (!widthChanged || mobileInput.keyboardOpen())) return;
+          if (mode === "agent") { cancelInput(); return; }
           cancelInput();
           setReady(false, "Adjusting the page…");
           clearTimeout(resizeTimer);
