@@ -2,9 +2,16 @@
 // this page; keystrokes and pasted text go straight to the session socket.
 const mobileInput = (() => {
     if (!interactive || !window.ReactNativeWebView?.postMessage) return null;
-    // Native supplies floating controls; give the remote page the full viewport.
+    // Native supplies floating controls; Agent View uses the full viewport.
     const chrome = document.createElement('style');
-    chrome.textContent = 'header { display: none !important; }';
+    chrome.textContent = `
+        header { display: none !important; background: Canvas; }
+        body[data-native-browser-controls="true"] header { display: flex !important; }
+        header #keyboard, header .viewport-control { display: none !important; }
+        body, #stage { background: #0b0b0b; }
+    `;
+    const header = document.querySelector('header');
+    let browserControlsVisible = false;
     document.head.appendChild(chrome);
     // Zoom the canvas, never the surrounding document or hidden keyboard input.
     document.querySelector('meta[name="viewport"]').content =
@@ -27,6 +34,25 @@ const mobileInput = (() => {
     let targetId, targetConnection, availableBefore, targetGeneration, targetViewport;
     let requestedReload = null;
     let previousStatus;
+    let insets = {top: 0, bottom: 0, keyboardBottom: 0};
+    let appliedInsets = 0;
+    function reservedSpace(nextMode = mode) {
+        return nextMode === 'mobile' ? (browserControlsVisible ? 0 : insets.top) +
+            (document.activeElement === input ? insets.keyboardBottom : insets.bottom) : 0;
+    }
+    function applyInsets() {
+        const mobile = mode === 'mobile';
+        // The header occupies layout space; do not reserve the native control
+        // row a second time above the streamed page when the bar is visible.
+        header.style.marginTop = (browserControlsVisible ? insets.top : 0) + 'px';
+        const top = mobile && !browserControlsVisible ? insets.top : 0;
+        stage.style.marginTop = top + 'px';
+        stage.style.marginBottom = (mobile ? reservedSpace() - top : 0) + 'px';
+        appliedInsets = reservedSpace();
+    }
+    function viewportHeight(nextMode) {
+        return stage.clientHeight + appliedInsets - reservedSpace(nextMode);
+    }
 
     function reset() {
         input.value = sentinel;
@@ -34,6 +60,7 @@ const mobileInput = (() => {
     }
     function available() { return ready && controlling && socket?.readyState === WebSocket.OPEN; }
     function update(force = false) {
+        applyInsets();
         const isReady = available();
         if (targetId !== pageId || targetConnection !== connection || targetGeneration !== generation) requestedReload = null;
         if (targetId !== pageId || targetConnection !== connection || availableBefore !== isReady || targetGeneration !== generation || targetViewport !== viewportGeneration) {
@@ -45,7 +72,7 @@ const mobileInput = (() => {
             input.blur();
         }
         const status = JSON.stringify({type: 'tlon.browser.input', version: 1,
-            ready: isReady, keyboardOpen: document.activeElement === input, context,
+            ready: isReady, keyboardOpen: document.activeElement === input, context, browserControlsVisible,
             mode: mode === "mobile" ? "mobile" : "agent", reloadRequired: requestedReload});
         if (force || status !== previousStatus) {
             previousStatus = status;
@@ -105,6 +132,29 @@ const mobileInput = (() => {
         receive(command) {
             if (command?.version !== 1) return;
             update();
+            if (command.type === 'insets') {
+                const keys = ['top', 'bottom', 'keyboardBottom'];
+                if (!keys.every(key => Number.isFinite(command[key]) && command[key] >= 0 && command[key] <= 300)) return;
+                if (keys.every(key => command[key] === insets[key])) return;
+                insets = Object.fromEntries(keys.map(key => [key, command[key]]));
+                applyInsets();
+                if (controlling && mode === 'mobile' && document.activeElement !== input) requestViewport();
+                return;
+            }
+            if (command.type === 'browserControls') {
+                if (typeof command.visible !== 'boolean' || command.visible === browserControlsVisible) return;
+                browserControlsVisible = command.visible;
+                if (!browserControlsVisible) {
+                    closeMenu();
+                    if (header.contains(document.activeElement)) document.activeElement.blur();
+                }
+                document.body.dataset.nativeBrowserControls = String(browserControlsVisible);
+                update(true);
+                // Agent View never resizes the remote browser. Mobile View
+                // fits the space remaining below the newly visible toolbar.
+                if (controlling && mode === 'mobile') requestViewport();
+                return;
+            }
             if (command.type === 'status') { update(true); return; }
             if (command.type === 'keyboard' && command.open === false) { input.blur(); return; }
             if (command.type === 'layout' && controlling && command.context === context && ['agent', 'mobile'].includes(command.mode)) {
@@ -126,7 +176,7 @@ const mobileInput = (() => {
     });
     reset();
     update();
-    return {update, finishComposition,
+    return {update, finishComposition, viewportHeight,
         keyboardOpen: () => document.activeElement === input,
         invalidate() { context++; composing = false; reset(); input.blur(); update(); },
         reloadRequired(mode) { requestedReload = mode; update(true); }

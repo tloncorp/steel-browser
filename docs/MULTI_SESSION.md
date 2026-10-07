@@ -95,14 +95,28 @@ fixtures; a live challenge requires separate manual verification.
 Tlon embeds the same viewer with floating native Close, keyboard, paste, and
 Browser options controls. The options menu selects **Agent View** (default) or
 **Mobile View**. Agent View leaves the live browser viewport unchanged, including
-agent-initiated resizes. Pinch zoom and panning affect only the streamed image;
+agent-initiated resizes. Pinch zoom and panning affect only the streamed image.
+In Agent View, double-tapping while zoomed in resets the image to its centered,
+default scale without clicking the remote page. Single taps while zoomed wait
+300 ms to distinguish the reset gesture;
 taps and scrolling still use the ordered viewer input protocol. Mobile View
 explicitly changes the shared page's viewport and mobile emulation. Switching
 emulation asks before reloading; Agent View restores the viewport captured before
-the switch. Keyboard presentation does not resize the remote page.
+the switch. In the native viewer, Mobile View reserves the safe area and control
+rows above and below the page on a dark background, and uses the remaining area
+for the remote viewport. Agent View remains edge-to-edge. Keyboard presentation
+does not resize the remote page.
 
-The `tlonBrowserInput` native bridge accepts versioned keyboard, paste, layout,
-and status commands. Its context changes with connection/control/frame epochs;
+The native options menu also offers **Show browser controls**, off by default for
+each new viewer. It reveals the existing Back, Forward, address field, and browser
+menu below the native controls. Native keyboard and layout controls remain in the
+app. The toolbar can be shown in either view; Agent View retains the remote
+viewport, while Mobile View fits the space below the toolbar.
+
+The `tlonBrowserInput` native bridge accepts versioned keyboard, paste, layout, insets,
+`browserControls` (`visible: boolean`), and status commands. Input status includes
+`browserControlsVisible`; clients disable the toggle when an older viewer omits
+that capability. Its context changes with connection/control/frame epochs;
 clipboard content never appears in status messages. Native layout confirmation
 and paste must use the latest context. The standalone web toolbar and dashboard
 clipboard bridge remain available outside the React Native WebView.
