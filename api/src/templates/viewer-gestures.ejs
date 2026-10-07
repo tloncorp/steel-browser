@@ -1,7 +1,8 @@
 // Zoom is local to the viewer; all remote input uses the PR's ordered protocol.
 const view = {zoom: 1, panX: 0, panY: 0};
 const pointers = new Map();
-let singleTouch, pinch;
+let singleTouch, pinch, pendingTap;
+const doubleTapDelay = 300;
 let suppressTap = false;
 let previousStageSize;
 const nativeViewer = !!window.ReactNativeWebView;
@@ -12,7 +13,7 @@ function canvasFit(width = stage.clientWidth, height = stage.clientHeight) {
 }
 // WebKit can blur the hidden input or start its own page zoom even when the
 // pointer handler prevents default. All touch input is handled below instead.
-for (const type of ['touchstart', 'touchmove', 'gesturestart', 'gesturechange']) {
+for (const type of ['touchstart', 'touchmove', 'touchend', 'gesturestart', 'gesturechange', 'gestureend']) {
   stage.addEventListener(type, event => event.preventDefault(), {passive: false});
 }
 function updateCanvasSize() {
@@ -34,12 +35,50 @@ function updateCanvasSize() {
   canvas.style.top = `calc(50% + ${view.panY}px)`;
 }
 function resetLocalView() {
+  clearPendingTap();
   view.zoom = 1; view.panX = view.panY = 0;
   updateCanvasSize();
 }
 function cancelLocalGesture() {
+  clearPendingTap();
   singleTouch = pinch = undefined;
   suppressTap = pointers.size > 0;
+}
+function clearPendingTap() {
+  if (pendingTap) clearTimeout(pendingTap.timer);
+  pendingTap = undefined;
+}
+function sendTap(point) {
+  if (!ready) return;
+  mobileInput?.finishComposition();
+  mouse('mousePressed',point,'left');
+  mouse('mouseReleased',point,'left');
+}
+function finishTap(event) {
+  const point = coordinates(event);
+  if (mode !== 'agent' || view.zoom <= 1) {
+    sendTap(point);
+    return;
+  }
+  // Wait only when zoomed in: a double-tap resets the local view without
+  // clicking the remote page. Input/context changes cancel the pending click.
+  if (pendingTap && performance.now() - pendingTap.time <= doubleTapDelay &&
+      Math.hypot(event.clientX-pendingTap.x,event.clientY-pendingTap.y) <= 30) {
+    resetLocalView();
+    return;
+  }
+  if (pendingTap) {
+    const previous = pendingTap.point;
+    clearPendingTap();
+    sendTap(previous);
+  }
+  const tap = {point, x:event.clientX, y:event.clientY, time:performance.now()};
+  tap.timer = setTimeout(() => {
+    if (pendingTap !== tap) return;
+    pendingTap = undefined;
+    sendTap(tap.point);
+  }, doubleTapDelay);
+  pendingTap = tap;
 }
 function touchInside(event) {
   const rect = canvas.getBoundingClientRect();
@@ -57,6 +96,7 @@ stage.addEventListener('pointerdown', event => {
   if (pointers.size === 1 && !suppressTap) {
     singleTouch = {id:event.pointerId, startX:event.clientX,startY:event.clientY,x:event.clientX,y:event.clientY,moved:false,inside:touchInside(event)};
   } else if (pointers.size === 2) {
+    clearPendingTap();
     suppressTap = true; singleTouch = undefined;
     const pair = touchPair(), rect = canvas.getBoundingClientRect();
     pinch = {distance:pair.distance,zoom:view.zoom,anchorX:(pair.x-rect.left)/rect.width,anchorY:(pair.y-rect.top)/rect.height};
@@ -77,6 +117,7 @@ stage.addEventListener('pointermove', event => {
   if (suppressTap || !singleTouch || singleTouch.id !== event.pointerId) return;
   if (Math.hypot(event.clientX-singleTouch.startX,event.clientY-singleTouch.startY)>6) singleTouch.moved=true;
   if (!singleTouch.moved) return;
+  clearPendingTap();
   let dx=event.clientX-singleTouch.x, dy=event.clientY-singleTouch.y;
   singleTouch.x=event.clientX; singleTouch.y=event.clientY;
   if (view.zoom > 1) {
@@ -94,10 +135,9 @@ stage.addEventListener('pointermove', event => {
 function finishLocalTouch(event) {
   if (!pointers.has(event.pointerId)) return;
   event.preventDefault();
+  if (event.type !== 'pointerup') clearPendingTap();
   if (event.type === 'pointerup' && !suppressTap && singleTouch?.id === event.pointerId && !singleTouch.moved && singleTouch.inside && touchInside(event) && ready) {
-    mobileInput?.finishComposition();
-    mouse('mousePressed',coordinates(event),'left');
-    mouse('mouseReleased',coordinates(event),'left');
+    finishTap(event);
   }
   pointers.delete(event.pointerId);singleTouch=pinch=undefined;suppressTap=pointers.size>0;
 }

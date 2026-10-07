@@ -419,7 +419,7 @@
             type: "viewport",
             mode: nextMode,
             width: Math.round(stage.clientWidth),
-            height: Math.max(160, Math.round(stage.clientHeight)),
+            height: Math.max(160, Math.round(mobileInput?.viewportHeight(nextMode) ?? stage.clientHeight)),
             reload,
           });
         }
