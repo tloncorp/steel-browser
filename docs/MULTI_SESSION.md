@@ -85,6 +85,13 @@ appear as Yes/No choices. A focused form takes precedence when a page has severa
 focus, discovery requires one unambiguous form. General forms fill without submitting. Login forms
 can submit when explicitly requested. File uploads and custom widgets require the live browser.
 
+Each signed viewer link offers one successful secure form fill. After filling, credential discovery
+with that link returns 404, allowing the app to finish its polling and return control to the bot.
+The link still opens the live browser. The bot inspects the current page and requests a fresh
+handoff for each step needing owner input. Reading the session through the internal gateway mints
+a distinct signed link, even when the session deadline is unchanged. Failed fills require fresh
+field discovery and input; they do not close the link's secure-entry round.
+
 Run the input, viewport, and public-gateway browser checks with a local Chrome:
 
 ```sh

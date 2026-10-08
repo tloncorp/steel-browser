@@ -284,8 +284,16 @@ async function secureGateway(
   fields,
   kind = "login",
   fillStatus = 200,
+  hooks = {},
 ) {
   const posted = [];
+  const discovered = [];
+  const session = {
+    id: sessionId,
+    status: "live",
+    createdAt: new Date().toISOString(),
+    timeout: 60_000,
+  };
   const metadata = {
     formId: "bound-form",
     pageId: "page-1",
@@ -294,10 +302,22 @@ async function secureGateway(
     kind,
     fields,
   };
-  const upstream = http.createServer((request, response) => {
+  const upstream = http.createServer(async (request, response) => {
+    if (request.url === `/v1/sessions/${sessionId}`) {
+      return response
+        .writeHead(200, { "content-type": "application/json" })
+        .end(JSON.stringify(session));
+    }
+    if (request.url.startsWith("/v1/sessions/debug?")) {
+      return response
+        .writeHead(200, { "content-type": "text/html" })
+        .end("Live browser");
+    }
     if (request.url !== `/v1/sessions/${sessionId}/credential-form`)
       return response.writeHead(404).end();
     if (request.method === "GET") {
+      discovered.push(metadata.formId);
+      await hooks.discover?.();
       response
         .writeHead(200, { "content-type": "application/json" })
         .end(JSON.stringify(metadata));
@@ -305,14 +325,18 @@ async function secureGateway(
     }
     const chunks = [];
     request.on("data", (chunk) => chunks.push(chunk));
-    request.on("end", () => {
+    request.on("end", async () => {
       posted.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      await hooks.fill?.();
       response
         .writeHead(fillStatus, { "content-type": "application/json" })
         .end(
           JSON.stringify(
             fillStatus === 200
-              ? { ok: true, submitted: kind === "login" }
+              ? {
+                  ok: true,
+                  submitted: kind === "login" && posted.at(-1).submit === true,
+                }
               : { error: "must-not-echo-submitted-value" },
           ),
         );
@@ -325,21 +349,45 @@ async function secureGateway(
     upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
     maximumTtlMs: 900_000,
   });
-  const publicPort = await listen(publicServer);
-  context.after(() => Promise.all([close(publicServer), close(upstream)]));
+  const [publicPort, internalPort] = await Promise.all([
+    listen(publicServer),
+    listen(internal),
+  ]);
+  context.after(() =>
+    Promise.all([close(internal), close(publicServer), close(upstream)]),
+  );
   const capability = mintCapability(
     { sessionId, expiresAt: Date.now() + 60_000 },
     secret,
   );
   const base = `http://127.0.0.1:${publicPort}`;
-  const discover = () => fetch(`${base}/credentials/${capability}`);
+  const discover = (token = capability) =>
+    fetch(`${base}/credentials/${token}`);
+  const freshCapability = async () => {
+    const response = await fetch(
+      `http://127.0.0.1:${internalPort}/v1/sessions/${sessionId}`,
+    );
+    assert.equal(response.status, 200);
+    return new URL((await response.json()).sessionViewerUrl).pathname.slice(3);
+  };
   const fill = (id, body) =>
     fetch(`${base}/credential-fills/${id}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     });
-  return { metadata, posted, discover, fill, internal, base, publicServer };
+  return {
+    metadata,
+    posted,
+    discovered,
+    discover,
+    fill,
+    internal,
+    base,
+    publicServer,
+    capability,
+    freshCapability,
+  };
 }
 
 test("secure handoffs expose metadata and a one-use endpoint, never values or selectors", async (context) => {
@@ -566,4 +614,160 @@ test("a fill admitted before its deadline cannot dispatch after a delayed body e
   request.end(input.slice(10));
   assert.equal(await result, 401);
   assert.deepEqual(gateway.posted, []);
+});
+
+test("session reads mint distinct capabilities with the same session deadline", () => {
+  const record = {
+    id: sessionId,
+    status: "live",
+    createdAt: new Date(10_000).toISOString(),
+    timeout: 60_000,
+  };
+  const config = {
+    secret,
+    publicOrigin: "https://viewer.test",
+    maximumTtlMs: 900_000,
+  };
+  const first = new URL(
+    rewriteSession(record, config, 20_000).sessionViewerUrl,
+  ).pathname.slice(3);
+  const second = new URL(
+    rewriteSession(record, config, 20_000).sessionViewerUrl,
+  ).pathname.slice(3);
+  assert.notEqual(first, second);
+  assert.deepEqual(
+    verifyCapability(first, secret, 20_000),
+    verifyCapability(second, secret, 20_000),
+  );
+});
+
+for (const kind of ["login", "details"]) {
+  test(`${kind} fills end discovery on that link and a fresh bot handoff opens the next step`, async (context) => {
+    const gateway = await secureGateway(
+      context,
+      [secureField("username")],
+      kind,
+    );
+    let capability = await gateway.freshCapability();
+    const completed = [];
+    for (const [index, purpose] of [
+      "username",
+      "current-password",
+      "one-time-code",
+    ].entries()) {
+      gateway.metadata.formId = `form-${index}`;
+      gateway.metadata.fields = [secureField(purpose)];
+      const response = await gateway.discover(capability);
+      assert.equal(response.status, 200);
+      const handoff = await response.json();
+      assert.equal(handoff.fields[0].purpose, purpose);
+      assert.equal(
+        (
+          await gateway.fill(handoff.handoffId, {
+            values: { f0: "private" },
+            submit: true,
+          })
+        ).status,
+        200,
+      );
+      completed.push(capability);
+      const reads = gateway.discovered.length;
+      // Every follow-up poll gets the app's normal no-form response, whether
+      // the page stays on this form or advances to another one.
+      for (let poll = 0; poll < 17; poll++) {
+        if (poll === 1) gateway.metadata.formId = "next-live-form";
+        assert.equal((await gateway.discover(capability)).status, 404);
+      }
+      assert.equal(gateway.discovered.length, reads);
+      const viewer = await fetch(`${gateway.base}/s/${capability}`);
+      assert.equal(viewer.status, 200);
+      assert.equal(await viewer.text(), "Live browser");
+      capability = await gateway.freshCapability();
+      assert.ok(!completed.includes(capability));
+      for (const previous of completed)
+        assert.equal((await gateway.discover(previous)).status, 404);
+    }
+    assert.equal(gateway.posted.length, 3);
+    assert.equal(gateway.discovered.length, 3);
+  });
+}
+
+test("a failed fill allows fresh discovery on the same link without replaying values", async (context) => {
+  const gateway = await secureGateway(
+    context,
+    [secureField("username")],
+    "login",
+    500,
+  );
+  const first = await (await gateway.discover()).json();
+  assert.equal(
+    (await gateway.fill(first.handoffId, { values: { f0: "private" } })).status,
+    500,
+  );
+  const retry = await gateway.discover();
+  assert.equal(retry.status, 200);
+  assert.notEqual((await retry.json()).handoffId, first.handoffId);
+  assert.equal(gateway.posted.length, 1);
+});
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+test("discovery overlapping a fill cannot reopen the completed handoff", async (context) => {
+  const discoveryStarted = deferred();
+  const releaseDiscovery = deferred();
+  const fillStarted = deferred();
+  const releaseFill = deferred();
+  context.after(() => {
+    releaseDiscovery.resolve();
+    releaseFill.resolve();
+  });
+  let discoveries = 0;
+  const gateway = await secureGateway(
+    context,
+    [secureField("username")],
+    "login",
+    200,
+    {
+      discover: async () => {
+        if (++discoveries === 2) {
+          discoveryStarted.resolve();
+          await releaseDiscovery.promise;
+        }
+      },
+      fill: async () => {
+        fillStarted.resolve();
+        await releaseFill.promise;
+      },
+    },
+  );
+  const first = await (await gateway.discover()).json();
+  const pendingDiscovery = gateway.discover();
+  await discoveryStarted.promise;
+  const pendingFill = gateway.fill(first.handoffId, {
+    values: { f0: "private" },
+  });
+  await fillStarted.promise;
+  assert.equal((await gateway.discover()).status, 404);
+  releaseDiscovery.resolve();
+  assert.equal((await pendingDiscovery).status, 404);
+  releaseFill.resolve();
+  assert.equal((await pendingFill).status, 200);
+  assert.equal((await gateway.discover()).status, 404);
+  assert.equal(gateway.posted.length, 1);
+});
+
+test("a successful fill ends the round even when the browser does not submit", async (context) => {
+  const gateway = await secureGateway(context, [secureField("username")]);
+  const handoff = await (await gateway.discover()).json();
+  const filled = await gateway.fill(handoff.handoffId, {
+    values: { f0: "private" },
+  });
+  assert.deepEqual(await filled.json(), { ok: true, submitted: false });
+  assert.equal((await gateway.discover()).status, 404);
 });
