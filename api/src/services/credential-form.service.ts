@@ -299,6 +299,13 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
       .map((id) => labelText(root.getElementById(id)))
       .join(" ")
       .trim();
+    // Some forms put a short label directly before the control without <label>.
+    const preceding = input.previousSibling;
+    const adjacentText =
+      preceding?.nodeType === Node.TEXT_NODE ? preceding.textContent?.trim() || "" : "";
+    const nearbyLabel = /^[^:\n]{1,80}:$/.test(adjacentText)
+      ? adjacentText.slice(0, -1).trim()
+      : "";
     return (
       labelledBy ||
       input.getAttribute("aria-label") ||
@@ -307,6 +314,8 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
         .join(" ")
         .trim() ||
       input.getAttribute("placeholder") ||
+      nearbyLabel ||
+      (input instanceof HTMLInputElement && input.type === "search" ? "Search" : "") ||
       input.name ||
       input.id ||
       ""
@@ -366,6 +375,24 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
         control.getAttribute("value") ||
         "",
     );
+    const focused = !!active && (group.includes(active as FormControl) || scope.contains(active));
+    const searchInputs = group.filter(
+      (input) => input instanceof HTMLInputElement && ["text", "search"].includes(input.type),
+    );
+    const searchOnly =
+      searchInputs.length > 0 &&
+      group.every((input) => searchInputs.includes(input) || input instanceof HTMLSelectElement) &&
+      (!!scope.closest('search, [role="search"]') ||
+        searchInputs.some((input) => input.type === "search") ||
+        (searchInputs.length === 1 &&
+          (/\bsearch\b/i.test(label(searchInputs[0])) ||
+            submitLabels.some((label) => /^search\b/i.test(label.trim())) ||
+            (scope instanceof HTMLFormElement &&
+              URL.canParse(scope.action) &&
+              /(?:^|\/)search(?:\/|$)/i.test(new URL(scope.action).pathname)))));
+    // Page chrome is not an invitation to start another handoff after navigation.
+    // Focus makes a search form an explicit target without disabling general forms.
+    if (searchOnly && !focused) continue;
     const nonLoginAction =
       /\bsubscribe\b|newsletter|\bsign\s*up\b|\bregister\b|create (?:an? )?account|reset password/i;
     // Login forms commonly contain Sign up / Forgot password links. Their
@@ -404,7 +431,15 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
     for (const input of group) {
       if (fields.some((field) => field.inputs.includes(input))) continue;
       if (splitCode && split.includes(input as HTMLInputElement) && input !== split[0]) continue;
-      const fieldLabel = label(input) || `Field ${fields.length + 1}`;
+      const rawLabel = label(input);
+      const pageLabel =
+        searchOnly &&
+        searchInputs.length === 1 &&
+        searchInputs[0] === input &&
+        (!rawLabel || rawLabel === input.name || rawLabel === input.id)
+          ? "Search"
+          : rawLabel;
+      const fieldLabel = pageLabel || `Field ${fields.length + 1}`;
       const yesNo = [
         { value: "0", label: "No" },
         { value: "1", label: "Yes" },
@@ -540,7 +575,7 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
         descriptor: {
           id: `f${fields.length}`,
           purpose: definition?.purpose || "field",
-          label: (section + (label(input) || definition?.label || fieldLabel)).slice(0, 256),
+          label: (section + (pageLabel || definition?.label || fieldLabel)).slice(0, 256),
           inputType: options
             ? "select"
             : input instanceof HTMLTextAreaElement
@@ -627,7 +662,7 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
       });
     matches.push({
       kind,
-      focused: !!active && (group.includes(active as FormControl) || scope.contains(active)),
+      focused,
       fields,
       controls,
     });

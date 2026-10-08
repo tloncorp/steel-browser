@@ -20,11 +20,12 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
   let service: CDPService;
   let origin: string;
   let html = "";
+  let destinationHtml = "";
   const requests: string[] = [];
   const site = createServer((req, res) => {
     requests.push(req.url || "");
     res.setHeader("Content-Type", "text/html");
-    res.end(req.url?.startsWith("/done") ? "<h1>Account home</h1>" : html);
+    res.end(req.url?.startsWith("/done") ? destinationHtml : html);
   });
   beforeAll(async () => {
     browser = await puppeteer.launch({
@@ -39,6 +40,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
   });
   beforeEach(async () => {
     requests.length = 0;
+    destinationHtml = "<h1>Account home</h1>";
     page = await browser.newPage();
     service = { getAllPages: async () => [page] } as unknown as CDPService;
   });
@@ -317,7 +319,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
   it.each([
     '<form><label>Email<input type="email"></label><button>Subscribe</button></form>',
     '<form><label>Coupon code<input name="code"></label><button>Apply</button></form>',
-    '<form><label>Search<input name="search"></label><button>Search</button></form>',
+    '<form action="http://["><input name="message"><button>Send</button></form>',
     '<form><input name="email"><button>Next</button></form>',
   ])("fills general forms without classifying them as logins", async (body) => {
     await load(body);
@@ -338,7 +340,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
 
   it("requires focus to choose between multiple visible forms", async () => {
     await load(
-      '<form><input name="search"><button>Search</button></form><form><input name="feedback"><button>Send</button></form>',
+      '<form><input name="title"><button>Save</button></form><form><input name="feedback"><button>Send</button></form>',
     );
     await expect(discoverCredentialForm(service)).rejects.toMatchObject({ statusCode: 404 });
     await page.focus('[name="feedback"]');
@@ -349,6 +351,52 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       "",
       "A suggestion",
     ]);
+  });
+
+  it("does not offer the homepage search form as the next step after login", async () => {
+    destinationHtml =
+      '<h1>Home</h1><form method="get" action="//hn.algolia.com/">Search: <input type="text" name="q" autocomplete="off"></form>';
+    await load(`<form action="/done">${fields}<button>Sign in</button></form>`);
+    expect((await fill()).submitted).toBe(true);
+    await page.waitForFunction(() => location.pathname === "/done");
+    const status = browserMonitorStatus(service);
+    await expect(discoverCredentialForm(service)).rejects.toMatchObject({ statusCode: 404 });
+    expect(browserMonitorStatus(service)).toEqual(status);
+
+    await page.focus('[name="q"]');
+    const target = await discoverCredentialForm(service);
+    expect(target.kind).toBe("details");
+    expect(target.fields).toMatchObject([{ label: "Search", purpose: "field" }]);
+    expect(
+      await fillCredentialForm(service, target, {
+        values: { f0: "browser automation" },
+        submit: true,
+      }),
+    ).toEqual({ submitted: false });
+    expect(await page.$eval("input", (input) => input.value)).toBe("browser automation");
+    expect(page.url()).toContain("/done");
+  });
+
+  it.each([
+    '<form><input type="search" name="q"></form>',
+    '<form role="search"><input name="q"><select><option>All</option></select></form>',
+    '<search><form><input name="q"></form></search>',
+    '<form action="/search"><input name="q"></form>',
+    '<form><input name="q"><button>Search</button></form>',
+    '<form><label>Search<input name="q"></label></form>',
+  ])("offers a search form only when it is focused", async (body) => {
+    await load(body);
+    await expect(discoverCredentialForm(service)).rejects.toMatchObject({ statusCode: 404 });
+    await page.focus("input");
+    expect((await discoverCredentialForm(service)).fields[0].label).toBe("Search");
+  });
+
+  it("discovers a substantive form beside an unfocused search form", async () => {
+    await load(
+      '<form>Search: <input name="q"></form><form><label>Message<textarea></textarea></label><button>Send</button></form>',
+    );
+    const target = await discoverCredentialForm(service);
+    expect(target.fields.map((field) => field.label)).toEqual(["Message"]);
   });
 
   it("rejects changed nodes and field semantics on the same URL before writing", async () => {
@@ -480,7 +528,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       "Appointment date",
       "Party size",
       "Website",
-      "query",
+      "Search",
       "time",
       "Field 8",
     ]);
