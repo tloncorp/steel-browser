@@ -72,10 +72,32 @@ disconnection, and link expiry cancel held contacts, mouse buttons, keys, and un
 A reconnect obtains fresh control and frame state without replaying input. Viewer arbitration is
 page-scoped; agent and direct CDP access operate independently.
 
+When a viewer takes control, its WebSocket `User-Agent` header becomes the remote tab's HTTP
+user agent and `navigator.userAgent`. A changed user agent reloads the current page so its next
+request uses the viewer's identity. Reconnecting with the same user agent does not reload. This
+does not change the viewport. The tab keeps that user agent after the viewer disconnects;
+a new controlling viewer supplies its own. Watching a tab does not change its user agent. This
+changes the reported user agent, not Chrome's browser engine or the rest of its device fingerprint.
+
 The public gateway supplies the verified capability deadline to the casting service. An open viewer
 connection closes at that deadline or the session deadline, whichever comes first. Secure form fills
 also recheck their deadline after reading the request body and before dispatching to the browser.
 Deploy the API and viewer template together: the input protocol requires matching versions.
+
+Secure form handoffs discover visible, editable native controls without requiring login or autofill
+semantics. Field labels come from the page's accessible labels, placeholders, or names; discovery
+does not return existing input values. Text fields and textareas retain their labels and required
+status. Radio groups appear as choices, while checkboxes and individual multiple-select options
+appear as Yes/No choices. A focused form takes precedence when a page has several forms; without
+focus, discovery requires one unambiguous form. General forms fill without submitting. Login forms
+can submit when explicitly requested. File uploads and custom widgets require the live browser.
+
+Each signed viewer link offers one successful secure form fill. After filling, credential discovery
+with that link returns 404, allowing the app to finish its polling and return control to the bot.
+The link still opens the live browser. The bot inspects the current page and requests a fresh
+handoff for each step needing owner input. Reading the session through the internal gateway mints
+a distinct signed link, even when the session deadline is unchanged. Failed fills require fresh
+field discovery and input; they do not close the link's secure-entry round.
 
 Run the input, viewport, and public-gateway browser checks with a local Chrome:
 

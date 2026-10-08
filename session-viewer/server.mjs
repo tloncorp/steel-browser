@@ -48,6 +48,7 @@ export function mintCapability({ sessionId, expiresAt }, secret) {
       v: 1,
       aud: "session-viewer",
       sid: sessionId,
+      nonce: randomBytes(16).toString("base64url"),
       exp: Math.floor(expiresAt / 1000),
     }),
   );
@@ -404,10 +405,16 @@ export function createGateway(config) {
   const upstreamOrigin = new URL(config.upstreamOrigin);
   const publicOrigin = new URL(config.publicOrigin);
   const credentialHandoffs = new Map();
+  // A viewer capability offers one successful form fill. Its live browser
+  // access remains valid after secure entry returns control to the bot.
+  const closedCredentialRounds = new Map();
 
   const removeExpiredHandoffs = (now = Date.now()) => {
     for (const [id, handoff] of credentialHandoffs) {
       if (handoff.expiresAt <= now) credentialHandoffs.delete(id);
+    }
+    for (const [token, expiresAt] of closedCredentialRounds) {
+      if (expiresAt <= now) closedCredentialRounds.delete(token);
     }
   };
 
@@ -449,11 +456,20 @@ export function createGateway(config) {
 
     const credentialEntry = /^\/credentials\/([^/]+)$/.exec(url.pathname);
     if (request.method === "GET" && credentialEntry) {
-      const capability = verifyCapability(credentialEntry[1], config.secret);
+      const token = credentialEntry[1];
+      const capability = verifyCapability(token, config.secret);
       if (!capability)
         return sendCredentialJson(response, 401, {
           error: "Credential handoff is invalid or expired.",
         });
+
+      removeExpiredHandoffs();
+      const endRound = () =>
+        sendCredentialJson(response, 404, {
+          error:
+            "This form handoff is complete. Request a fresh handoff for another step.",
+        });
+      if (closedCredentialRounds.has(token)) return endRound();
 
       try {
         const target = new URL(
@@ -463,10 +479,12 @@ export function createGateway(config) {
           upstreamOrigin,
         );
         const discovered = await upstreamJson(target);
+        // Discovery can overlap a fill. Do not publish a new handle after that
+        // fill starts, even if the upstream lookup was already in flight.
+        if (closedCredentialRounds.has(token)) return endRound();
         if (!discovered.response.ok) {
           return sendCredentialJson(response, discovered.response.status, {
-            error:
-              discovered.body?.error ?? "No live credential form is available.",
+            error: discovered.body?.error ?? "No live form is available.",
           });
         }
         const { formId, pageId, frameUrl, origin, kind } =
@@ -508,6 +526,8 @@ export function createGateway(config) {
           Date.now() + 5 * 60_000,
         );
         credentialHandoffs.set(handoffId, {
+          token,
+          capabilityExpiresAt: capability.expiresAt,
           sessionId: capability.sessionId,
           target: { formId, pageId, frameUrl, origin, kind },
           fields,
@@ -573,6 +593,7 @@ export function createGateway(config) {
         });
       }
       handoff.status = "submitting";
+      closedCredentialRounds.set(handoff.token, handoff.capabilityExpiresAt);
       try {
         const target = new URL(
           `/v1/sessions/${encodeURIComponent(
@@ -590,6 +611,7 @@ export function createGateway(config) {
           }),
         });
         if (!filled.response.ok) {
+          closedCredentialRounds.delete(handoff.token);
           credentialHandoffs.delete(credentialFill[1]);
           return sendCredentialJson(response, filled.response.status, {
             error:
@@ -602,6 +624,7 @@ export function createGateway(config) {
           submitted: filled.body?.submitted === true,
         });
       } catch {
+        closedCredentialRounds.delete(handoff.token);
         credentialHandoffs.delete(credentialFill[1]);
         return sendCredentialJson(response, 502, {
           error: "Browser unavailable.",

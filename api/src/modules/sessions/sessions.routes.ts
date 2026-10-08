@@ -123,9 +123,9 @@ async function routes(server: FastifyInstance) {
     {
       schema: {
         operationId: "discover_session_credential_form",
-        description: "Discover a visible login form for a trusted session viewer handoff",
+        description: "Discover a visible form for a trusted session viewer handoff",
         tags: ["Sessions"],
-        summary: "Discover a credential form",
+        summary: "Discover a form",
       },
     },
     async (request: FastifyRequest<{ Params: { sessionId: string } }>, reply: FastifyReply) =>
@@ -151,9 +151,9 @@ async function routes(server: FastifyInstance) {
     {
       schema: {
         operationId: "fill_session_credential_form",
-        description: "Fill a previously discovered credential form without returning its values",
+        description: "Fill a previously discovered form without returning its values",
         tags: ["Sessions"],
-        summary: "Fill a credential form",
+        summary: "Fill a form",
         body: {
           type: "object",
           additionalProperties: false,

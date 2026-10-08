@@ -170,6 +170,30 @@ describe("casting viewport", () => {
     expect(nextApply).toHaveBeenCalledTimes(1);
   });
 
+  it("finishes page preparation before granting control and serializes disconnects", async () => {
+    const { viewport, client } = setup();
+    let finish!: () => void;
+    const first = client.acquire(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const rejected = expect(first).rejects.toThrow("control_lost");
+    await Promise.resolve();
+    expect(client.canControl()).toBe(false);
+    const closing = client.close();
+    const other = viewport.attach(vi.fn());
+    const prepareOther = vi.fn(async () => {});
+    const next = other.acquire(prepareOther);
+    expect(prepareOther).not.toHaveBeenCalled();
+    finish();
+    await Promise.all([rejected, closing, next]);
+    expect(prepareOther).toHaveBeenCalledOnce();
+    expect(client.canControl()).toBe(false);
+    expect(other.canControl()).toBe(true);
+  });
+
   it("keeps the queue usable after a failed browser update", async () => {
     const { client, notify, apply } = setup();
     await client.resize(request(), async () => {

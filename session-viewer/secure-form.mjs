@@ -85,9 +85,7 @@ export function validValues(fields, values) {
     Object.keys(values).some(
       (id) => !fields.some((field) => field.id === id),
     ) ||
-    !Object.values(values).some(
-      (value) => typeof value === "string" && value.length > 0,
-    )
+    !Object.keys(values).length
   )
     return false;
   return fields.every((field) => {

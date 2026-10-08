@@ -140,10 +140,16 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     });
   });
 
-  it("leaves unsupported required fields for the live browser", async () => {
+  it("includes additional required fields and leaves submission in the live browser", async () => {
     await load(
       `<form action="/done">${fields}<input required name="extra"><button>Log in</button></form>`,
     );
+    const target = await discoverCredentialForm(service);
+    expect(target.fields).toHaveLength(3);
+    expect(target.fields[2]).toMatchObject({ label: "extra", purpose: "field", required: true });
+    await expect(
+      fillCredentialForm(service, target, { values: { f0: "user", f1: "secret" } }),
+    ).rejects.toMatchObject({ statusCode: 400 });
     expect((await fill()).submitted).toBe(false);
     expect(page.url()).toBe(`${origin}/login`);
     expect(await getCredentialContinuation(service)).toMatchObject({
@@ -257,6 +263,24 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     expect((await fill()).submitted).toBe(true);
   });
 
+  it("keeps login submission available with optional checkboxes", async () => {
+    await load(`<form onsubmit="event.preventDefault();document.body.dataset.sent='yes'">${fields}
+      <label>Remember me<input type="checkbox"></label><button>Sign in</button></form>`);
+    const target = await discoverCredentialForm(service);
+    expect(target.kind).toBe("login");
+    expect(target.fields[2]).toMatchObject({ label: "Remember me", required: false });
+    expect(
+      await fillCredentialForm(service, target, {
+        values: { f0: "user", f1: "secret", f2: "1" },
+        submit: true,
+      }),
+    ).toEqual({ submitted: true });
+    expect(
+      await page.$eval('[type="checkbox"]', (input) => (input as HTMLInputElement).checked),
+    ).toBe(true);
+    expect(await page.evaluate(() => document.body.dataset.sent)).toBe("yes");
+  });
+
   it("revokes a receipt if any filled field changes identity or is cleared", async () => {
     await load(`<form onsubmit="event.preventDefault()">${fields}<button>Sign in</button></form>`);
     await fill();
@@ -295,13 +319,36 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     '<form><label>Coupon code<input name="code"></label><button>Apply</button></form>',
     '<form><label>Search<input name="search"></label><button>Search</button></form>',
     '<form><input name="email"><button>Next</button></form>',
-    '<form><input type="password"><button>Sign in</button></form><form><input type="password"><button>Sign in</button></form>',
-  ])("does not guess a sensitive destination in unrelated or ambiguous forms", async (body) => {
+  ])("fills general forms without classifying them as logins", async (body) => {
     await load(body);
-    // A generic /login route alone must not identify an unnamed field.
+    // Identifier fields without a sign-in context are general fields.
     if (body.includes('name="email"'))
       await page.evaluate(() => history.replaceState(null, "", "/form"));
+    const target = await discoverCredentialForm(service);
+    expect(target.kind).toBe("details");
+    expect(target.fields[0].purpose).toBe("field");
+    expect(
+      await fillCredentialForm(service, target, {
+        values: { f0: "test@example.test" },
+        submit: true,
+      }),
+    ).toEqual({ submitted: false });
+    expect(await page.$eval("input", (input) => input.value)).toBe("test@example.test");
+  });
+
+  it("requires focus to choose between multiple visible forms", async () => {
+    await load(
+      '<form><input name="search"><button>Search</button></form><form><input name="feedback"><button>Send</button></form>',
+    );
     await expect(discoverCredentialForm(service)).rejects.toMatchObject({ statusCode: 404 });
+    await page.focus('[name="feedback"]');
+    const target = await discoverCredentialForm(service);
+    expect(target.fields.map((field) => field.label)).toEqual(["feedback"]);
+    await fillCredentialForm(service, target, { values: { f0: "A suggestion" } });
+    expect(await page.$$eval("input", (inputs) => inputs.map((input) => input.value))).toEqual([
+      "",
+      "A suggestion",
+    ]);
   });
 
   it("rejects changed nodes and field semantics on the same URL before writing", async () => {
@@ -359,6 +406,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     });
     expect(target.kind).toBe("details");
     expect(target.fields.at(-1)?.options).toEqual([
+      { value: "0", label: "Choose country" },
       { value: "1", label: "United States" },
       { value: "2", label: "Canada" },
     ]);
@@ -410,5 +458,166 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
         () => document.querySelector("#host")!.shadowRoot!.querySelector("input")!.value,
       ),
     ).toBe("secret");
+  });
+
+  it("fills native text controls using page labels without exposing existing values", async () => {
+    await load(`<form onsubmit="event.preventDefault();document.body.dataset.sent='yes'">
+      <label>Subject<input name="subject" required value="private-subject"></label>
+      <label>Message<textarea required>private-message</textarea></label>
+      <span id="when">Appointment date</span><input type="date" aria-labelledby="when">
+      <input type="number" aria-label="Party size" min="1" max="12">
+      <input type="url" placeholder="Website">
+      <input type="search" name="query">
+      <input type="time" id="time">
+      <input>
+      <input disabled name="disabled"><input readonly name="readonly"><input type="hidden" name="hidden">
+      <button>Send</button></form>`);
+    const target = await discoverCredentialForm(service);
+    expect(target.kind).toBe("details");
+    expect(target.fields.map((field) => field.label)).toEqual([
+      "Subject",
+      "Message",
+      "Appointment date",
+      "Party size",
+      "Website",
+      "query",
+      "time",
+      "Field 8",
+    ]);
+    expect(target.fields[1].inputType).toBe("textarea");
+    expect(JSON.stringify(target)).not.toMatch(/private-subject|private-message/);
+    const values = [
+      "A question",
+      "First line\nSecond line",
+      "2026-10-09",
+      "3",
+      "https://example.test",
+      "find me",
+      "12:30",
+      "unnamed",
+    ];
+    expect(
+      await fillCredentialForm(service, target, {
+        values: Object.fromEntries(values.map((value, i) => [`f${i}`, value])),
+        submit: true,
+      }),
+    ).toEqual({ submitted: false });
+    expect(
+      await page.$$eval(
+        "input:not(:disabled):not([readonly]):not([type=hidden]), textarea",
+        (inputs) => inputs.map((input) => (input as HTMLInputElement).value),
+      ),
+    ).toEqual(values);
+    expect(await page.evaluate(() => document.body.dataset.sent)).toBeUndefined();
+  });
+
+  it("fills checkbox, radio, and multiple-select choices through field events", async () => {
+    await load(`<form>
+      <label>Accept terms<input type="checkbox" required></label>
+      <label>Updates<input type="checkbox" checked></label>
+      <fieldset><legend>Contact method</legend>
+        <label>Email<input type="radio" name="contact" value="private-email" required checked></label>
+        <label>Phone<input type="radio" name="contact" value="private-phone"></label>
+      </fieldset>
+      <label>Topics<select multiple required>
+        <option value="private-news" selected>News</option><option value="private-events">Events</option>
+        <optgroup disabled><option>Disabled</option></optgroup>
+      </select></label>
+      <button>Save</button></form>
+      <script>document.querySelector('form').addEventListener('change',()=>{
+        document.body.dataset.changes=String(Number(document.body.dataset.changes||0)+1);
+      }); document.querySelector('form').addEventListener('click',event=>{
+        if(event.target.matches('input')) document.body.dataset.clicks=String(Number(document.body.dataset.clicks||0)+1);
+      })</script>`);
+    const target = await discoverCredentialForm(service);
+    expect(target.fields.map((field) => field.label)).toEqual([
+      "Accept terms",
+      "Updates",
+      "Contact method",
+      "Topics: News",
+      "Topics: Events",
+    ]);
+    expect(JSON.stringify(target)).not.toContain("private-");
+    expect(target.fields[0].options).toEqual([{ value: "1", label: "Yes" }]);
+    expect(target.fields[2].options).toEqual([
+      { value: "0", label: "Email" },
+      { value: "1", label: "Phone" },
+    ]);
+    for (const values of [
+      { f0: "0", f1: "0", f2: "1", f3: "0", f4: "1" },
+      { f0: "1", f1: "0", f2: "2", f3: "0", f4: "1" },
+      { f0: "1", f1: "0", f2: "1", f3: "0", f4: "0" },
+    ]) {
+      await expect(fillCredentialForm(service, target, { values })).rejects.toMatchObject({
+        statusCode: 400,
+      });
+      expect(await page.evaluate(() => document.body.dataset.changes)).toBeUndefined();
+    }
+    expect(
+      await fillCredentialForm(service, target, {
+        values: { f0: "1", f1: "0", f2: "1", f3: "0", f4: "1" },
+      }),
+    ).toEqual({ submitted: false });
+    expect(await page.$$eval("input", (inputs) => inputs.map((input) => input.checked))).toEqual([
+      true,
+      false,
+      false,
+      true,
+    ]);
+    expect(
+      await page.$eval("select", (select) =>
+        Array.from(select.selectedOptions).map((option) => option.value),
+      ),
+    ).toEqual(["private-events"]);
+    expect(await page.evaluate(() => document.body.dataset.changes)).toBe("5");
+    expect(await page.evaluate(() => document.body.dataset.clicks)).toBe("3");
+    expect(await getCredentialContinuation(service)).toMatchObject({ kind: "details" });
+  });
+
+  it("clears optional fields and preserves omitted fields", async () => {
+    await load(
+      '<form><input name="clear" value="draft"><input name="keep" value="keep"><button>Save</button></form>',
+    );
+    const target = await discoverCredentialForm(service);
+    await fillCredentialForm(service, target, { values: { f0: "" } });
+    expect(await page.$$eval("input", (inputs) => inputs.map((input) => input.value))).toEqual([
+      "",
+      "keep",
+    ]);
+  });
+
+  it("binds externally associated controls and form-less fields", async () => {
+    for (const body of [
+      '<form id="feedback"><button>Send</button></form><label>Message<textarea form="feedback" required></textarea></label>',
+      "<div><label>Message<textarea required></textarea></label><button>Send</button></div>",
+    ]) {
+      await load(body);
+      const target = await discoverCredentialForm(service);
+      expect(target.fields).toMatchObject([{ label: "Message", inputType: "textarea" }]);
+      await fillCredentialForm(service, target, { values: { f0: "Feedback" } });
+      expect(await page.$eval("textarea", (input) => input.value)).toBe("Feedback");
+    }
+  });
+
+  it("rejects changed choice semantics before filling another field", async () => {
+    for (const mutation of ["multiple", "option", "required"] as const) {
+      await load(
+        '<form><input name="message"><select multiple><option>One</option><option>Two</option></select><button>Save</button></form>',
+      );
+      const target = await discoverCredentialForm(service);
+      await page.$eval(
+        "select",
+        (select, mutation) => {
+          if (mutation === "multiple") select.multiple = false;
+          if (mutation === "option") select.options[0].label = "Changed";
+          if (mutation === "required") select.required = true;
+        },
+        mutation,
+      );
+      await expect(
+        fillCredentialForm(service, target, { values: { f0: "Private", f1: "1" } }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(await page.$eval("input", (input) => input.value)).toBe("");
+    }
   });
 });

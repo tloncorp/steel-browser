@@ -1,6 +1,7 @@
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import type { Browser, CDPSession, Page } from "puppeteer-core";
+import type { CdpFrame } from "puppeteer-core/internal/cdp/Frame.js";
 import WebSocket, { type Server } from "ws";
 import { z } from "zod";
 import type { SessionService } from "../../services/session.service.js";
@@ -207,7 +208,37 @@ export async function handleCastSession(
       const message = envelope.parse(data);
       if (message.type === "control") {
         if (data.action === "acquire") {
-          await viewport?.acquire();
+          await viewport?.acquire(async () => {
+            const userAgent = request.headers["user-agent"];
+            if (
+              !page ||
+              closed ||
+              typeof userAgent !== "string" ||
+              !userAgent.trim() ||
+              userAgent.length > 2048
+            )
+              return;
+            // A fingerprint can pin an HTTP User-Agent independently of the CDP
+            // override. Puppeteer's CDP network manager holds those extra headers.
+            const headers = {
+              ...(
+                page.mainFrame() as unknown as CdpFrame
+              )._frameManager.networkManager.extraHTTPHeaders(),
+            };
+            const previousAgent =
+              headers["user-agent"] ?? (await page.evaluate(() => navigator.userAgent));
+            if (closed) return;
+            delete headers["user-agent"];
+            await page.setExtraHTTPHeaders(headers);
+            await page.setUserAgent(userAgent);
+            if (previousAgent !== userAgent && !closed) {
+              frameReady = false;
+              viewportGeneration++;
+              frames.clear();
+              await input.reset();
+              await page.reload({ waitUntil: "domcontentloaded", timeout: 15_000 });
+            }
+          });
           if (closed) await viewport?.close();
         } else if (data.action === "release") {
           viewport?.assertControl(message.generation);
