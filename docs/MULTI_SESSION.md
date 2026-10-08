@@ -72,6 +72,13 @@ disconnection, and link expiry cancel held contacts, mouse buttons, keys, and un
 A reconnect obtains fresh control and frame state without replaying input. Viewer arbitration is
 page-scoped; agent and direct CDP access operate independently.
 
+When a viewer takes control, its WebSocket `User-Agent` header becomes the remote tab's HTTP
+user agent and `navigator.userAgent`. A changed user agent reloads the current page so its next
+request uses the viewer's identity. Reconnecting with the same user agent does not reload. This
+does not change the viewport. The tab keeps that user agent after the viewer disconnects;
+a new controlling viewer supplies its own. Watching a tab does not change its user agent. This
+changes the reported user agent, not Chrome's browser engine or the rest of its device fingerprint.
+
 The public gateway supplies the verified capability deadline to the casting service. An open viewer
 connection closes at that deadline or the session deadline, whichever comes first. Secure form fills
 also recheck their deadline after reading the request body and before dispatching to the browser.

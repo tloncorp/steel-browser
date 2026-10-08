@@ -30,6 +30,8 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
   let pageId: string;
   const sessionId = "11111111-1111-4111-8111-111111111111";
   const errors: string[] = [];
+  const upgradeAgents: (string | undefined)[] = [];
+  const documentAgents: (string | undefined)[] = [];
   const session = { id: sessionId, status: "live", dimensions: { width: 1920, height: 1080 } };
   const sessionRuntime = { getBrowserInstance: () => browser };
 
@@ -42,7 +44,16 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     wss = new WebSocketServer({ noServer: true });
     server = createServer(async (request, response) => {
       response.setHeader("content-type", "text/html");
-      if (request.url === "/fixture") {
+      if (request.url === "/request-info") {
+        response.setHeader("content-type", "application/json");
+        response.end(
+          JSON.stringify({
+            userAgent: request.headers["user-agent"],
+            marker: request.headers["x-viewer-test"],
+          }),
+        );
+      } else if (request.url === "/fixture") {
+        documentAgents.push(request.headers["user-agent"]);
         response.end(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
           <title>Responsive test page</title><style>
           body { margin:0; font:20px sans-serif; background:#f2f4f8; min-height:2400px; }
@@ -102,6 +113,7 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
       }
     });
     server.on("upgrade", (request, socket, head) => {
+      upgradeAgents.push(request.headers["user-agent"]);
       void handleCastSession(
         request,
         socket,
@@ -160,14 +172,19 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     vi.restoreAllMocks();
   });
 
-  async function viewer(width: number, height: number, route = "/") {
+  async function viewer(width: number, height: number, route = "/", userAgent?: string) {
     const viewerBrowser = await puppeteer.launch({
       executablePath,
       headless: true,
-      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+      args: [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        ...(userAgent ? [`--user-agent=${userAgent}`] : []),
+      ],
     });
     viewerBrowsers.push(viewerBrowser);
     const page = await viewerBrowser.newPage();
+    if (userAgent) await page.setUserAgent(userAgent);
     page.setDefaultTimeout(5000);
     await page.setViewport({ width, height, deviceScaleFactor: 3, hasTouch: true });
     page.on("pageerror", (error) => errors.push(String(error)));
@@ -244,6 +261,49 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
     await cdp.detach();
   }
+
+  it("uses the controlling viewer user agent and reloads only when it changes", async () => {
+    const phoneAgent =
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1";
+    const secondAgent = "ViewerDesktop/1.0";
+    await target.setExtraHTTPHeaders({
+      "user-agent": "SessionAgent/1.0",
+      "x-viewer-test": "preserved",
+    });
+    await target.goto(`${origin}/fixture`);
+    const loads = Number(await target.evaluate(() => sessionStorage.loads));
+    const phone = await viewer(390, 844, "/native", phoneAgent);
+    await ready(phone);
+    expect(upgradeAgents.at(-1)).toBe(phoneAgent);
+    await expect.poll(() => target.evaluate(() => navigator.userAgent)).toBe(phoneAgent);
+    expect(Number(await target.evaluate(() => sessionStorage.loads))).toBe(loads + 1);
+    expect(documentAgents.at(-1)).toBe(phoneAgent);
+    expect(await target.$eval("#draft", (el) => (el as HTMLInputElement).value)).toBe(
+      "Unsent login text",
+    );
+    const outgoing = () =>
+      target.evaluate(async () => (await fetch("/request-info", { method: "POST" })).json());
+    expect(await outgoing()).toEqual({ userAgent: phoneAgent, marker: "preserved" });
+
+    const watching = await viewer(800, 900, "/native", secondAgent);
+    await watching.waitForFunction(
+      () => document.querySelector("#control")?.textContent === "Take control",
+    );
+    expect(await outgoing()).toEqual({ userAgent: phoneAgent, marker: "preserved" });
+    await phone.close();
+    await ready(watching);
+    expect(await outgoing()).toEqual({ userAgent: secondAgent, marker: "preserved" });
+    expect(Number(await target.evaluate(() => sessionStorage.loads))).toBe(loads + 2);
+    await watching.close();
+    const reconnected = await viewer(800, 900, "/native", secondAgent);
+    await ready(reconnected);
+    expect(Number(await target.evaluate(() => sessionStorage.loads))).toBe(loads + 2);
+    await reconnected.close();
+    // The tab keeps the adopted identity when the bot resumes it.
+    expect(await outgoing()).toEqual({ userAgent: secondAgent, marker: "preserved" });
+    await target.setExtraHTTPHeaders({});
+    await target.setUserAgent(await browser.userAgent());
+  });
 
   it("keeps the live agent viewport, zooms locally, bridges native input and restores Agent View", async () => {
     await target.setViewport({ width: 1440, height: 900 });
@@ -419,7 +479,9 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     await ready(phone);
     const barHeight = await phone.$eval("header", (el) => el.getBoundingClientRect().height);
     await expect.poll(() => target.evaluate(() => innerHeight)).toBe(600 - barHeight);
-    expect(await phone.$eval("#stage", (el) => el.getBoundingClientRect().top)).toBe(130 + barHeight);
+    expect(await phone.$eval("#stage", (el) => el.getBoundingClientRect().top)).toBe(
+      130 + barHeight,
+    );
     expect(await target.evaluate(() => sessionStorage.loads)).toBe(mobileLoads);
     await command({ type: "browserControls", visible: false });
     await ready(phone);
