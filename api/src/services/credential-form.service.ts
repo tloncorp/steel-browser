@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { recordBrowserForm, recordBrowserFill, recordBrowserFillFailure } from "./browser-monitor.service.js";
+import {
+  recordBrowserForm,
+  recordBrowserFill,
+  recordBrowserFillFailure,
+} from "./browser-monitor.service.js";
 import type { CDPSession, ElementHandle, Frame, JSHandle, Page } from "puppeteer-core";
 import type { CDPService } from "./cdp/cdp.service.js";
 import { secureFieldDefinitions, type SecureFormField } from "./secure-form-fields.js";
@@ -80,12 +84,24 @@ export async function getCredentialContinuation(
                   "required",
                   "pattern",
                   "form",
+                  "multiple",
+                  "min",
+                  "max",
+                  "step",
                 ].map((name) => input.getAttribute(name)),
               ) === attributes,
           ) &&
           form.fields
             .filter((field) => filledIds.includes(field.descriptor.id))
-            .every((field) => field.inputs.every((input) => input.value.length > 0)),
+            .every(
+              (field) =>
+                field.choice ||
+                field.inputs.every((input) =>
+                  input instanceof HTMLSelectElement
+                    ? input.selectedIndex >= 0
+                    : input.value.length > 0,
+                ),
+            ),
         state.receipt,
         state.filledIds,
       )
@@ -208,9 +224,15 @@ function httpOrigin(rawUrl: string): string | undefined {
   }
 }
 
-type BoundField = { descriptor: SecureFormField; inputs: FormControl[] };
+type BoundField = {
+  descriptor: SecureFormField;
+  inputs: FormControl[];
+  choice?: "checkbox" | "radio" | "option";
+  optionIndex?: number;
+};
 type BoundForm = {
   kind: "login" | "details";
+  focused: boolean;
   fields: BoundField[];
   controls: Array<{
     input: FormControl;
@@ -236,6 +258,8 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
       ...(element.shadowRoot ? all(element.shadowRoot) : []),
     ]);
   const elements = all(document);
+  let active = document.activeElement;
+  while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
   const visible = (input: FormControl) => {
     const style = getComputedStyle(input);
     const rect = input.getBoundingClientRect();
@@ -250,6 +274,14 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
       !input.closest('[inert], [aria-hidden="true"]')
     );
   };
+  const labelText = (element: Element | null) => {
+    if (!element || element.matches("input, textarea, select, script, style")) return "";
+    const copy = element.cloneNode(true) as Element;
+    copy
+      .querySelectorAll("input, textarea, select, script, style")
+      .forEach((child) => child.remove());
+    return copy.textContent || "";
+  };
   const text = (input: FormControl) =>
     [
       input.name,
@@ -260,6 +292,28 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
     ]
       .map((value) => value.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_-]/g, " "))
       .join(" ");
+  const label = (input: FormControl) => {
+    const root = input.getRootNode() as Document | ShadowRoot;
+    const labelledBy = (input.getAttribute("aria-labelledby") || "")
+      .split(/\s+/)
+      .map((id) => labelText(root.getElementById(id)))
+      .join(" ")
+      .trim();
+    return (
+      labelledBy ||
+      input.getAttribute("aria-label") ||
+      Array.from(input.labels || [])
+        .map(labelText)
+        .join(" ")
+        .trim() ||
+      input.getAttribute("placeholder") ||
+      input.name ||
+      input.id ||
+      ""
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+  };
   const otpWords = new RegExp(
     definitions.find((field) => field.purpose === "one-time-code")!.pattern!,
     "i",
@@ -269,9 +323,9 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
     .filter(
       (element): element is FormControl =>
         (element instanceof HTMLInputElement &&
-          ["text", "email", "tel", "password", "number", "month"].includes(element.type)) ||
+          !["hidden", "file", "button", "submit", "reset", "image"].includes(element.type)) ||
         element instanceof HTMLTextAreaElement ||
-        (element instanceof HTMLSelectElement && !element.multiple),
+        element instanceof HTMLSelectElement,
     )
     .filter(visible);
   const groups = new Map<Element, FormControl[]>();
@@ -348,7 +402,69 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
         split.some((input) => explicitPurpose(input)?.purpose === "one-time-code"));
     const fields: BoundField[] = [];
     for (const input of group) {
+      if (fields.some((field) => field.inputs.includes(input))) continue;
       if (splitCode && split.includes(input as HTMLInputElement) && input !== split[0]) continue;
+      const fieldLabel = label(input) || `Field ${fields.length + 1}`;
+      const yesNo = [
+        { value: "0", label: "No" },
+        { value: "1", label: "Yes" },
+      ];
+      if (input instanceof HTMLInputElement && ["checkbox", "radio"].includes(input.type)) {
+        const radio = input.type === "radio";
+        const choices =
+          radio && input.name
+            ? group.filter(
+                (other) =>
+                  other instanceof HTMLInputElement &&
+                  other.type === "radio" &&
+                  other.name === input.name &&
+                  other.form === input.form &&
+                  other.getRootNode() === input.getRootNode(),
+              )
+            : [input];
+        const required = choices.some((choice) => choice.required);
+        const legend = labelText(input.closest("fieldset")?.querySelector("legend") || null).trim();
+        fields.push({
+          inputs: choices,
+          choice: radio ? "radio" : "checkbox",
+          descriptor: {
+            id: `f${fields.length}`,
+            purpose: "field",
+            label: (radio ? legend || input.name || fieldLabel : fieldLabel).slice(0, 256),
+            inputType: "select",
+            required,
+            options: radio
+              ? choices.map((choice, index) => ({
+                  value: String(index),
+                  label: (label(choice) || `Option ${index + 1}`).slice(0, 256),
+                }))
+              : required
+              ? [yesNo[1]]
+              : yesNo,
+          },
+        });
+        continue;
+      }
+      if (input instanceof HTMLSelectElement && input.multiple) {
+        // Each option is an independent choice in the string-valued handoff contract.
+        Array.from(input.options).forEach((option, optionIndex) => {
+          if (option.disabled || option.parentElement?.matches("optgroup[disabled]")) return;
+          fields.push({
+            inputs: [input],
+            choice: "option",
+            optionIndex,
+            descriptor: {
+              id: `f${fields.length}`,
+              purpose: "field",
+              label: `${fieldLabel}: ${option.label}`.slice(0, 256),
+              inputType: "select",
+              required: false,
+              options: yesNo,
+            },
+          });
+        });
+        continue;
+      }
       let definition = explicitPurpose(input);
       if (!definition && splitCode && input === split[0])
         definition = definitions.find((field) => field.purpose === "one-time-code");
@@ -384,10 +500,10 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
         if (textInputs.length === 1 && textInputs[0] === input)
           definition = definitions.find((field) => field.purpose === "username");
       }
-      if (!definition) continue;
       if (
         !hasDetails &&
         (hasLoginContext || passwords.length) &&
+        definition &&
         ["email", "tel"].includes(definition.purpose)
       )
         definition = definitions.find((field) => field.purpose === "username")!;
@@ -398,13 +514,10 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
         ? "Billing: "
         : "";
       const fieldInputs: FormControl[] = splitCode && input === split[0] ? split : [input];
-      const isLoginField = ["username", "current-password", "one-time-code"].includes(
-        definition.purpose,
-      );
       const maxLength =
         "maxLength" in input && input.maxLength > 0 ? Math.min(input.maxLength, 4096) : undefined;
       const codeLength =
-        definition.purpose === "one-time-code"
+        definition?.purpose === "one-time-code"
           ? splitCode
             ? split.length
             : maxLength && maxLength <= 12
@@ -415,7 +528,7 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
         input instanceof HTMLSelectElement
           ? Array.from(input.options).flatMap((option, index) =>
               option.disabled ||
-              !option.value ||
+              (input.required && !option.value) ||
               option.parentElement?.matches("optgroup[disabled]")
                 ? []
                 : [{ value: String(index), label: option.label.slice(0, 256) }],
@@ -426,14 +539,18 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
         inputs: fieldInputs,
         descriptor: {
           id: `f${fields.length}`,
-          purpose: definition.purpose,
-          label: section + definition.label,
+          purpose: definition?.purpose || "field",
+          label: (section + (label(input) || definition?.label || fieldLabel)).slice(0, 256),
           inputType: options
             ? "select"
             : input instanceof HTMLTextAreaElement
             ? "textarea"
-            : definition.inputType,
-          required: input.required || isLoginField,
+            : definition?.inputType ||
+              (input instanceof HTMLInputElement &&
+              ["password", "email", "tel"].includes(input.type)
+                ? (input.type as "password" | "email" | "tel")
+                : "text"),
+          required: input.required,
           ...(maxLength && !splitCode ? { maxLength } : {}),
           ...(codeLength ? { exactLength: codeLength } : {}),
           ...(options ? { options } : {}),
@@ -441,8 +558,12 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
       });
     }
     if (!fields.length || fields.length > 40) continue;
-    const purposes = fields.map((field) => field.descriptor.purpose);
+    // Optional checkboxes (such as Remember me) do not change a login's purpose.
+    const purposes = fields
+      .filter((field) => field.choice !== "checkbox" || field.descriptor.required)
+      .map((field) => field.descriptor.purpose);
     const login =
+      purposes.length > 0 &&
       purposes.every((purpose) =>
         ["username", "current-password", "one-time-code"].includes(purpose),
       ) &&
@@ -451,20 +572,36 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
       (hasLoginContext ||
         purposes.includes("current-password") ||
         purposes.includes("one-time-code"));
-    if (login && new Set(purposes).size !== purposes.length) continue;
-    if (!login && !hasDetails && !purposes.includes("new-password")) continue;
     // Unsupported required controls keep submission in the live browser.
-    const unsupportedRequired = group.some(
-      (input) => input.required && !fields.some((field) => field.inputs.includes(input)),
+    const unsupportedRequired = elements.some(
+      (input) =>
+        (input instanceof HTMLInputElement ||
+          input instanceof HTMLSelectElement ||
+          input instanceof HTMLTextAreaElement) &&
+        (input.form === scope || (!input.form && scope.contains(input))) &&
+        visible(input) &&
+        input.required &&
+        !fields.some((field) => field.inputs.includes(input)),
     );
     const controls = fields.flatMap((field) =>
       field.inputs.map((input) => ({
         input,
         form: input.form,
         attributes: JSON.stringify(
-          ["type", "name", "id", "autocomplete", "maxlength", "required", "pattern", "form"].map(
-            (name) => input.getAttribute(name),
-          ),
+          [
+            "type",
+            "name",
+            "id",
+            "autocomplete",
+            "maxlength",
+            "required",
+            "pattern",
+            "form",
+            "multiple",
+            "min",
+            "max",
+            "step",
+          ].map((name) => input.getAttribute(name)),
         ),
         action: input.form?.action,
         options:
@@ -480,9 +617,23 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
             : undefined,
       })),
     );
-    matches.push({ kind: login && !unsupportedRequired ? "login" : "details", fields, controls });
+    const kind =
+      login && !unsupportedRequired && new Set(purposes).size === purposes.length
+        ? "login"
+        : "details";
+    if (kind === "login")
+      fields.forEach((field) => {
+        if (!field.choice) field.descriptor.required = true;
+      });
+    matches.push({
+      kind,
+      focused: !!active && (group.includes(active as FormControl) || scope.contains(active)),
+      fields,
+      controls,
+    });
   }
-  return matches.length === 1 ? matches[0] : null;
+  const focused = matches.filter((form) => form.focused);
+  return focused.length === 1 ? focused[0] : matches.length === 1 ? matches[0] : null;
 }
 
 async function releaseForm(cdpService: CDPService) {
@@ -500,6 +651,7 @@ async function discoverBoundForm(cdpService: CDPService): Promise<CredentialForm
       frame: Frame;
       handle: JSHandle<BoundForm>;
       kind: "login" | "details";
+      focused: boolean;
       fields: SecureFormField[];
     }> = [];
     for (const frame of page.frames()) {
@@ -526,18 +678,29 @@ async function discoverBoundForm(cdpService: CDPService): Promise<CredentialForm
       const metadata = await handle
         .evaluate(
           (form) =>
-            form && { kind: form.kind, fields: form.fields.map((field) => field.descriptor) },
+            form && {
+              kind: form.kind,
+              focused: form.focused,
+              fields: form.fields.map((field) => field.descriptor),
+            },
         )
         .catch(() => undefined);
       if (metadata) candidates.push({ frame, handle: handle as JSHandle<BoundForm>, ...metadata });
       else await handle.dispose();
     }
-    if (candidates.length !== 1) {
+    const focused = candidates.filter((candidate) => candidate.focused);
+    const selected = focused.length === 1 ? focused : candidates;
+    if (selected.length !== 1) {
       await Promise.all(candidates.map((candidate) => candidate.handle.dispose()));
       if (candidates.length > 1) break;
       continue;
     }
-    const { frame, handle, fields, kind } = candidates[0];
+    await Promise.all(
+      candidates
+        .filter((candidate) => candidate !== selected[0])
+        .map((candidate) => candidate.handle.dispose()),
+    );
+    const { frame, handle, fields, kind } = selected[0];
     const previous = forms.get(cdpService);
     const same =
       previous?.frame === frame &&
@@ -606,7 +769,7 @@ async function fillBoundForm(
     typeof values !== "object" ||
     Array.isArray(values) ||
     Object.keys(values).some((id) => !fields.some((field) => field.id === id)) ||
-    !Object.values(values).some((value) => typeof value === "string" && value.length > 0)
+    !Object.keys(values).length
   ) {
     throw new CredentialFormError("The submitted fields do not match this form.", 400);
   }
@@ -624,6 +787,25 @@ async function fillBoundForm(
     )
       throw new CredentialFormError("A field does not match the form's requirements.", 400);
   }
+  const choicesValid = await located.handle
+    .evaluate(
+      (form, values) =>
+        form.fields.every(
+          (field) =>
+            field.choice !== "option" ||
+            !field.inputs[0].required ||
+            form.fields.some(
+              (other) =>
+                other.choice === "option" &&
+                other.inputs[0] === field.inputs[0] &&
+                values[other.descriptor.id] === "1",
+            ),
+        ),
+      values,
+    )
+    .catch(() => false);
+  if (!choicesValid)
+    throw new CredentialFormError("Select at least one option in each required field.", 400);
   await clearContinuation(cdpService);
   const anchorHandle = await located.handle
     .evaluateHandle(
@@ -654,6 +836,10 @@ async function fillBoundForm(
                   "required",
                   "pattern",
                   "form",
+                  "multiple",
+                  "min",
+                  "max",
+                  "step",
                 ].map((name) => input.getAttribute(name)),
               ) === attributes &&
               (!(input instanceof HTMLSelectElement) ||
@@ -671,13 +857,32 @@ async function fillBoundForm(
         let anchor: FormControl | null = null;
         for (const field of form.fields) {
           const value = values[field.descriptor.id];
-          if (value === undefined || value === "") continue;
+          if (value === undefined) continue;
+          if (value === "" && field.descriptor.options) continue;
           for (const [index, input] of field.inputs.entries()) {
             // Event handlers can replace another field synchronously. Stop before
             // delivering any value to a replacement or a different destination.
             if (!valid()) return null;
+            if (field.choice === "radio" && index !== Number(value)) continue;
             input.focus();
-            if (input instanceof HTMLSelectElement) {
+            if (!valid()) return null;
+            if (field.choice === "checkbox" || field.choice === "radio") {
+              // Checkbox/radio change handlers in controlled forms listen for clicks.
+              const control = input as HTMLInputElement;
+              const checked = field.choice === "radio" || value === "1";
+              if (control.checked !== checked) control.click();
+              if (control.checked !== checked) return null;
+              input.blur();
+              anchor = input;
+              continue;
+            } else if (field.choice === "option" && input instanceof HTMLSelectElement) {
+              const setter = Object.getOwnPropertyDescriptor(
+                HTMLOptionElement.prototype,
+                "selected",
+              )?.set;
+              if (!setter) return null;
+              setter.call(input.options[field.optionIndex!], value === "1");
+            } else if (input instanceof HTMLSelectElement) {
               const setter = Object.getOwnPropertyDescriptor(
                 HTMLSelectElement.prototype,
                 "selectedIndex",

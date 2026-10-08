@@ -77,6 +77,14 @@ connection closes at that deadline or the session deadline, whichever comes firs
 also recheck their deadline after reading the request body and before dispatching to the browser.
 Deploy the API and viewer template together: the input protocol requires matching versions.
 
+Secure form handoffs discover visible, editable native controls without requiring login or autofill
+semantics. Field labels come from the page's accessible labels, placeholders, or names; discovery
+does not return existing input values. Text fields and textareas retain their labels and required
+status. Radio groups appear as choices, while checkboxes and individual multiple-select options
+appear as Yes/No choices. A focused form takes precedence when a page has several forms; without
+focus, discovery requires one unambiguous form. General forms fill without submitting. Login forms
+can submit when explicitly requested. File uploads and custom widgets require the live browser.
+
 Run the input, viewport, and public-gateway browser checks with a local Chrome:
 
 ```sh

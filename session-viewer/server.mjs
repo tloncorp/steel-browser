@@ -466,7 +466,7 @@ export function createGateway(config) {
         if (!discovered.response.ok) {
           return sendCredentialJson(response, discovered.response.status, {
             error:
-              discovered.body?.error ?? "No live credential form is available.",
+              discovered.body?.error ?? "No live form is available.",
           });
         }
         const { formId, pageId, frameUrl, origin, kind } =

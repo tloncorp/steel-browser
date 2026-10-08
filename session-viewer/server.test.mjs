@@ -440,6 +440,43 @@ test("a new discovery invalidates an earlier public fill handle", async (context
   assert.equal(gateway.posted.length, 0);
 });
 
+test("general form labels and choices pass through without values or submission authorization", async (context) => {
+  const gateway = await secureGateway(
+    context,
+    [
+      secureField("field", "f0", { label: "Message", inputType: "textarea" }),
+      secureField("field", "f1", {
+        label: "Updates",
+        inputType: "select",
+        options: [
+          { value: "0", label: "No" },
+          { value: "1", label: "Yes" },
+        ],
+        value: "private-existing-value",
+      }),
+    ],
+    "details",
+  );
+  const handoff = await (await gateway.discover()).json();
+  assert.equal(handoff.fields[0].label, "Message");
+  assert.deepEqual(handoff.fields[1].options, [
+    { value: "0", label: "No" },
+    { value: "1", label: "Yes" },
+  ]);
+  assert.ok(!JSON.stringify(handoff).includes("private-existing-value"));
+  assert.equal(
+    (
+      await gateway.fill(handoff.handoffId, {
+        values: { f0: "A request", f1: "0" },
+        submit: true,
+      })
+    ).status,
+    200,
+  );
+  assert.deepEqual(gateway.posted[0].values, { f0: "A request", f1: "0" });
+  assert.equal(gateway.posted[0].submit, false);
+});
+
 test("an uncertain upstream failure consumes the handle and never echoes its body", async (context) => {
   const gateway = await secureGateway(
     context,
