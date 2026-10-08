@@ -175,6 +175,13 @@ export class CastingInput {
               : undefined;
           await this.send("Input.dispatchKeyEvent", {
             ...params,
+            // CDP on macOS needs an editing command as well as the key event.
+            ...(process.platform === "darwin" &&
+            event.type === "keyDown" &&
+            event.key.toLowerCase() === "a" &&
+            event.modifiers & 4
+              ? { commands: ["selectAll"] }
+              : {}),
             ...(event.type === "keyDown" && text ? { text } : {}),
           });
           break;

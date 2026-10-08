@@ -115,6 +115,15 @@ export async function handleCastSession(
         throw new ViewerInputError("waiting_for_frame");
       return bounds;
     };
+    const readAgent = async () => {
+      if (!client || !page) throw new ViewerInputError("session_expired");
+      const metrics = await client.send("Page.getLayoutMetrics");
+      return {
+        width: metrics.cssLayoutViewport.clientWidth,
+        height: metrics.cssLayoutViewport.clientHeight,
+        mobile: page.viewport()?.isMobile ?? session.deviceConfig?.device === "mobile",
+      };
+    };
     const input = new CastingInput(async (method, parameters) => {
       if (!client) throw new ViewerInputError("session_expired");
       return client.send(method as Parameters<CDPSession["send"]>[0], parameters);
@@ -219,26 +228,30 @@ export async function handleCastSession(
         viewportGeneration++;
         frames.clear();
         await input.reset();
-        await viewport?.resize(data, async (next, reload) => {
-          if (!client || !page || closed) throw new ViewerInputError("session_expired");
-          expected = { width: next.width, height: next.height };
-          await client.send("Emulation.setDeviceMetricsOverride", {
-            ...expected,
-            screenWidth: next.width,
-            screenHeight: next.height,
-            mobile: next.mobile,
-            deviceScaleFactor: 1,
-            screenOrientation:
-              next.width > next.height
-                ? { angle: 90, type: "landscapePrimary" }
-                : { angle: 0, type: "portraitPrimary" },
-          });
-          await client.send("Emulation.setTouchEmulationEnabled", {
-            enabled: true,
-            maxTouchPoints: 1,
-          });
-          if (reload) await page.reload({ waitUntil: "domcontentloaded", timeout: 15_000 });
-        });
+        await viewport?.resize(
+          data,
+          async (next, reload) => {
+            if (!client || !page || closed) throw new ViewerInputError("session_expired");
+            expected = { width: next.width, height: next.height };
+            await client.send("Emulation.setDeviceMetricsOverride", {
+              ...expected,
+              screenWidth: next.width,
+              screenHeight: next.height,
+              mobile: next.mobile,
+              deviceScaleFactor: 1,
+              screenOrientation:
+                next.width > next.height
+                  ? { angle: 90, type: "landscapePrimary" }
+                  : { angle: 0, type: "portraitPrimary" },
+            });
+            await client.send("Emulation.setTouchEmulationEnabled", {
+              enabled: next.mobile,
+              maxTouchPoints: 1,
+            });
+            if (reload) await page.reload({ waitUntil: "domcontentloaded", timeout: 15_000 });
+          },
+          readAgent,
+        );
         await client.send("Page.stopScreencast");
         await client.send("Page.startScreencast", {
           format: "jpeg",
@@ -384,7 +397,7 @@ export async function handleCastSession(
         expected = { width: initial.width, height: initial.height };
         viewport = getPageViewport(runtime, pageId, {
           ...initial,
-          mobile: session.deviceConfig?.device === "mobile",
+          mobile: page.viewport()?.isMobile ?? session.deviceConfig?.device === "mobile",
         }).attach((message) => {
           send({
             ...message,
@@ -394,6 +407,17 @@ export async function handleCastSession(
           publishControl();
         }, reset);
         client.on("Page.screencastFrame", async ({ data, sessionId, metadata }) => {
+          if (
+            viewport?.mode() === "agent" &&
+            (metadata.deviceWidth !== expected.width || metadata.deviceHeight !== expected.height)
+          ) {
+            expected = { width: metadata.deviceWidth, height: metadata.deviceHeight };
+            frameReady = false;
+            viewportGeneration++;
+            frames.clear();
+            await input.reset();
+            publishControl();
+          }
           const generation = viewport?.snapshot().generation ?? 0;
           const epoch = viewportGeneration;
           await client?.send("Page.screencastFrameAck", { sessionId }).catch(() => {});
@@ -435,6 +459,38 @@ export async function handleCastSession(
         detachListeners = () => {
           page?.off("close", pageClosed);
         };
+        // Chrome can retain the last capture surface after another CDP client
+        // changes emulation metrics. Restart capture on an agent resize instead
+        // of relying on a new screencast frame to announce the new geometry.
+        let resizeQueued = false;
+        client.on("Page.frameResized", () => {
+          if (closed || resizeQueued) return;
+          resizeQueued = true;
+          const operation = messageQueue.then(async () => {
+            resizeQueued = false;
+            if (closed || !client || viewport?.mode() !== "agent") return;
+            const next = await readAgent();
+            if (next.width === expected.width && next.height === expected.height) return;
+            expected = { width: next.width, height: next.height };
+            frameReady = false;
+            viewportGeneration++;
+            frames.clear();
+            await input.reset();
+            await client.send("Page.stopScreencast");
+            await client.send("Page.startScreencast", {
+              format: "jpeg",
+              quality: 75,
+              maxWidth: 2560,
+              maxHeight: 1600,
+            });
+            publishControl();
+          });
+          messageQueue = operation.catch(() => {
+            send({ type: "inputError", code: "session_expired" });
+            ws.close(4001, "Browser unavailable");
+          });
+        });
+        await client.send("Page.enable");
         await client.send("Page.startScreencast", {
           format: "jpeg",
           quality: 75,

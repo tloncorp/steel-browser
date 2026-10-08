@@ -27,6 +27,26 @@ describe("casting viewport", () => {
     expect(getPageViewport(second, "page", initial)).not.toBe(viewport);
   });
 
+  it("does not mutate Agent View and recovers if reading its current viewport fails", async () => {
+    const { client, apply, notify } = setup();
+    await client.resize(request({ mode: "agent" }), apply, async () => {
+      throw new Error("closed page");
+    });
+    expect(notify).toHaveBeenCalledWith({
+      type: "viewportError",
+      message: "Could not read the agent viewport.",
+    });
+    const read = async () => ({ width: 1600, height: 1000, mobile: false });
+    await client.resize(request({ mode: "agent" }), apply, read);
+    expect(apply).not.toHaveBeenCalled();
+    await client.resize(request({ mode: "mobile", reload: true }), apply, read);
+    await client.resize(request({ mode: "agent", reload: true }), apply, read);
+    expect(apply).toHaveBeenLastCalledWith(
+      { mode: "agent", width: 1600, height: 1000, mobile: false },
+      true,
+    );
+  });
+
   it("uses exact phone dimensions for a mobile session without a reload", async () => {
     const viewport = new PageViewport({ width: 508, height: 1074, mobile: true });
     const apply = vi.fn(async () => {});

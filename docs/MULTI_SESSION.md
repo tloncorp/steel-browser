@@ -58,7 +58,7 @@ use this browser's full concurrency.
 
 The session viewer turns finger swipes into scrolling and taps into clicks. A mouse supports
 held dragging and wheel scrolling. The toolbar keeps back, forward, address, keyboard, layout,
-and browser options on one row. The screen icon selects Auto, Mobile, or Desktop layout;
+and browser options on one row. The screen icon selects Agent View (default), Auto, Mobile, or Desktop layout;
 browser options contain tabs, reload, and viewer control.
 
 To enter text, tap the browser field, then tap the keyboard icon. The keyboard panel displays
@@ -89,3 +89,43 @@ text entry with the software keyboard, composition, deletion,
 paste, rotation during a gesture, and return from backgrounding. Verify input against the same
 browser page after reconnecting. The Chrome tests use harmless page and cross-origin iframe
 fixtures; a live challenge requires separate manual verification.
+
+### Tlon native viewer
+
+Tlon embeds the same viewer with floating native Close, keyboard, paste, and
+Browser options controls. The options menu selects **Agent View** (default) or
+**Mobile View**. Agent View leaves the live browser viewport unchanged, including
+agent-initiated resizes. Pinch zoom and panning affect only the streamed image.
+In Agent View, double-tapping while zoomed in resets the image to its centered,
+default scale without clicking the remote page. Single taps while zoomed wait
+300 ms to distinguish the reset gesture;
+taps and scrolling still use the ordered viewer input protocol. Mobile View
+explicitly changes the shared page's viewport and mobile emulation. Switching
+emulation asks before reloading; Agent View restores the viewport captured before
+the switch. In the native viewer, Mobile View reserves the safe area and control
+rows above and below the page on a dark background, and uses the remaining area
+for the remote viewport. Agent View remains edge-to-edge. Keyboard presentation
+does not resize the remote page.
+
+The native options menu also offers **Show browser controls**, off by default for
+each new viewer. It reveals the existing Back, Forward, address field, and browser
+menu below the native controls. Native keyboard and layout controls remain in the
+app. The toolbar can be shown in either view; Agent View retains the remote
+viewport, while Mobile View fits the space below the toolbar.
+
+The `tlonBrowserInput` native bridge accepts versioned keyboard, paste, layout, insets,
+`browserControls` (`visible: boolean`), and status commands. Input status includes
+`browserControlsVisible`; clients disable the toggle when an older viewer omits
+that capability. Its context changes with connection/control/frame epochs;
+clipboard content never appears in status messages. Native layout confirmation
+and paste must use the latest context. The standalone web toolbar and dashboard
+clipboard bridge remain available outside the React Native WebView.
+
+For deployment, build the `steel-browser` API image from the branch containing
+both the streamed-input changes and this native integration. The API build copies
+all viewer templates, including the native-input and gesture partials. This native
+integration adds no environment variables, migrations, or new public endpoints;
+it does not change the `steel-mcp` or `session-viewer` images. A deployment that
+predates the streamed-input changes must also include their matching gateway
+changes. The Tlon native controls require the separate client update; standalone
+viewer links remain usable while that client update is pending.

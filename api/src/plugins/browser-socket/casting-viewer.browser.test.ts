@@ -48,9 +48,10 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
           body { margin:0; font:20px sans-serif; background:#f2f4f8; min-height:2400px; }
           header { background:#17385d; color:white; padding:24px; }
           button,input { font:20px sans-serif; margin:20px; padding:12px; }
-          #layout:after {content:'Desktop';} @media(max-width:600px) {#layout:after {content:'Phone';}}
+          #layout:after {content:'Desktop';} @media(max-width:600px) {#layout:after {content:'Phone';} #zoom-tap {display:none;}}
           </style><header id="layout"></header><button id="tap" onclick="this.textContent='Tapped'">Tap here</button>
           <input id="draft" value="Unsent login text">
+          <button id="zoom-tap" style="position:absolute;left:650px;top:400px;width:160px;height:60px;margin:0" onclick="this.dataset.clicks=String(Number(this.dataset.clicks||0)+1)">Zoom tap</button>
           <div id="slider" style="margin:20px;width:280px;height:45px;background:#aef;touch-action:none;user-select:none">Drag me</div>
           <button id="hold" style="touch-action:none">Hold me</button>
           <div id="touch-only" style="margin:20px;width:280px;height:45px;background:#fea;touch-action:none">Touch only</div>
@@ -170,8 +171,25 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     page.setDefaultTimeout(5000);
     await page.setViewport({ width, height, deviceScaleFactor: 3, hasTouch: true });
     page.on("pageerror", (error) => errors.push(String(error)));
+    if (route === "/native")
+      await page.evaluateOnNewDocument(() => {
+        const host = window as any;
+        host.nativeStatuses = [];
+        host.ReactNativeWebView = {
+          postMessage: (message: string) => {
+            const data = JSON.parse(message);
+            if (data.type === "tlon.browser.input") host.nativeStatuses.push(data);
+          },
+        };
+      });
     await page.goto(
-      route === "/watch" ? `${origin}/?watch=1` : route === "/" ? viewerEntry : route,
+      route === "/native"
+        ? viewerEntry
+        : route === "/watch"
+        ? `${origin}/?watch=1`
+        : route === "/"
+        ? viewerEntry
+        : route,
     );
     await page.waitForFunction(
       () =>
@@ -227,8 +245,223 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     await cdp.detach();
   }
 
+  it("keeps the live agent viewport, zooms locally, bridges native input and restores Agent View", async () => {
+    await target.setViewport({ width: 1440, height: 900 });
+    const before = await target.evaluate(() => ({
+      width: innerWidth,
+      height: innerHeight,
+      loads: sessionStorage.loads,
+      touch: navigator.maxTouchPoints,
+    }));
+    const phone = await viewer(390, 844, "/native");
+    await ready(phone);
+    const remote = () =>
+      target.evaluate(() => ({
+        width: innerWidth,
+        height: innerHeight,
+        loads: sessionStorage.loads,
+        touch: navigator.maxTouchPoints,
+      }));
+    expect(await remote()).toEqual(before);
+    expect(await phone.$eval("header", (el) => getComputedStyle(el).display)).toBe("none");
+    const status = () => phone.evaluate(() => (window as any).nativeStatuses.at(-1));
+    const command = (data: object) =>
+      phone.evaluate((data) => {
+        const host = window as any;
+        host.tlonBrowserInput.receive({
+          version: 1,
+          context: host.nativeStatuses.at(-1).context,
+          ...data,
+        });
+      }, data);
+    await command({ type: "insets", top: 130, bottom: 114, keyboardBottom: 80 });
+    expect(await phone.$eval("#stage", (el) => el.clientHeight)).toBe(844);
+    expect(await remote()).toEqual(before);
+    expect((await status()).mode).toBe("agent");
+    expect((await status()).browserControlsVisible).toBe(false);
+    await command({ type: "browserControls", visible: "yes" });
+    expect((await status()).browserControlsVisible).toBe(false);
+    await command({ type: "browserControls", visible: true });
+    expect((await status()).browserControlsVisible).toBe(true);
+    expect(await phone.$eval("header", (el) => getComputedStyle(el).display)).toBe("flex");
+    expect(await phone.$eval("header", (el) => el.getBoundingClientRect().top)).toBe(130);
+    expect(await phone.$eval("#url", (el) => (el as HTMLInputElement).readOnly)).toBe(false);
+    expect(await remote()).toEqual(before);
+    // Hiding the bar closes its menu and releases focus from its address field.
+    await phone.focus("#url");
+    await command({ type: "browserControls", visible: false });
+    expect(await phone.$eval("header", (el) => getComputedStyle(el).display)).toBe("none");
+    expect(await phone.evaluate(() => document.activeElement?.id)).not.toBe("url");
+    expect(await phone.$eval("#stage", (el) => el.clientHeight)).toBe(844);
+    expect(await remote()).toEqual(before);
+    const input = await phone.createCDPSession();
+    const bounds = await phone.$eval("canvas", (el) => {
+      const r = el.getBoundingClientRect();
+      return { x: r.x, y: r.y, width: r.width, height: r.height };
+    });
+    const cx = bounds.x + bounds.width / 2,
+      cy = bounds.y + bounds.height / 2;
+    const zoomIn = async () => {
+      await input.send("Input.dispatchTouchEvent", {
+        type: "touchStart",
+        touchPoints: [
+          { id: 1, x: cx - 25, y: cy },
+          { id: 2, x: cx + 25, y: cy },
+        ],
+      });
+      await input.send("Input.dispatchTouchEvent", {
+        type: "touchMove",
+        touchPoints: [
+          { id: 1, x: cx - 100, y: cy },
+          { id: 2, x: cx + 100, y: cy },
+        ],
+      });
+      await input.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    };
+    await zoomIn();
+    expect(await phone.$eval("canvas", (el) => el.getBoundingClientRect().width)).toBeGreaterThan(
+      1400,
+    );
+    expect(await remote()).toEqual(before);
+    expect(await target.evaluate(() => scrollY)).toBe(0);
+    const zoomPoint = await pointOn(phone, "#zoom-tap");
+    await phone.touchscreen.tap(zoomPoint.x, zoomPoint.y);
+    await expect
+      .poll(() => target.$eval("#zoom-tap", (el) => (el as HTMLElement).dataset.clicks))
+      .toBe("1");
+    const priorX = await phone.$eval("canvas", (el) => el.getBoundingClientRect().x);
+    await input.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ id: 1, x: cx, y: cy }],
+    });
+    await input.send("Input.dispatchTouchEvent", {
+      type: "touchMove",
+      touchPoints: [{ id: 1, x: cx + 40, y: cy + 30 }],
+    });
+    await input.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    expect(await phone.$eval("canvas", (el) => el.getBoundingClientRect().x)).toBeCloseTo(
+      priorX + 40,
+      0,
+    );
+    expect(await target.evaluate(() => scrollY)).toBe(0);
+    // Double-tap a remote button while zoomed: reset locally, without either
+    // tap activating it or changing the agent's viewport/page state.
+    const resetPoint = await pointOn(phone, "#zoom-tap");
+    await phone.touchscreen.tap(resetPoint.x, resetPoint.y);
+    await phone.touchscreen.tap(resetPoint.x, resetPoint.y);
+    await expect
+      .poll(() => phone.$eval("canvas", (el) => el.getBoundingClientRect().width))
+      .toBeCloseTo(bounds.width, 0);
+    expect(await phone.$eval("canvas", (el) => el.getBoundingClientRect().x)).toBeCloseTo(
+      bounds.x,
+      0,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(await target.$eval("#zoom-tap", (el) => (el as HTMLElement).dataset.clicks)).toBe("1");
+    expect(await remote()).toEqual(before);
+    // Taps at the default scale still reach the remote page normally.
+    const standardPoint = await pointOn(phone, "#zoom-tap");
+    await phone.touchscreen.tap(standardPoint.x, standardPoint.y);
+    await expect
+      .poll(() => target.$eval("#zoom-tap", (el) => (el as HTMLElement).dataset.clicks))
+      .toBe("2");
+    await zoomIn();
+    // Native typing and paste use the same versioned, ordered actions as the web viewer.
+    await target.$eval("#draft", (el) => {
+      (el as HTMLInputElement).value = "";
+      (el as HTMLInputElement).focus();
+    });
+    await command({ type: "keyboard", open: true });
+    await phone.type("#mobile-session-keyboard", "hello");
+    await command({ type: "paste", text: " 🌈" });
+    await expect
+      .poll(() => target.$eval("#draft", (el) => (el as HTMLInputElement).value))
+      .toBe("hello 🌈");
+    const canvasBounds = () =>
+      phone.$eval("canvas", (el) => {
+        const rect = el.getBoundingClientRect();
+        return { width: rect.width, top: rect.top };
+      });
+    const beforeKeyboardResize = await canvasBounds();
+    await phone.setViewport({ width: 390, height: 430, hasTouch: true });
+    await expect.poll(() => canvasBounds()).toEqual(beforeKeyboardResize);
+    expect((await status()).keyboardOpen).toBe(true);
+    expect(await remote()).toEqual(before);
+    // A touch/pan while editing must not blur the local keyboard input.
+    await input.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ id: 1, x: 190, y: 250 }],
+    });
+    await input.send("Input.dispatchTouchEvent", {
+      type: "touchMove",
+      touchPoints: [{ id: 1, x: 210, y: 250 }],
+    });
+    await input.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    expect((await status()).keyboardOpen).toBe(true);
+    await command({ type: "keyboard", open: false });
+    await phone.setViewport({ width: 390, height: 844, hasTouch: true });
+    await expect.poll(() => canvasBounds()).toEqual(beforeKeyboardResize);
+    await command({ type: "layout", mode: "mobile" });
+    await expect.poll(async () => (await status()).reloadRequired).toBe("mobile");
+    expect(await remote()).toEqual(before);
+    await command({ type: "layout", mode: "agent", reload: false });
+    await ready(phone);
+    expect(await remote()).toEqual(before);
+    await command({ type: "layout", mode: "mobile" });
+    await expect.poll(async () => (await status()).reloadRequired).toBe("mobile");
+    await command({ type: "layout", mode: "mobile", reload: true });
+    await ready(phone);
+    await expect.poll(() => target.evaluate(() => innerWidth)).toBe(390);
+    expect((await status()).mode).toBe("mobile");
+    await expect.poll(() => target.evaluate(() => innerHeight)).toBe(600);
+    const mobileLoads = await target.evaluate(() => sessionStorage.loads);
+    await command({ type: "browserControls", visible: true });
+    await ready(phone);
+    const barHeight = await phone.$eval("header", (el) => el.getBoundingClientRect().height);
+    await expect.poll(() => target.evaluate(() => innerHeight)).toBe(600 - barHeight);
+    expect(await phone.$eval("#stage", (el) => el.getBoundingClientRect().top)).toBe(130 + barHeight);
+    expect(await target.evaluate(() => sessionStorage.loads)).toBe(mobileLoads);
+    await command({ type: "browserControls", visible: false });
+    await ready(phone);
+    await expect.poll(() => target.evaluate(() => innerHeight)).toBe(600);
+    const mobileBounds = await phone.$eval("canvas", (el) => {
+      const rect = el.getBoundingClientRect();
+      return { top: rect.top, bottom: rect.bottom, height: rect.height };
+    });
+    expect(mobileBounds).toEqual({ top: 130, bottom: 730, height: 600 });
+    const mobileViewport = await remote();
+    await command({ type: "keyboard", open: true });
+    await phone.setViewport({ width: 390, height: 430, hasTouch: true });
+    await expect
+      .poll(() => phone.$eval("canvas", (el) => el.getBoundingClientRect().width))
+      .toBe(390);
+    expect((await status()).keyboardOpen).toBe(true);
+    expect(await remote()).toEqual(mobileViewport);
+    await command({ type: "keyboard", open: false });
+    await phone.setViewport({ width: 390, height: 844, hasTouch: true });
+    await phone.waitForFunction(() => document.querySelector("#stage")!.clientHeight === 600);
+    expect(await remote()).toEqual(mobileViewport);
+    await command({ type: "layout", mode: "agent" });
+    await expect.poll(async () => (await status()).reloadRequired).toBe("agent");
+    await command({ type: "layout", mode: "agent", reload: true });
+    await ready(phone);
+    await expect.poll(() => target.evaluate(() => innerWidth)).toBe(1440);
+    expect((await status()).mode).toBe("agent");
+    expect(await phone.$eval("#stage", (el) => el.clientHeight)).toBe(844);
+    await target.setViewport({ width: 1600, height: 1000 });
+    await expect.poll(() => phone.$eval("canvas", (el) => el.width), { timeout: 5000 }).toBe(1600);
+    await ready(phone);
+    await phone.close();
+    await target.setViewport({ width: 1920, height: 1080 });
+    await target.evaluate(() => {
+      sessionStorage.loads = "0";
+    });
+    await target.reload();
+  }, 30000);
+
   it("reflows without reload, confirms mobile mode, maps touch, rotates, and transfers ownership", async () => {
     const phone = await viewer(390, 844);
+    await setLayout(phone, "auto");
     await target.waitForFunction(() => innerWidth === 390);
     await expect.poll(() => phone.$eval("canvas", (el) => el.width), { timeout: 5000 }).toBe(390);
     if (process.env.CASTING_VIEWER_EVIDENCE_DIR) {
@@ -520,9 +753,10 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
       .poll(() => target.$eval("#draft", (el) => (el as HTMLInputElement).value))
       .toBe("abc");
     expect(await target.evaluate("window.keys")).toEqual(expect.arrayContaining(["a", "b", "c"]));
-    await phone.keyboard.down("Control");
+    const selectAllModifier = process.platform === "darwin" ? "Meta" : "Control";
+    await phone.keyboard.down(selectAllModifier);
     await phone.keyboard.press("a");
-    await phone.keyboard.up("Control");
+    await phone.keyboard.up(selectAllModifier);
     await phone.keyboard.press("Backspace");
     await expect
       .poll(() => target.$eval("#draft", (el) => (el as HTMLInputElement).value))
