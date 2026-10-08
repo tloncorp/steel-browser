@@ -84,9 +84,6 @@ status. Radio groups appear as choices, while checkboxes and individual multiple
 appear as Yes/No choices. A focused form takes precedence when a page has several forms; without
 focus, discovery requires one unambiguous form. General forms fill without submitting. Login forms
 can submit when explicitly requested. File uploads and custom widgets require the live browser.
-Search-only forms require focus, so an unfocused search box does not start an unrelated handoff
-after navigation. Short text labels directly preceding controls, such as `Search:`, take precedence
-over internal field names such as `q`.
 
 Run the input, viewport, and public-gateway browser checks with a local Chrome:
 
