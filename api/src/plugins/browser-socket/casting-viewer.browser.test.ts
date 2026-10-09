@@ -32,6 +32,8 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
   const errors: string[] = [];
   const upgradeAgents: (string | undefined)[] = [];
   const documentAgents: (string | undefined)[] = [];
+  let blockDocumentLoad = false;
+  const pendingScripts: Array<() => void> = [];
   const session = { id: sessionId, status: "live", dimensions: { width: 1920, height: 1080 } };
   const sessionRuntime = { getBrowserInstance: () => browser };
 
@@ -44,7 +46,9 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     wss = new WebSocketServer({ noServer: true });
     server = createServer(async (request, response) => {
       response.setHeader("content-type", "text/html");
-      if (request.url === "/request-info") {
+      if (request.url === "/blocking-script") {
+        pendingScripts.push(() => response.end(""));
+      } else if (request.url === "/request-info") {
         response.setHeader("content-type", "application/json");
         response.end(
           JSON.stringify({
@@ -85,7 +89,7 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
           touchOnly.addEventListener('touchstart',e=>e.preventDefault(),{passive:false});
           touchOnly.addEventListener('touchmove',e=>{e.preventDefault();window.touchMoves.push(e.touches[0].clientX);},{passive:false});
           sessionStorage.loads=String(Number(sessionStorage.loads||0)+1);
-          </script>`);
+          </script>${blockDocumentLoad ? '<script src="/blocking-script"></script>' : ""}`);
       } else if (request.url === "/dashboard") {
         response.end(
           `<iframe src="/?clipboardBridge=true" style="width:800px;height:1000px"></iframe><script>window.messages=[];addEventListener('message',event=>window.messages.push(event.data));</script>`,
@@ -624,6 +628,7 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     );
     if (await observer.$eval("#control", (el) => el.textContent === "Take control"))
       await menuAction(observer, "#control");
+    await setLayout(observer, "auto");
     await target.waitForFunction(() => innerWidth === 1200);
     const readOnly = await viewer(500, 700, "/watch");
     expect(await readOnly.$eval("#control", (el) => (el as HTMLButtonElement).hidden)).toBe(true);
@@ -639,7 +644,7 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
       () => !(document.querySelector("#viewport-mode") as HTMLSelectElement).disabled,
     );
     await observer.close();
-    const reconnected = await viewer(1200, 800);
+    const reconnected = await viewer(1200, 800, "/native");
     await reconnected.waitForFunction(
       () => (document.querySelector("#viewport-mode") as HTMLSelectElement).value === "mobile",
     );
@@ -1053,5 +1058,81 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
       "from parent",
     );
     await dashboard.close();
+  });
+  async function freshTarget(width: number, height: number) {
+    await target.close();
+    target = await browser.newPage();
+    target.setDefaultTimeout(5000);
+    await target.setViewport({ width, height });
+    await target.goto(`${origin}/fixture`);
+    const cdp = await target.createCDPSession();
+    pageId = (await cdp.send("Target.getTargetInfo")).targetInfo.targetId;
+    await cdp.detach();
+  }
+
+  it.each([
+    [390, 844],
+    [844, 390],
+  ])(
+    "detects a phone when opened at %s x %s and preserves manual layout on reconnect",
+    async (width, height) => {
+      await freshTarget(1920, 1080);
+      const phone = await viewer(
+        width,
+        height,
+        "/",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1",
+      );
+      await ready(phone);
+      expect(await phone.$eval("#viewport-mode", (el) => (el as HTMLSelectElement).value)).toBe(
+        "mobile",
+      );
+      expect(await target.evaluate(() => navigator.maxTouchPoints)).toBe(1);
+      expect(await target.evaluate(() => innerWidth)).toBe(width);
+      expect(await target.evaluate(() => sessionStorage.loads)).toBe("2");
+      expect(await phone.$eval("#viewport-confirm", (el) => (el as HTMLDialogElement).open)).toBe(
+        false,
+      );
+      await setLayout(phone, "desktop");
+      for (const socket of wss.clients) socket.terminate();
+      await phone.waitForFunction(
+        () => document.querySelector("#stage")?.getAttribute("data-ready") === "false",
+      );
+
+      await ready(phone);
+      expect(await phone.$eval("#viewport-mode", (el) => (el as HTMLSelectElement).value)).toBe(
+        "desktop",
+      );
+      await phone.close();
+      await target.setUserAgent(await browser.userAgent());
+    },
+    30_000,
+  );
+
+  it("preserves the agent viewport for a narrow desktop browser", async () => {
+    await freshTarget(1440, 900);
+    const desktop = await viewer(390, 844);
+    await ready(desktop);
+    expect(await desktop.$eval("#viewport-mode", (el) => (el as HTMLSelectElement).value)).toBe(
+      "agent",
+    );
+    expect(await target.evaluate(() => innerWidth)).toBe(1440);
+    await desktop.close();
+  });
+
+  it("grants control while a reloaded page is still loading", async () => {
+    await freshTarget(1920, 1080);
+    blockDocumentLoad = true;
+    try {
+      const phone = await viewer(390, 844, "/native", "SlowViewer/1.0");
+      await expect.poll(() => pendingScripts.length).toBeGreaterThan(0);
+      await ready(phone);
+      expect(await target.evaluate(() => document.readyState)).toBe("loading");
+      await phone.close();
+    } finally {
+      blockDocumentLoad = false;
+      pendingScripts.splice(0).forEach((release) => release());
+      await target.setUserAgent(await browser.userAgent());
+    }
   });
 });

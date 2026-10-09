@@ -330,6 +330,15 @@
           serverHeight = 0,
           mode = "agent",
           pendingMode;
+        // Detect this viewer once when it opens. Server state and reconnects must
+        // not overwrite the viewer's initial device choice or a manual selection.
+        const mobileDevice =
+          /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+          navigator.userAgentData?.mobile === true ||
+          (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+        let openingLayout = window.ReactNativeWebView
+          ? undefined
+          : mobileDevice ? "mobile" : "agent";
         let metadata,
           paintedFrame = 0,
           sentFrame = 0,
@@ -515,7 +524,10 @@
               controlButton.disabled =
                 !interactive || !supported || acquiring || (!controlling && !data.available);
               controlButton.textContent = controlling ? "Hand back" : "Take control";
-              if (gained) requestViewport();
+              if (gained) {
+                requestViewport(openingLayout ?? mode, openingLayout !== undefined);
+                openingLayout = undefined;
+              }
               else if (!controlling) {
                 setReady(
                   false,

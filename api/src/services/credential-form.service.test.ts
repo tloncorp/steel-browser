@@ -351,6 +351,44 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     ]);
   });
 
+  it.each(["main", 'div role="main"'])(
+    "selects the primary form in %s while respecting explicit focus",
+    async (landmark) => {
+      const tag = landmark.split(" ")[0];
+      await load(
+        `<${landmark}><form><input name="email" type="email"><input name="address"></form></${tag}><aside><form><input name="discount"></form></aside>`,
+      );
+      const target = await discoverCredentialForm(service);
+      expect(target.fields.map((field) => field.label)).toEqual(["email", "address"]);
+      await fillCredentialForm(service, target, {
+        values: { f0: "person@example.test", f1: "123 Main St" },
+        submit: true,
+      });
+      expect(
+        await page.$eval('[name="discount"]', (input) => (input as HTMLInputElement).value),
+      ).toBe("");
+      await page.focus('[name="discount"]');
+      const focused = await discoverCredentialForm(service);
+      expect(focused.fields.map((field) => field.label)).toEqual(["discount"]);
+    },
+  );
+
+  it("does not count nested secondary landmarks as primary forms", async () => {
+    await load(
+      '<main><form><input name="address"></form><aside><form><input name="discount"></form></aside></main>',
+    );
+    expect((await discoverCredentialForm(service)).fields.map((field) => field.label)).toEqual([
+      "address",
+    ]);
+  });
+
+  it("requires focus when the primary content has multiple forms", async () => {
+    await load(
+      '<main><form><input name="login"></form><form><input name="signup"></form></main><aside><form><input name="discount"></form></aside>',
+    );
+    await expect(discoverCredentialForm(service)).rejects.toMatchObject({ statusCode: 404 });
+  });
+
   it("rejects changed nodes and field semantics on the same URL before writing", async () => {
     for (const mutation of ["replace", "type", "form"] as const) {
       await load(

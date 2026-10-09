@@ -233,6 +233,7 @@ type BoundField = {
 type BoundForm = {
   kind: "login" | "details";
   focused: boolean;
+  primary: boolean;
   fields: BoundField[];
   controls: Array<{
     input: FormControl;
@@ -628,12 +629,20 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
     matches.push({
       kind,
       focused: !!active && (group.includes(active as FormControl) || scope.contains(active)),
+      primary: !!scope
+        .closest(
+          'main, aside, nav, header, footer, [role="main"], [role="complementary"], [role="navigation"], [role="banner"], [role="contentinfo"]',
+        )
+        ?.matches('main, [role="main"]'),
       fields,
       controls,
     });
   }
   const focused = matches.filter((form) => form.focused);
-  return focused.length === 1 ? focused[0] : matches.length === 1 ? matches[0] : null;
+  if (focused.length === 1) return focused[0];
+  if (matches.length === 1) return matches[0];
+  const primary = matches.filter((form) => form.primary);
+  return primary.length === 1 ? primary[0] : null;
 }
 
 async function releaseForm(cdpService: CDPService) {
