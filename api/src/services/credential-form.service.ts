@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { recordBrowserForm, recordBrowserFill, recordBrowserFillFailure } from "./browser-monitor.service.js";
+import {
+  recordBrowserForm,
+  recordBrowserFill,
+  recordBrowserFillFailure,
+} from "./browser-monitor.service.js";
 import type { CDPSession, ElementHandle, Frame, JSHandle, Page } from "puppeteer-core";
 import type { CDPService } from "./cdp/cdp.service.js";
 import { secureFieldDefinitions, type SecureFormField } from "./secure-form-fields.js";
@@ -14,6 +18,7 @@ export interface CredentialFormTarget {
 export interface CredentialFormDescription extends CredentialFormTarget {
   fields: SecureFormField[];
 }
+export type CredentialFormScope = "all" | "sensitive";
 export interface CredentialFormValues {
   values: Record<string, string>;
   submit?: boolean;
@@ -37,8 +42,8 @@ const continuations = new WeakMap<
   CDPService,
   {
     receipt: CredentialContinuation;
-    anchor: ElementHandle<FormControl>;
-    bound: JSHandle<BoundForm>;
+    anchor: ElementHandle<HTMLElement>;
+    parts: BoundFormPart[];
     filledIds: string[];
     timer: ReturnType<typeof setTimeout>;
   }
@@ -50,7 +55,7 @@ async function clearContinuation(cdpService: CDPService): Promise<void> {
   clearTimeout(state.timer);
   await Promise.all([
     state.anchor.dispose().catch(() => {}),
-    state.bound.dispose().catch(() => {}),
+    ...state.parts.map((part) => part.handle.dispose().catch(() => {})),
   ]);
 }
 export async function getCredentialContinuation(
@@ -60,36 +65,58 @@ export async function getCredentialContinuation(
   if (!state) return null;
   const valid =
     Date.now() < state.receipt.expiresAt &&
-    (await state.bound
-      .evaluate(
-        (form, target, filledIds) =>
-          location.href === target.frameUrl &&
-          location.origin === target.origin &&
-          form.controls.every(
-            ({ input, form, attributes, action }) =>
-              input.isConnected &&
-              input.form === form &&
-              input.form?.action === action &&
-              JSON.stringify(
-                [
-                  "type",
-                  "name",
-                  "id",
-                  "autocomplete",
-                  "maxlength",
-                  "required",
-                  "pattern",
-                  "form",
-                ].map((name) => input.getAttribute(name)),
-              ) === attributes,
-          ) &&
-          form.fields
-            .filter((field) => filledIds.includes(field.descriptor.id))
-            .every((field) => field.inputs.every((input) => input.value.length > 0)),
-        state.receipt,
-        state.filledIds,
+    (await attachedParts(state.parts)) &&
+    (
+      await Promise.all(
+        state.parts.map((part) =>
+          part.handle
+            .evaluate(
+              (form, target, filledIds) =>
+                location.href === target.frameUrl &&
+                location.origin === target.origin &&
+                form.scope.isConnected &&
+                (form.scope instanceof HTMLFormElement ? form.scope.action : undefined) ===
+                  form.action &&
+                form.controls.every(
+                  ({ input, form, attributes, action }) =>
+                    input.isConnected &&
+                    input.form === form &&
+                    input.form?.action === action &&
+                    JSON.stringify(
+                      [
+                        "type",
+                        "name",
+                        "id",
+                        "autocomplete",
+                        "maxlength",
+                        "required",
+                        "pattern",
+                        "form",
+                        "multiple",
+                        "min",
+                        "max",
+                        "step",
+                      ].map((name) => input.getAttribute(name)),
+                    ) === attributes,
+                ) &&
+                form.fields
+                  .filter((field) => filledIds.includes(field.descriptor.id))
+                  .every(
+                    (field) =>
+                      field.choice ||
+                      field.inputs.every((input) =>
+                        input instanceof HTMLSelectElement
+                          ? input.selectedIndex >= 0
+                          : input.value.length > 0,
+                      ),
+                  ),
+              { frameUrl: part.frameUrl, origin: part.origin },
+              state.filledIds,
+            )
+            .catch(() => false),
+        ),
       )
-      .catch(() => false));
+    ).every(Boolean);
   if (!valid) {
     if (continuations.get(cdpService) === state) await clearContinuation(cdpService);
     return null;
@@ -97,7 +124,7 @@ export async function getCredentialContinuation(
   return { ...state.receipt };
 }
 /** Click one unambiguous login control through the browser's input pipeline. */
-async function activateCredentialControl(anchor: ElementHandle<FormControl>): Promise<boolean> {
+async function activateCredentialControl(anchor: ElementHandle<HTMLElement>): Promise<boolean> {
   const deadline = Date.now() + 2_000;
   do {
     const handle = await anchor.evaluateHandle((input) => {
@@ -121,7 +148,7 @@ async function activateCredentialControl(anchor: ElementHandle<FormControl>): Pr
             "",
         ) &&
         !/\b(?:with|google|apple|facebook|register|sign\s*up)\b/i.test(element.textContent || "");
-      const form = input.form;
+      const form = input instanceof HTMLFormElement ? input : (input as FormControl).form;
       let candidates: HTMLElement[];
       if (form) {
         candidates = Array.from(
@@ -208,9 +235,18 @@ function httpOrigin(rawUrl: string): string | undefined {
   }
 }
 
-type BoundField = { descriptor: SecureFormField; inputs: FormControl[] };
+type BoundField = {
+  descriptor: SecureFormField;
+  inputs: FormControl[];
+  choice?: "checkbox" | "radio" | "option";
+  optionIndex?: number;
+};
 type BoundForm = {
   kind: "login" | "details";
+  focused: boolean;
+  primary: boolean;
+  scope: Element;
+  action?: string;
   fields: BoundField[];
   controls: Array<{
     input: FormControl;
@@ -220,10 +256,16 @@ type BoundForm = {
     options?: string;
   }>;
 };
+type BoundFormPart = {
+  parentIndex?: number;
+  frame: Frame;
+  frameUrl: string;
+  origin: string;
+  handle: JSHandle<BoundForm>;
+};
 type LocatedCredentialForm = {
   description: CredentialFormDescription;
-  frame: Frame;
-  handle: JSHandle<BoundForm>;
+  parts: BoundFormPart[];
   timer: ReturnType<typeof setTimeout>;
 };
 const forms = new WeakMap<CDPService, LocatedCredentialForm>();
@@ -236,6 +278,8 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
       ...(element.shadowRoot ? all(element.shadowRoot) : []),
     ]);
   const elements = all(document);
+  let active = document.activeElement;
+  while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
   const visible = (input: FormControl) => {
     const style = getComputedStyle(input);
     const rect = input.getBoundingClientRect();
@@ -250,6 +294,14 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
       !input.closest('[inert], [aria-hidden="true"]')
     );
   };
+  const labelText = (element: Element | null) => {
+    if (!element || element.matches("input, textarea, select, script, style")) return "";
+    const copy = element.cloneNode(true) as Element;
+    copy
+      .querySelectorAll("input, textarea, select, script, style")
+      .forEach((child) => child.remove());
+    return copy.textContent || "";
+  };
   const text = (input: FormControl) =>
     [
       input.name,
@@ -260,6 +312,28 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
     ]
       .map((value) => value.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_-]/g, " "))
       .join(" ");
+  const label = (input: FormControl) => {
+    const root = input.getRootNode() as Document | ShadowRoot;
+    const labelledBy = (input.getAttribute("aria-labelledby") || "")
+      .split(/\s+/)
+      .map((id) => labelText(root.getElementById(id)))
+      .join(" ")
+      .trim();
+    return (
+      labelledBy ||
+      input.getAttribute("aria-label") ||
+      Array.from(input.labels || [])
+        .map(labelText)
+        .join(" ")
+        .trim() ||
+      input.getAttribute("placeholder") ||
+      input.name ||
+      input.id ||
+      ""
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+  };
   const otpWords = new RegExp(
     definitions.find((field) => field.purpose === "one-time-code")!.pattern!,
     "i",
@@ -269,9 +343,9 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
     .filter(
       (element): element is FormControl =>
         (element instanceof HTMLInputElement &&
-          ["text", "email", "tel", "password", "number", "month"].includes(element.type)) ||
+          !["hidden", "file", "button", "submit", "reset", "image"].includes(element.type)) ||
         element instanceof HTMLTextAreaElement ||
-        (element instanceof HTMLSelectElement && !element.multiple),
+        element instanceof HTMLSelectElement,
     )
     .filter(visible);
   const groups = new Map<Element, FormControl[]>();
@@ -348,7 +422,69 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
         split.some((input) => explicitPurpose(input)?.purpose === "one-time-code"));
     const fields: BoundField[] = [];
     for (const input of group) {
+      if (fields.some((field) => field.inputs.includes(input))) continue;
       if (splitCode && split.includes(input as HTMLInputElement) && input !== split[0]) continue;
+      const fieldLabel = label(input) || `Field ${fields.length + 1}`;
+      const yesNo = [
+        { value: "0", label: "No" },
+        { value: "1", label: "Yes" },
+      ];
+      if (input instanceof HTMLInputElement && ["checkbox", "radio"].includes(input.type)) {
+        const radio = input.type === "radio";
+        const choices =
+          radio && input.name
+            ? group.filter(
+                (other) =>
+                  other instanceof HTMLInputElement &&
+                  other.type === "radio" &&
+                  other.name === input.name &&
+                  other.form === input.form &&
+                  other.getRootNode() === input.getRootNode(),
+              )
+            : [input];
+        const required = choices.some((choice) => choice.required);
+        const legend = labelText(input.closest("fieldset")?.querySelector("legend") || null).trim();
+        fields.push({
+          inputs: choices,
+          choice: radio ? "radio" : "checkbox",
+          descriptor: {
+            id: `f${fields.length}`,
+            purpose: "field",
+            label: (radio ? legend || input.name || fieldLabel : fieldLabel).slice(0, 256),
+            inputType: "select",
+            required,
+            options: radio
+              ? choices.map((choice, index) => ({
+                  value: String(index),
+                  label: (label(choice) || `Option ${index + 1}`).slice(0, 256),
+                }))
+              : required
+              ? [yesNo[1]]
+              : yesNo,
+          },
+        });
+        continue;
+      }
+      if (input instanceof HTMLSelectElement && input.multiple) {
+        // Each option is an independent choice in the string-valued handoff contract.
+        Array.from(input.options).forEach((option, optionIndex) => {
+          if (option.disabled || option.parentElement?.matches("optgroup[disabled]")) return;
+          fields.push({
+            inputs: [input],
+            choice: "option",
+            optionIndex,
+            descriptor: {
+              id: `f${fields.length}`,
+              purpose: "field",
+              label: `${fieldLabel}: ${option.label}`.slice(0, 256),
+              inputType: "select",
+              required: false,
+              options: yesNo,
+            },
+          });
+        });
+        continue;
+      }
       let definition = explicitPurpose(input);
       if (!definition && splitCode && input === split[0])
         definition = definitions.find((field) => field.purpose === "one-time-code");
@@ -384,10 +520,10 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
         if (textInputs.length === 1 && textInputs[0] === input)
           definition = definitions.find((field) => field.purpose === "username");
       }
-      if (!definition) continue;
       if (
         !hasDetails &&
         (hasLoginContext || passwords.length) &&
+        definition &&
         ["email", "tel"].includes(definition.purpose)
       )
         definition = definitions.find((field) => field.purpose === "username")!;
@@ -398,13 +534,10 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
         ? "Billing: "
         : "";
       const fieldInputs: FormControl[] = splitCode && input === split[0] ? split : [input];
-      const isLoginField = ["username", "current-password", "one-time-code"].includes(
-        definition.purpose,
-      );
       const maxLength =
         "maxLength" in input && input.maxLength > 0 ? Math.min(input.maxLength, 4096) : undefined;
       const codeLength =
-        definition.purpose === "one-time-code"
+        definition?.purpose === "one-time-code"
           ? splitCode
             ? split.length
             : maxLength && maxLength <= 12
@@ -415,7 +548,7 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
         input instanceof HTMLSelectElement
           ? Array.from(input.options).flatMap((option, index) =>
               option.disabled ||
-              !option.value ||
+              (input.required && !option.value) ||
               option.parentElement?.matches("optgroup[disabled]")
                 ? []
                 : [{ value: String(index), label: option.label.slice(0, 256) }],
@@ -426,23 +559,31 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
         inputs: fieldInputs,
         descriptor: {
           id: `f${fields.length}`,
-          purpose: definition.purpose,
-          label: section + definition.label,
+          purpose: definition?.purpose || "field",
+          label: (section + (label(input) || definition?.label || fieldLabel)).slice(0, 256),
           inputType: options
             ? "select"
             : input instanceof HTMLTextAreaElement
             ? "textarea"
-            : definition.inputType,
-          required: input.required || isLoginField,
+            : definition?.inputType ||
+              (input instanceof HTMLInputElement &&
+              ["password", "email", "tel"].includes(input.type)
+                ? (input.type as "password" | "email" | "tel")
+                : "text"),
+          required: input.required,
           ...(maxLength && !splitCode ? { maxLength } : {}),
           ...(codeLength ? { exactLength: codeLength } : {}),
           ...(options ? { options } : {}),
         },
       });
     }
-    if (!fields.length || fields.length > 40) continue;
-    const purposes = fields.map((field) => field.descriptor.purpose);
+    if (!fields.length) continue;
+    // Optional checkboxes (such as Remember me) do not change a login's purpose.
+    const purposes = fields
+      .filter((field) => field.choice !== "checkbox" || field.descriptor.required)
+      .map((field) => field.descriptor.purpose);
     const login =
+      purposes.length > 0 &&
       purposes.every((purpose) =>
         ["username", "current-password", "one-time-code"].includes(purpose),
       ) &&
@@ -451,20 +592,36 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
       (hasLoginContext ||
         purposes.includes("current-password") ||
         purposes.includes("one-time-code"));
-    if (login && new Set(purposes).size !== purposes.length) continue;
-    if (!login && !hasDetails && !purposes.includes("new-password")) continue;
     // Unsupported required controls keep submission in the live browser.
-    const unsupportedRequired = group.some(
-      (input) => input.required && !fields.some((field) => field.inputs.includes(input)),
+    const unsupportedRequired = elements.some(
+      (input) =>
+        (input instanceof HTMLInputElement ||
+          input instanceof HTMLSelectElement ||
+          input instanceof HTMLTextAreaElement) &&
+        (input.form === scope || (!input.form && scope.contains(input))) &&
+        visible(input) &&
+        input.required &&
+        !fields.some((field) => field.inputs.includes(input)),
     );
     const controls = fields.flatMap((field) =>
       field.inputs.map((input) => ({
         input,
         form: input.form,
         attributes: JSON.stringify(
-          ["type", "name", "id", "autocomplete", "maxlength", "required", "pattern", "form"].map(
-            (name) => input.getAttribute(name),
-          ),
+          [
+            "type",
+            "name",
+            "id",
+            "autocomplete",
+            "maxlength",
+            "required",
+            "pattern",
+            "form",
+            "multiple",
+            "min",
+            "max",
+            "step",
+          ].map((name) => input.getAttribute(name)),
         ),
         action: input.form?.action,
         options:
@@ -480,9 +637,38 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
             : undefined,
       })),
     );
-    matches.push({ kind: login && !unsupportedRequired ? "login" : "details", fields, controls });
+    const kind =
+      login && !unsupportedRequired && new Set(purposes).size === purposes.length
+        ? "login"
+        : "details";
+    if (kind === "login")
+      fields.forEach((field) => {
+        if (!field.choice) field.descriptor.required = true;
+      });
+    matches.push({
+      kind,
+      scope,
+      action: scope instanceof HTMLFormElement ? scope.action : undefined,
+      focused:
+        !!active &&
+        active !== document.body &&
+        active !== document.documentElement &&
+        document.hasFocus() &&
+        (group.includes(active as FormControl) || scope.contains(active)),
+      primary: !!scope
+        .closest(
+          'main, aside, nav, header, footer, [role="main"], [role="complementary"], [role="navigation"], [role="banner"], [role="contentinfo"]',
+        )
+        ?.matches('main, [role="main"]'),
+      fields,
+      controls,
+    });
   }
-  return matches.length === 1 ? matches[0] : null;
+  const focused = matches.filter((form) => form.focused);
+  if (focused.length === 1) return focused[0];
+  if (matches.length === 1) return matches[0];
+  const primary = matches.filter((form) => form.primary);
+  return primary.length === 1 ? primary[0] : null;
 }
 
 async function releaseForm(cdpService: CDPService) {
@@ -490,16 +676,21 @@ async function releaseForm(cdpService: CDPService) {
   if (!current) return;
   forms.delete(cdpService);
   clearTimeout(current.timer);
-  await current.handle.dispose().catch(() => {});
+  await Promise.all(current.parts.map((part) => part.handle.dispose().catch(() => {})));
 }
 
-async function discoverBoundForm(cdpService: CDPService): Promise<CredentialFormDescription> {
+async function discoverBoundForm(
+  cdpService: CDPService,
+  scope: CredentialFormScope,
+): Promise<CredentialFormDescription> {
   const pages = await cdpService.getAllPages();
   for (const page of [...pages].reverse()) {
     const candidates: Array<{
       frame: Frame;
       handle: JSHandle<BoundForm>;
       kind: "login" | "details";
+      focused: boolean;
+      primary: boolean;
       fields: SecureFormField[];
     }> = [];
     for (const frame of page.frames()) {
@@ -526,40 +717,156 @@ async function discoverBoundForm(cdpService: CDPService): Promise<CredentialForm
       const metadata = await handle
         .evaluate(
           (form) =>
-            form && { kind: form.kind, fields: form.fields.map((field) => field.descriptor) },
+            form && {
+              kind: form.kind,
+              focused: form.focused,
+              primary: form.primary,
+              fields: form.fields.map((field) => field.descriptor),
+            },
         )
         .catch(() => undefined);
       if (metadata) candidates.push({ frame, handle: handle as JSHandle<BoundForm>, ...metadata });
       else await handle.dispose();
     }
-    if (candidates.length !== 1) {
+    // A payment provider can render each field in its own cross-origin frame.
+    // Only frames physically contained by the same bound form belong together.
+    const parent = new Map<(typeof candidates)[number], (typeof candidates)[number]>();
+    for (const candidate of candidates) {
+      let child = candidate.frame;
+      while (child.parentFrame()) {
+        const container = candidates.find((other) => other.frame === child.parentFrame());
+        if (container) {
+          const owner = await child.frameElement().catch(() => null);
+          const contained =
+            owner &&
+            (await container.handle
+              .evaluate((form, owner) => form.scope.contains(owner), owner)
+              .catch(() => false));
+          await owner?.dispose();
+          if (contained) parent.set(candidate, container);
+          break;
+        }
+        child = child.parentFrame()!;
+      }
+    }
+    const rootOf = (candidate: (typeof candidates)[number]) => {
+      while (parent.has(candidate)) candidate = parent.get(candidate)!;
+      return candidate;
+    };
+    const roots = candidates.filter((candidate) => !parent.has(candidate));
+    const focused = [...new Set(candidates.filter((candidate) => candidate.focused).map(rootOf))];
+    const primary = roots.filter((candidate) => candidate.primary);
+    const root =
+      focused.length === 1
+        ? focused[0]
+        : roots.length === 1
+        ? roots[0]
+        : primary.length === 1
+        ? primary[0]
+        : undefined;
+    if (!root) {
       await Promise.all(candidates.map((candidate) => candidate.handle.dispose()));
       if (candidates.length > 1) break;
       continue;
     }
-    const { frame, handle, fields, kind } = candidates[0];
+    let selected = [
+      root,
+      ...candidates.filter((candidate) => candidate !== root && rootOf(candidate) === root),
+    ];
+    await Promise.all(
+      candidates
+        .filter((candidate) => !selected.includes(candidate))
+        .map((candidate) => candidate.handle.dispose()),
+    );
+    if (scope === "sensitive") {
+      for (const candidate of selected) {
+        candidate.fields = await candidate.handle.evaluate((form) => {
+          form.fields = form.fields.filter(
+            ({ descriptor: { purpose } }) =>
+              purpose.startsWith("cc-") ||
+              ["username", "current-password", "new-password", "one-time-code"].includes(purpose),
+          );
+          const inputs = new Set(form.fields.flatMap((field) => field.inputs));
+          form.controls = form.controls.filter((control) => inputs.has(control.input));
+          return form.fields.map((field) => field.descriptor);
+        });
+      }
+      // Keep only selected destinations and the scopes that contain their frames.
+      // Ordinary fields neither require owner entry nor invalidate a sensitive fill.
+      const included = new Set(selected.filter((candidate) => candidate.fields.length > 0));
+      for (let candidate of included) {
+        while (parent.has(candidate)) {
+          candidate = parent.get(candidate)!;
+          included.add(candidate);
+        }
+      }
+      await Promise.all(
+        selected
+          .filter((candidate) => !included.has(candidate))
+          .map((candidate) => candidate.handle.dispose()),
+      );
+      selected = selected.filter((candidate) => included.has(candidate));
+      if (!selected.length) continue;
+    }
+    if (selected.reduce((count, candidate) => count + candidate.fields.length, 0) > 40) {
+      await Promise.all(selected.map((candidate) => candidate.handle.dispose()));
+      continue;
+    }
+    let offset = 0;
+    for (const candidate of selected) {
+      candidate.fields = await candidate.handle.evaluate((form, offset) => {
+        form.fields.forEach((field, index) => {
+          field.descriptor.id = `f${offset + index}`;
+        });
+        return form.fields.map((field) => field.descriptor);
+      }, offset);
+      offset += candidate.fields.length;
+    }
+    const parts: BoundFormPart[] = selected.map((candidate) => ({
+      parentIndex: parent.has(candidate) ? selected.indexOf(parent.get(candidate)!) : undefined,
+      frame: candidate.frame,
+      handle: candidate.handle,
+      frameUrl: candidate.frame.url(),
+      origin: httpOrigin(candidate.frame.url())!,
+    }));
+    const { frame } = root;
+    const fields = selected.flatMap((candidate) => candidate.fields);
+    const kind = parts.length === 1 ? root.kind : "details";
     const previous = forms.get(cdpService);
     const same =
-      previous?.frame === frame &&
-      previous.description.frameUrl === frame.url() &&
-      (await handle
-        .evaluate(
-          (next, prior) =>
-            next.kind === prior.kind &&
-            JSON.stringify(next.fields.map((field) => field.descriptor)) ===
-              JSON.stringify(prior.fields.map((field) => field.descriptor)) &&
-            next.controls.length === prior.controls.length &&
-            next.controls.every(
-              (control, i) =>
-                control.input === prior.controls[i].input &&
-                control.form === prior.controls[i].form &&
-                control.attributes === prior.controls[i].attributes &&
-                control.action === prior.controls[i].action &&
-                control.options === prior.controls[i].options,
-            ),
-          previous.handle,
+      previous?.parts.length === parts.length &&
+      (
+        await Promise.all(
+          parts.map(async (part, index) => {
+            const prior = previous.parts[index];
+            return (
+              prior.parentIndex === part.parentIndex &&
+              prior.frame === part.frame &&
+              prior.frameUrl === part.frameUrl &&
+              (await part.handle
+                .evaluate(
+                  (next, prior) =>
+                    next.kind === prior.kind &&
+                    next.scope === prior.scope &&
+                    next.action === prior.action &&
+                    JSON.stringify(next.fields.map((field) => field.descriptor)) ===
+                      JSON.stringify(prior.fields.map((field) => field.descriptor)) &&
+                    next.controls.length === prior.controls.length &&
+                    next.controls.every(
+                      (control, i) =>
+                        control.input === prior.controls[i].input &&
+                        control.form === prior.controls[i].form &&
+                        control.attributes === prior.controls[i].attributes &&
+                        control.action === prior.controls[i].action &&
+                        control.options === prior.controls[i].options,
+                    ),
+                  prior.handle,
+                )
+                .catch(() => false))
+            );
+          }),
         )
-        .catch(() => false));
+      ).every(Boolean);
     const description: CredentialFormDescription = {
       formId: same ? previous.description.formId : randomUUID(),
       pageId: pageId(page),
@@ -573,14 +880,156 @@ async function discoverBoundForm(cdpService: CDPService): Promise<CredentialForm
       void releaseForm(cdpService);
     }, 5 * 60_000);
     timer.unref();
-    forms.set(cdpService, { description, frame, handle, timer });
+    forms.set(cdpService, { description, parts, timer });
     return description;
   }
   await releaseForm(cdpService);
   throw new CredentialFormError(
-    "No unambiguous supported form was found. Open the browser to continue.",
+    scope === "sensitive"
+      ? "No supported payment or authentication fields were found. Continue in the browser."
+      : "No unambiguous supported form was found. Open the browser to continue.",
     404,
   );
+}
+
+function applyBoundValues(
+  form: BoundForm,
+  target: { frameUrl: string; origin: string },
+  values: Record<string, string>,
+  write: boolean,
+): FormControl | boolean | null {
+  const valid = () =>
+    location.href === target.frameUrl &&
+    location.origin === target.origin &&
+    form.scope.isConnected &&
+    (form.scope instanceof HTMLFormElement ? form.scope.action : undefined) === form.action &&
+    form.controls.every(({ input, form, attributes, action, options }) => {
+      const rect = input.getBoundingClientRect();
+      return (
+        input.isConnected &&
+        input.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) &&
+        !input.disabled &&
+        !("readOnly" in input && input.readOnly) &&
+        rect.width > 0 &&
+        rect.height > 0 &&
+        getComputedStyle(input).visibility === "visible" &&
+        !input.closest('[inert], [aria-hidden="true"]') &&
+        input.form === form &&
+        input.form?.action === action &&
+        JSON.stringify(
+          [
+            "type",
+            "name",
+            "id",
+            "autocomplete",
+            "maxlength",
+            "required",
+            "pattern",
+            "form",
+            "multiple",
+            "min",
+            "max",
+            "step",
+          ].map((name) => input.getAttribute(name)),
+        ) === attributes &&
+        (!(input instanceof HTMLSelectElement) ||
+          JSON.stringify(
+            Array.from(input.options).map((option) => [
+              option.value,
+              option.label,
+              option.disabled,
+              option.parentElement?.matches("optgroup[disabled]"),
+            ]),
+          ) === options)
+      );
+    });
+  if (!valid()) return null;
+  if (!write) return true;
+  let anchor: FormControl | null = null;
+  for (const field of form.fields) {
+    const value = values[field.descriptor.id];
+    if (value === undefined) continue;
+    if (value === "" && field.descriptor.options) continue;
+    for (const [index, input] of field.inputs.entries()) {
+      // Event handlers can replace another field synchronously. Stop before
+      // delivering any value to a replacement or a different destination.
+      if (!valid()) return null;
+      if (field.choice === "radio" && index !== Number(value)) continue;
+      input.focus();
+      if (!valid()) return null;
+      if (field.choice === "checkbox" || field.choice === "radio") {
+        // Checkbox/radio change handlers in controlled forms listen for clicks.
+        const control = input as HTMLInputElement;
+        const checked = field.choice === "radio" || value === "1";
+        if (control.checked !== checked) control.click();
+        if (control.checked !== checked) return null;
+        input.blur();
+        anchor = input;
+        continue;
+      } else if (field.choice === "option" && input instanceof HTMLSelectElement) {
+        const setter = Object.getOwnPropertyDescriptor(HTMLOptionElement.prototype, "selected")
+          ?.set;
+        if (!setter) return null;
+        setter.call(input.options[field.optionIndex!], value === "1");
+      } else if (input instanceof HTMLSelectElement) {
+        const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "selectedIndex")
+          ?.set;
+        if (!setter) return null;
+        setter.call(input, Number(value));
+      } else {
+        const prototype =
+          input instanceof HTMLTextAreaElement
+            ? HTMLTextAreaElement.prototype
+            : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+        if (!setter) return null;
+        setter.call(input, field.inputs.length > 1 ? value[index] : value);
+      }
+      input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      input.blur();
+      anchor = input;
+    }
+  }
+  return anchor;
+}
+
+async function attachedParts(parts: BoundFormPart[]): Promise<boolean> {
+  for (const part of parts) {
+    const container = part.parentIndex === undefined ? undefined : parts[part.parentIndex];
+    let child = part.frame;
+    let foundContainer = !container;
+    while (child.parentFrame()) {
+      const owner = await child.frameElement().catch(() => null);
+      if (!owner) return false;
+      try {
+        const visible = await owner
+          .evaluate((element) => {
+            const rect = element.getBoundingClientRect();
+            return (
+              element.isConnected &&
+              element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) &&
+              rect.width > 0 &&
+              rect.height > 0 &&
+              !element.closest('[inert], [aria-hidden="true"]')
+            );
+          })
+          .catch(() => false);
+        if (!visible) return false;
+        if (container?.frame === child.parentFrame()) {
+          foundContainer = await container.handle
+            .evaluate((form, element) => form.scope.contains(element), owner)
+            .catch(() => false);
+          if (!foundContainer) return false;
+        }
+      } finally {
+        await owner.dispose();
+      }
+      child = child.parentFrame()!;
+    }
+    if (!foundContainer) return false;
+  }
+  return true;
 }
 
 async function fillBoundForm(
@@ -606,7 +1055,7 @@ async function fillBoundForm(
     typeof values !== "object" ||
     Array.isArray(values) ||
     Object.keys(values).some((id) => !fields.some((field) => field.id === id)) ||
-    !Object.values(values).some((value) => typeof value === "string" && value.length > 0)
+    !Object.keys(values).length
   ) {
     throw new CredentialFormError("The submitted fields do not match this form.", 400);
   }
@@ -624,96 +1073,88 @@ async function fillBoundForm(
     )
       throw new CredentialFormError("A field does not match the form's requirements.", 400);
   }
-  await clearContinuation(cdpService);
-  const anchorHandle = await located.handle
-    .evaluateHandle(
-      (form, target, values) => {
-        const valid = () =>
-          location.href === target.frameUrl &&
-          location.origin === target.origin &&
-          form.controls.every(({ input, form, attributes, action, options }) => {
-            const rect = input.getBoundingClientRect();
-            return (
-              input.isConnected &&
-              input.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) &&
-              !input.disabled &&
-              !("readOnly" in input && input.readOnly) &&
-              rect.width > 0 &&
-              rect.height > 0 &&
-              getComputedStyle(input).visibility === "visible" &&
-              !input.closest('[inert], [aria-hidden="true"]') &&
-              input.form === form &&
-              input.form?.action === action &&
-              JSON.stringify(
-                [
-                  "type",
-                  "name",
-                  "id",
-                  "autocomplete",
-                  "maxlength",
-                  "required",
-                  "pattern",
-                  "form",
-                ].map((name) => input.getAttribute(name)),
-              ) === attributes &&
-              (!(input instanceof HTMLSelectElement) ||
-                JSON.stringify(
-                  Array.from(input.options).map((option) => [
-                    option.value,
-                    option.label,
-                    option.disabled,
-                    option.parentElement?.matches("optgroup[disabled]"),
-                  ]),
-                ) === options)
-            );
-          });
-        if (!valid()) return null;
-        let anchor: FormControl | null = null;
-        for (const field of form.fields) {
-          const value = values[field.descriptor.id];
-          if (value === undefined || value === "") continue;
-          for (const [index, input] of field.inputs.entries()) {
-            // Event handlers can replace another field synchronously. Stop before
-            // delivering any value to a replacement or a different destination.
-            if (!valid()) return null;
-            input.focus();
-            if (input instanceof HTMLSelectElement) {
-              const setter = Object.getOwnPropertyDescriptor(
-                HTMLSelectElement.prototype,
-                "selectedIndex",
-              )?.set;
-              if (!setter) return null;
-              setter.call(input, Number(value));
-            } else {
-              const prototype =
-                input instanceof HTMLTextAreaElement
-                  ? HTMLTextAreaElement.prototype
-                  : HTMLInputElement.prototype;
-              const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
-              if (!setter) return null;
-              setter.call(input, field.inputs.length > 1 ? value[index] : value);
-            }
-            input.dispatchEvent(
-              new InputEvent("input", { bubbles: true, inputType: "insertText" }),
-            );
-            input.dispatchEvent(new Event("change", { bubbles: true }));
-            input.blur();
-            anchor = input;
-          }
-        }
-        return anchor;
-      },
-      target,
-      values,
-    )
-    .catch(() => undefined);
-  const anchor = anchorHandle?.asElement() as ElementHandle<FormControl> | null;
-  if (!anchor) {
-    await anchorHandle?.dispose();
-    throw new CredentialFormError(
+  const changed = () =>
+    new CredentialFormError(
       "The form changed before it could be filled. Reconnect to continue.",
       409,
     );
+  if (!(await attachedParts(located.parts))) throw changed();
+  // Validate every destination before writing any field. Each write also checks
+  // its own live nodes so page event handlers cannot redirect subsequent values.
+  for (const part of located.parts) {
+    const valid = await part.handle
+      .evaluate(applyBoundValues, { frameUrl: part.frameUrl, origin: part.origin }, values, false)
+      .catch(() => false);
+    if (!valid) throw changed();
+    const choicesValid = await part.handle
+      .evaluate(
+        (form, values) =>
+          form.fields.every(
+            (field) =>
+              field.choice !== "option" ||
+              !field.inputs[0].required ||
+              form.fields.some(
+                (other) =>
+                  other.choice === "option" &&
+                  other.inputs[0] === field.inputs[0] &&
+                  values[other.descriptor.id] === "1",
+              ),
+          ),
+        values,
+      )
+      .catch(() => false);
+    if (!choicesValid)
+      throw new CredentialFormError("Select at least one option in each required field.", 400);
+  }
+  await clearContinuation(cdpService);
+  let anchor: ElementHandle<HTMLElement> | undefined;
+  let wrote = false;
+  try {
+    for (const part of located.parts) {
+      if (!(await attachedParts(located.parts))) throw changed();
+      const hasValues = await part.handle
+        .evaluate(
+          (form, values) =>
+            form.fields.some(
+              (field) =>
+                values[field.descriptor.id] !== undefined &&
+                !(values[field.descriptor.id] === "" && field.descriptor.options),
+            ),
+          values,
+        )
+        .catch(() => {
+          throw changed();
+        });
+      if (!hasValues) {
+        if (part === located.parts[0]) {
+          const primary = await part.handle.evaluateHandle((form) => form.scope);
+          anchor = primary.asElement() as ElementHandle<HTMLElement>;
+        }
+        continue;
+      }
+      const result = await part.handle
+        .evaluateHandle(
+          applyBoundValues,
+          { frameUrl: part.frameUrl, origin: part.origin },
+          values,
+          true,
+        )
+        .catch(() => undefined);
+      const filled = result?.asElement() as ElementHandle<HTMLElement> | null;
+      if (!filled) {
+        await result?.dispose();
+        throw changed();
+      }
+      wrote = true;
+      // Keep the root form anchor for continuation; card-frame nodes cannot
+      // identify the checkout's continue button.
+      if (!anchor) anchor = filled;
+      else await filled.dispose();
+    }
+    if (!anchor || !wrote) throw changed();
+  } catch (error) {
+    await anchor?.dispose();
+    throw error;
   }
   if (request.submit !== true && located.description.kind === "login") {
     await anchor.dispose();
@@ -721,7 +1162,7 @@ async function fillBoundForm(
   }
   // A receipt identifies an exact node, so MCP never guesses which filled form
   // a continuation button belongs to. It carries no field values.
-  const client = (anchor as ElementHandle<FormControl> & { client: CDPSession }).client;
+  const client = (anchor as ElementHandle<HTMLElement> & { client: CDPSession }).client;
   const { node } = await client.send("DOM.describeNode", {
     objectId: anchor.remoteObject().objectId,
   });
@@ -739,11 +1180,16 @@ async function fillBoundForm(
     void clearContinuation(cdpService);
   }, 5 * 60_000);
   timer.unref();
-  const bound = await located.handle.evaluateHandle((form) => form);
+  const parts = await Promise.all(
+    located.parts.map(async (part) => ({
+      ...part,
+      handle: await part.handle.evaluateHandle((form) => form),
+    })),
+  );
   continuations.set(cdpService, {
     receipt,
     anchor,
-    bound,
+    parts,
     filledIds: Object.keys(values).filter((id) => values[id] !== ""),
     timer,
   });
@@ -781,12 +1227,13 @@ export async function fillCredentialForm(
 
 export async function discoverCredentialForm(
   cdpService: CDPService,
+  scope: CredentialFormScope = "sensitive",
 ): Promise<CredentialFormDescription> {
   if (filling.has(cdpService))
     throw new CredentialFormError("A secure form operation is already in progress.", 409);
   filling.add(cdpService);
   try {
-    const result = await discoverBoundForm(cdpService);
+    const result = await discoverBoundForm(cdpService, scope);
     recordBrowserForm(cdpService, result.formId);
     return result;
   } finally {

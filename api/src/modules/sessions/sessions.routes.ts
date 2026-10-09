@@ -123,13 +123,25 @@ async function routes(server: FastifyInstance) {
     {
       schema: {
         operationId: "discover_session_credential_form",
-        description: "Discover a visible login form for a trusted session viewer handoff",
+        description: "Discover payment and authentication fields, or explicitly request all fields",
         tags: ["Sessions"],
-        summary: "Discover a credential form",
+        summary: "Discover a form",
+        querystring: {
+          type: "object",
+          properties: {
+            scope: { type: "string", enum: ["sensitive", "all"], default: "sensitive" },
+          },
+          additionalProperties: false,
+        },
       },
     },
-    async (request: FastifyRequest<{ Params: { sessionId: string } }>, reply: FastifyReply) =>
-      handleDiscoverCredentialForm(server, request, reply),
+    async (
+      request: FastifyRequest<{
+        Params: { sessionId: string };
+        Querystring: { scope?: "sensitive" | "all" };
+      }>,
+      reply: FastifyReply,
+    ) => handleDiscoverCredentialForm(server, request, reply),
   );
 
   server.get(
@@ -151,9 +163,9 @@ async function routes(server: FastifyInstance) {
     {
       schema: {
         operationId: "fill_session_credential_form",
-        description: "Fill a previously discovered credential form without returning its values",
+        description: "Fill a previously discovered form without returning its values",
         tags: ["Sessions"],
-        summary: "Fill a credential form",
+        summary: "Fill a form",
         body: {
           type: "object",
           additionalProperties: false,

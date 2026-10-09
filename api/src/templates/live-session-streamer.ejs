@@ -1,1884 +1,1141 @@
-<!DOCTYPE html>
-  <html data-theme="<%= theme %>" <%= singlePageMode ? 'data-single-page-mode="true"' : '' %>>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Steel Session Player</title>
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Live browser</title>
     <style>
-        /* CSS Variables for themes */
-        html[data-theme="dark"] {
-              --bg-primary: #272725;
-              --bg-secondary: #171717;
-              --border-color: #383838;
-              --text-color: #ffffff;
-              --tab-active-bg: #272725;
-              --tab-hover-bg: #333333;
-              --icon-color: #8a8a8a;
-              --icon-hover-color: #ffffff;
-              --error-color: #e53935;
-              --offline-indicator-color: #e53935;
-              --loading-overlay-bg: rgba(30, 30, 30, 0.8);
-              --loading-spinner-color: #ffffff;
-        }
-
-        html[data-theme="light"] {
-            --bg-primary: #ffffff;
-            --bg-secondary: #f5f5f5;
-            --border-color: #e0e0e0;
-            --text-color: #000000;
-              --tab-active-bg: #e8e8e8;
-              --tab-hover-bg: #efefef;
-              --icon-color: #666666;
-              --icon-hover-color: #000000;
-              --error-color: #e53935;
-              --offline-indicator-color: #e53935;
-              --loading-overlay-bg: rgba(240, 240, 240, 0.8);
-              --loading-spinner-color: #333333;
-        }
-
-        html, body {
-            margin: 0;
-            padding: 0;
-            width: 100%;
-            height: 100%;
-            background: var(--bg-primary);
-            overflow: hidden;
-              font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
-        }
-        .container {
-            width: 100%;
-            height: 100%;
-            background: var(--bg-primary);
-            border: none;
-            display: flex;
-            flex-direction: column;
-            box-sizing: border-box;
-            overflow: hidden;
-        }
-        .top-bar {
-            height: 40px;
-            flex: 0 0 40px;
-            background: var(--bg-secondary);
-            border-bottom: 1px solid var(--border-color);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-              padding: 0;
-            box-sizing: border-box;
-        }
-        .url-bar {
-            min-width: 0;
-              width: 100%;
-            height: 28px;
-            padding: 0 12px;
-            background: var(--bg-primary);
-            border-radius: 4px;
-            border: 1px solid var(--border-color);
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            color: var(--text-color);
-            font-family: system-ui, -apple-system, sans-serif;
-            &:focus-within {
-              outline: none;
-              background: var(--tab-hover-bg);
-            }
-        }
-        .favicon {
-            width: 14px;
-            height: 14px;
-            object-fit: contain;
-            margin-right: 4px;
-        }
-        .url-input {
-            flex: 1;
-            border: none;
-            background: transparent;
-            color: var(--text-color);
-            font-family: 'Geist', sans-serif;
-            font-size: 13px;
-            outline: none;
-            width: 100%;
-        }
-        .content {
-            min-height: 0;
-            flex: 1;
-            overflow: hidden;
-            background: white;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            position: relative;
-        }
-          .canvas-container {
-              position: absolute;
-              height: 100%;
-              width: 100%;
-              display: none;
-          }
-          .canvas-container.active {
-              display: flex;
-              align-items: center;
-              justify-content: center;
-          }
-          .canvas {
-            position: absolute;
-            height: 100%;
-            width: auto;
-            left: 50%;
-            transform: translateX(-50%);
-            object-fit: contain;
-            touch-action: none;
-          }
-
-          .viewport-control {
-            position: relative;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            width: 28px;
-            height: 28px;
-            border-radius: 4px;
-          }
-          .viewport-control:hover { background: var(--tab-hover-bg); }
-          .viewport-control:focus-within {
-            outline: 2px solid var(--icon-color);
-            outline-offset: -2px;
-          }
-          .viewport-control:has(select:disabled) { opacity: .5; }
-          .viewport-control select {
-            position: absolute;
-            inset: 0;
-            width: 100%;
-            height: 100%;
-            opacity: 0;
-            cursor: pointer;
-            font-size: 16px;
-          }
-          .viewport-control select:disabled { cursor: default; }
-          #viewport-status {
-            position: absolute;
-            width: 1px;
-            height: 1px;
-            overflow: hidden;
-            clip-path: inset(50%);
-            white-space: nowrap;
-          }
-          .viewport-confirm {
-            max-width: min(360px, calc(100% - 64px));
-            padding: 20px;
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            background: var(--bg-primary);
-            color: var(--text-color);
-          }
-          .viewport-confirm::backdrop { background: rgba(0, 0, 0, .45); }
-          .viewport-confirm p { line-height: 1.5; }
-          .viewport-confirm button { font: inherit; padding: 10px 14px; }
-
-          /* Tab bar styles */
-          .tab-bar {
-            display: flex;
-            padding: 6px;
-            gap: 4px;
-            height: 36px;
-            background: var(--bg-secondary);
-            border-bottom: 1px solid var(--border-color);
-            overflow-x: auto;
-            scrollbar-width: none; /* Firefox */
-            -ms-overflow-style: none; /* IE and Edge */
-            align-items: center;
-          }
-          .tab-bar::-webkit-scrollbar {
-              display: none; /* Chrome, Safari, Opera */
-          }
-          .tab {
-              display: flex;
-              align-items: center;
-              padding: 0 12px;
-              min-width: 120px;
-              max-width: 200px;
-              height: 36px;
-              border-radius: 8px;
-              color: var(--text-color);
-              font-size: 12px;
-              cursor: <%= interactive ? "pointer" : "default" %>;
-              white-space: nowrap;
-              overflow: hidden;
-              text-overflow: ellipsis;
-              position: relative;
-              gap: 8px;
-              transition: background-color 0.2s;
-          }
-          .tab:hover {
-              background-color: <%= interactive ? "var(--tab-hover-bg)" : "transparent" %>;
-          }
-          .tab.active {
-              background-color: var(--tab-active-bg);
-          }
-          .tab-favicon {
-              width: 16px;
-              height: 16px;
-              object-fit: contain;
-          }
-          .tab-title {
-              flex: 1;
-              overflow: hidden;
-              text-overflow: ellipsis;
-          }
-          .tab-close {
-              width: 16px;
-              height: 16px;
-              display: flex;
-              align-items: center;
-              justify-content: center;
-              border-radius: 50%;
-              opacity: 0.6;
-              font-size: 14px;
-              line-height: 1;
-          }
-          .tab-close:hover {
-              background: rgba(255, 255, 255, 0.1);
-              opacity: 1;
-          }
-          .new-tab-button {
-              display: flex;
-              align-items: center;
-              justify-content: center;
-              width: 36px;
-              min-width: 36px;
-              height: 36px;
-              color: var(--icon-color);
-              cursor: pointer;
-              font-size: 18px;
-              transition: color 0.2s;
-          }
-          .new-tab-button:hover {
-              color: var(--icon-hover-color);
-          }
-
-          /* Navigation buttons */
-          .nav-buttons {
-              display: flex;
-              gap: 4px;
-              margin-left: 8px;
-              margin-right: 8px;
-          }
-        .nav-button {
-              width: 28px;
-              height: 28px;
-            border: none;
-            background: transparent;
-              color: var(--icon-color);
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-              font-size: 18px;
-            padding: 0;
-              border-radius: 4px;
-              transition: all 0.2s;
-        }
-        .nav-button:hover {
-              color: var(--icon-hover-color);
-              background: rgba(255, 255, 255, 0.1);
-          }
-          .nav-button:disabled {
-              cursor: default;
-              &:hover {
-                background: transparent;
-              }
-          }
-
-          /* Browser chrome layout */
-          .browser-chrome {
-              display: flex;
-              flex-direction: column;
-              width: 100%;
-              position: relative;
-          }
-          .address-bar {
-              display: flex;
-              align-items: center;
-              padding: 0 8px;
-              height: 40px;
-              background: var(--bg-secondary);
-              border-bottom: 1px solid var(--border-color);
-          }
-
-          /* Icons */
-          .icon {
-              width: 16px;
-              height: 16px;
-              fill: var(--icon-color);
-          }
-          .icon-container {
-              display: flex;
-              align-items: center;
-              justify-content: center;
-          }
-
-          /* Offline status indicator styling - inline with tabs */
-          .connection-status {
-              display: flex;
-              align-items: center;
-              padding: 0 12px;
-              height: 36px;
-              color: var(--text-color);
-              font-family: system-ui, -apple-system, sans-serif;
-              font-size: 13px;
-              box-sizing: border-box;
-              min-width: 140px;
-              flex-shrink: 0;
-          }
-
-          .connection-status.offline {
-              display: flex;
-          }
-
-          .connection-status.online {
-              display: none;
-          }
-
-          /* Initially hide the connection status until we know the state */
-          .connection-status.connecting {
-              display: none;
-          }
-
-          .status-indicator {
-              width: 8px;
-              height: 8px;
-              border-radius: 50%;
-              margin-right: 8px;
-              display: inline-block;
-              flex-shrink: 0;
-          }
-
-          .status-indicator.offline {
-              background-color: var(--offline-indicator-color);
-          }
-
-          /* Remove the margin adjustment since it's now inline */
-          .connection-status.offline + .tab-bar {
-              margin-top: 0;
-          }
-
-          /* Add new styles for the lock icons */
-          .url-security-icon {
-              width: 18px;
-              height: 18px;
-              display: flex;
-              align-items: center;
-              justify-content: center;
-          }
-
-          .url-security-icon svg {
-              width: 18px;
-              height: 18px;
-              fill: var(--icon-color);
-          }
-
-          .url-security-icon.secure svg {
-              fill: #4CAF50; /* Green for secure connections */
-          }
-
-          /* Single-page mode styles */
-          html[data-single-page-mode="true"] .tab-bar {
-              display: none !important;
-          }
-
-          html[data-single-page-mode="true"] .content {
-              height: calc(100% - 40px); /* Only account for address bar in single-page mode */
-          }
-
-          /* Add styles for WebSocket connection loading/error states */
-          .canvas-container.loading::before {
-              content: "Loading...";
-              position: absolute;
-              top: 50%;
-              left: 50%;
-              transform: translate(-50%, -50%);
-              color: var(--text-color);
-              font-family: system-ui, -apple-system, sans-serif;
-              font-size: 16px;
-              z-index: 5;
-          }
-
-          .canvas-container.error::before {
-              content: "Session released";
-              position: absolute;
-              top: 50%;
-              left: 50%;
-              transform: translate(-50%, -50%);
-              color: #fff;
-              font-family: system-ui, -apple-system, sans-serif;
-              font-size: 16px;
-              z-index: 5;
-          }
-
-          /* Tab switching loading overlay */
-          .canvas-container.tab-switching::after {
-              content: "";
-              position: absolute;
-              top: 0;
-              left: 0;
-              right: 0;
-              bottom: 0;
-              background: var(--loading-overlay-bg);
-              z-index: 10;
-          }
-
-          .canvas-container.tab-switching::before {
-              content: "";
-              position: absolute;
-              width: 40px;
-              height: 40px;
-              top: 50%;
-              left: 50%;
-              transform: translate(-50%, -50%);
-              border: 4px solid transparent;
-              border-top-color: var(--loading-spinner-color);
-              border-radius: 50%;
-              animation: spin 1s linear infinite;
-              z-index: 11;
-          }
-
-          @keyframes spin {
-              0% { transform: translate(-50%, -50%) rotate(0deg); }
-              100% { transform: translate(-50%, -50%) rotate(360deg); }
-          }
-
-          /* Tab loading spinner */
-          .tab-favicon-spinner {
-              width: 16px;
-              height: 16px;
-              display: none;
-              position: relative;
-          }
-
-          .tab-favicon-spinner::after {
-              content: '';
-              position: absolute;
-              width: 12px;
-              height: 12px;
-              top: 2px;
-              left: 2px;
-              border: 2px solid var(--icon-color);
-              border-top-color: transparent;
-              border-radius: 50%;
-              animation: spinner-rotation 0.8s linear infinite;
-          }
-
-          @keyframes spinner-rotation {
-              0% { transform: rotate(0deg); }
-              100% { transform: rotate(360deg); }
-          }
-
-          .tab.loading .tab-favicon {
-              display: none;
-          }
-
-          .tab.loading .tab-favicon-spinner {
-              display: block;
-          }
+      :root {
+        color-scheme: <%= theme === 'dark' ? 'dark' : 'light' %>;
+        font:
+          14px system-ui,
+          sans-serif;
+        background: Canvas;
+        color: CanvasText;
+      }
+      [hidden] {
+        display: none !important;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        height: 100dvh;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      header {
+        flex: none;
+        display: flex;
+        position: relative;
+        z-index: 2;
+        align-items: center;
+        gap: 4px;
+        padding: 6px;
+        border-bottom: 1px solid #8885;
+      }
+      button,
+      select,
+      input,
+      textarea {
+        font: inherit;
+      }
+      button,
+      select {
+        min-height: 36px;
+        border: 1px solid #8887;
+        border-radius: 8px;
+        padding: 6px 10px;
+        background: Canvas;
+        color: CanvasText;
+      }
+      button:disabled,
+      select:disabled {
+        opacity: 0.5;
+      }
+      #control {
+        background: #245de8;
+        color: white;
+        border-color: #245de8;
+      }
+      #url {
+        flex: 1;
+        min-width: 0;
+        width: 0;
+        height: 36px;
+        font-size: 16px;
+        border: 1px solid #8885;
+        border-radius: 8px;
+        padding: 9px;
+        background: Canvas;
+        color: CanvasText;
+      }
+      .icon-button,
+      .viewport-control {
+        flex: none;
+        width: 32px;
+        height: 36px;
+        display: grid;
+        place-items: center;
+        padding: 0;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: CanvasText;
+        font-size: 20px;
+      }
+      .icon-button:hover,
+      .viewport-control:hover {
+        background: #8882;
+      }
+      .viewport-control {
+        position: relative;
+      }
+      .viewport-control svg {
+        width: 20px;
+        height: 20px;
+        fill: currentColor;
+      }
+      .viewport-control select {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        opacity: 0;
+        cursor: pointer;
+        font-size: 16px;
+      }
+      .viewport-control:focus-within {
+        outline: 2px solid #245de8;
+      }
+      .viewport-control:has(select:disabled) {
+        opacity: 0.5;
+      }
+      #browser-menu {
+        position: absolute;
+        top: calc(100% + 4px);
+        right: 6px;
+        width: min(280px, calc(100vw - 12px));
+        display: grid;
+        gap: 8px;
+        padding: 12px;
+        border: 1px solid #8885;
+        border-radius: 10px;
+        background: Canvas;
+        box-shadow: 0 4px 20px #0002;
+      }
+      #tabs {
+        min-width: 0;
+        width: 100%;
+      }
+      #status {
+        position: absolute;
+        top: calc(100% + 4px);
+        left: 6px;
+        max-width: calc(100vw - 12px);
+        padding: 6px 10px;
+        border-radius: 6px;
+        background: Canvas;
+        color: CanvasText;
+        box-shadow: 0 2px 8px #0002;
+        font-size: 12px;
+        pointer-events: none;
+      }
+      header[data-ready="true"] #status {
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip-path: inset(50%);
+        padding: 0;
+      }
+      #stage {
+        flex: 1;
+        min-height: 0;
+        overflow: hidden;
+        position: relative;
+        display: flex;
+        justify-content: center;
+        align-items: flex-start;
+        touch-action: none;
+        background: #8881;
+      }
+      canvas {
+        display: block;
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        object-fit: contain;
+        touch-action: none;
+        outline: none;
+        background: white;
+      }
+      #stage[data-ready="false"] canvas {
+        opacity: 0.65;
+      }
+      #keyboard-panel {
+        position: absolute;
+        bottom: 12px;
+        left: 12px;
+        right: 12px;
+        border: 1px solid #8887;
+        border-radius: 10px;
+        padding: 8px;
+        background: Canvas;
+        box-shadow: 0 4px 20px #0002;
+      }
+      #keyboard-panel[hidden] {
+        display: none;
+      }
+      #keyboard-input {
+        display: block;
+        width: 100%;
+        height: 40px;
+        resize: none;
+        border: 1px solid #8887;
+        border-radius: 6px;
+        padding: 8px;
+        font-size: 16px;
+        background: Canvas;
+        color: CanvasText;
+      }
+      #keyboard-panel p {
+        margin: 0 0 6px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 12px;
+      }
+      dialog {
+        border: 1px solid #8885;
+        border-radius: 12px;
+        max-width: 340px;
+      }
+      dialog p {
+        line-height: 1.5;
+      }
     </style>
-</head>
-<body>
-    <div class="container">
-        <% if (showControls) { %>
-          <div class="browser-chrome">
-              <% if (!singlePageMode) { %>
-              <div class="tab-bar" id="tab-bar">
-                  <div class="connection-status connecting" id="connection-status">
-                      <div class="status-indicator offline"></div>
-                      <span>Session Offline</span>
-                  </div>
-                  <!-- Tabs will be dynamically added here -->
-                  <!-- New tab button commented out as requested
-                  <div class="new-tab-button" id="new-tab-button">+</div>
-                  -->
-              </div>
-              <% } %>
-              <div class="address-bar">
-                <div class="nav-buttons">
-                    <button class="nav-button" id="back-button" <%= interactive ? "" : "disabled" %>>
-                        <svg class="icon" viewBox="0 0 24 24">
-                            <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/>
-                        </svg>
-                    </button>
-                    <button class="nav-button" id="forward-button" <%= interactive ? "" : "disabled" %>>
-                        <svg class="icon" viewBox="0 0 24 24">
-                            <path d="M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8-8-8z"/>
-                        </svg>
-                    </button>
-                    <button class="nav-button" id="refresh-button" <%= interactive ? "" : "disabled" %>>
-                        <svg class="icon" viewBox="0 0 24 24">
-                            <path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/>
-                        </svg>
-                    </button>
-                    <% if (interactive) { %>
-                    <div class="viewport-control" title="View mode">
-                        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
-                            <path d="M20 3H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h6v2H7v2h10v-2h-3v-2h6a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm0 14H4V5h16v12z"/>
-                        </svg>
-                        <select id="viewport-mode" aria-label="View mode" aria-describedby="viewport-status" disabled>
-                            <option value="auto">Auto</option>
-                            <option value="mobile">Mobile</option>
-                            <option value="desktop">Desktop</option>
-                        </select>
-                    </div>
-                    <% } %>
-                </div>
-                <div class="url-bar">
-                    <div class="url-security-icon" id="url-security-icon">
-                        <svg viewBox="0 0 24 24" id="lock-icon" style="display: none;">
-                            <path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/>
-                        </svg>
-                        <svg viewBox="0 0 24 24" id="unlock-icon" style="display: none;">
-                            <path d="M12 17c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm6-9h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6h1.9c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm0 12H6V10h12v10z"/>
-                        </svg>
-                    </div>
-                    <input type="text" id="url-text" class="url-input" value="Session connecting..." disabled <%= interactive ? "" : "readonly" %>>
-                </div>
-              </div>
-          </div>
-        <% } %>
-        <% if (interactive && showControls) { %>
-        <span id="viewport-status" role="status">Connecting…</span>
-        <dialog id="viewport-confirm" class="viewport-confirm" aria-labelledby="viewport-confirm-title">
-            <strong id="viewport-confirm-title">Reload to change mobile emulation?</strong>
-            <p>The remote page will reload. Unsent form input may be lost.</p>
-            <button id="viewport-cancel" type="button">Cancel</button>
-            <button id="viewport-reload" type="button">Reload page</button>
-        </dialog>
-        <% } %>
-        <div class="content" id="content">
-            <!-- Canvas containers will be dynamically added here -->
-        </div>
-    </div>
-
+  </head>
+  <body>
+    <header <%= showControls ? '' : 'hidden' %>>
+      <button id="back" class="icon-button" aria-label="Back" title="Back">‹</button>
+      <button id="forward" class="icon-button" aria-label="Forward" title="Forward">›</button>
+      <input id="url" aria-label="Browser address" autocomplete="off" spellcheck="false" readonly />
+      <button id="keyboard" class="icon-button" type="button" aria-label="Keyboard" title="Keyboard" disabled>⌨️</button>
+      <div class="viewport-control" title="Page layout">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 3H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h6v2H7v2h10v-2h-3v-2h6a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm0 14H4V5h16v12z"/></svg>
+        <select id="viewport-mode" aria-label="Page layout" disabled>
+          <option value="agent">Agent View</option>
+          <option value="auto">Auto</option>
+          <option value="mobile">Mobile</option>
+          <option value="desktop">Desktop</option>
+        </select>
+      </div>
+      <button id="menu-toggle" class="icon-button" type="button" aria-label="Browser options" title="Browser options" aria-expanded="false" aria-controls="browser-menu">⋯</button>
+      <div id="browser-menu" hidden>
+        <select id="tabs" aria-label="Browser tab" <%= singlePageMode ? 'hidden' : '' %>></select>
+        <button id="close-tab" aria-label="Close tab" <%= singlePageMode ? 'hidden' : '' %>>Close tab</button>
+        <button id="refresh" aria-label="Reload">Reload</button>
+        <button id="control" type="button" disabled>Take control</button>
+        <button id="reconnect" type="button" hidden>Reconnect</button>
+      </div>
+      <span id="status" role="status" aria-live="polite">Connecting…</span>
+    </header>
+    <main id="stage" data-ready="false">
+      <canvas tabindex="0" aria-label="Live browser page"></canvas>
+      <div id="keyboard-panel" hidden>
+        <p>
+          Type into the selected browser field.
+          <button id="keyboard-close" class="icon-button" type="button" aria-label="Hide keyboard" title="Hide keyboard">×</button>
+        </p>
+        <textarea
+          id="keyboard-input"
+          aria-label="Browser keyboard"
+          autocapitalize="off"
+          autocomplete="off"
+          autocorrect="off"
+          spellcheck="false"
+          inputmode="text"
+        ></textarea>
+      </div>
+    </main>
+    <dialog id="viewport-confirm">
+      <p>Changing the page’s mobile emulation reloads it. Unsaved page input may be lost.</p>
+      <button id="viewport-cancel">Cancel</button> <button id="viewport-reload">Reload page</button>
+    </dialog>
     <script>
-    (function() {
-          // Global flag for single page mode
-          const singlePageMode = <%= singlePageMode %>;
-          const interactive = <%= interactive %>;
-
-          // Tab and page management
-          const tabBar = document.getElementById('tab-bar');
-          const contentContainer = document.getElementById('content');
-          const urlText = document.getElementById('url-text');
-          const backButton = document.getElementById('back-button');
-          const forwardButton = document.getElementById('forward-button');
-          const refreshButton = document.getElementById('refresh-button');
-          const connectionStatus = document.getElementById('connection-status');
-          const viewportMode = document.getElementById('viewport-mode');
-          const viewportStatus = document.getElementById('viewport-status');
-          const viewportConfirm = document.getElementById('viewport-confirm');
-          let pendingConfirmation = null;
-
-          let tabs = {};
-          let activeTabId = null;
-
-          // WebSocket connection management
-          const baseWsUrl = <%- JSON.stringify(wsUrl) %>;
-          let tabDiscoveryWebSocket = null; // WebSocket for discovering tabs (multi-page mode)
-          let activeConnectionRetries = {}; // Track reconnection attempts
-
-          // Default dimensions until we get first image
-          const defaultWidth = <%= dimensions?.width || 1920 %>;
-          const defaultHeight = <%= dimensions?.height || 1080 %>;
-
-          function requestViewport(pageId, mode, reload = false) {
-              const tab = tabs[pageId];
-              if (!interactive || !tab?.viewportReady || tab.websocket?.readyState !== WebSocket.OPEN) return;
-              if (!mode && tab.pendingMode) return;
-              if (!contentContainer.clientWidth || !contentContainer.clientHeight) return;
-              tab.websocket.send(JSON.stringify({
-                  type: 'viewport',
-                  mode: mode || tab.viewportMode,
-                  width: Math.round(contentContainer.clientWidth),
-                  height: Math.round(contentContainer.clientHeight),
-                  reload,
-              }));
+      (() => {
+        "use strict";
+        const VERSION = 1;
+        const singlePageMode = <%- JSON.stringify(singlePageMode) %>;
+        const interactive = <%- JSON.stringify(interactive) %>;
+        const suppliedUrl = new URL(<%- JSON.stringify(wsUrl) %>, location.href);
+        suppliedUrl.host = location.host;
+        suppliedUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+        const capability =
+          /^\/s\/([^/]+)$/.exec(location.pathname)?.[1] ||
+          new URLSearchParams(location.search).get("cap");
+        if (capability) suppliedUrl.searchParams.set("cap", capability);
+        const $ = (id) => document.getElementById(id);
+        const canvas = document.querySelector("canvas");
+        const context = canvas.getContext("2d");
+        const stage = $("stage");
+        const controlButton = $("control");
+        const status = $("status");
+        const layout = $("viewport-mode");
+        const menu = $("browser-menu");
+        function closeMenu() {
+          menu.hidden = true;
+          $("menu-toggle").setAttribute("aria-expanded", "false");
+        }
+        $("menu-toggle").addEventListener("click", () => {
+          menu.hidden = !menu.hidden;
+          $("menu-toggle").setAttribute("aria-expanded", String(!menu.hidden));
+        });
+        document.addEventListener("pointerdown", (event) => {
+          if (!menu.contains(event.target) && !$("menu-toggle").contains(event.target))
+            closeMenu();
+        });
+        document.addEventListener("keydown", (event) => {
+          if (event.key === "Escape" && !menu.hidden) {
+            closeMenu();
+            $("menu-toggle").focus();
           }
+        });
+        menu.addEventListener("click", (event) => {
+          if (event.target.closest("button")) closeMenu();
+        });
+        const keyboard = $("keyboard-input");
+        const panel = $("keyboard-panel");
+        let socket,
+          connection = 0,
+          reconnectTimer,
+          resizeTimer;
+        let retries = 0,
+          expired = false,
+          suspended = false,
+          supported = false;
+        let desiredControl = interactive;
+        let controlling = false,
+          ready = false,
+          acquiring = false;
+        let generation = 0,
+          viewportGeneration = 0,
+          sequence = 0,
+          pageId = "";
+        let serverWidth = 0,
+          serverHeight = 0,
+          mode = "agent",
+          pendingMode;
+        // Detect this viewer once when it opens. Server state and reconnects must
+        // not overwrite the viewer's initial device choice or a manual selection.
+        const mobileDevice =
+          /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+          navigator.userAgentData?.mobile === true ||
+          (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+        let openingLayout = mobileDevice ? "mobile" : "agent";
+        let metadata,
+          paintedFrame = 0,
+          sentFrame = 0,
+          expiresAt = Infinity;
+        let gesture,
+          pendingMove,
+          moveTimer,
+          composing = false,
+          keyboardText = "",
+          keyboardCaret = 0;
+        const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+        const characters = (value) =>
+          Array.from(graphemes.segment(value), (part) => part.segment);
+        let discoverySocket,
+          discoveryTimer,
+          discoveryRetries = 0,
+          selectedPage = "";
+        let terminalMessage = "";
+        let clipboardRequest = 0;
+        const clipboardRequests = new Set();
+        const parentOrigin = document.referrer
+          ? new URL(document.referrer).origin
+          : location.origin;
+        const clipboardBridge =
+          interactive &&
+          window.parent !== window &&
+          new URLSearchParams(location.search).get("clipboardBridge") === "true";
+        const tellParent = (message) => {
+          if (window.parent !== window) window.parent.postMessage(message, parentOrigin);
+        };
 
-          viewportMode?.addEventListener('change', () => {
-              tabs[activeTabId].pendingMode = viewportMode.value;
-              requestViewport(activeTabId, viewportMode.value);
+        <%- include("mobile-session-input") %>
+        <%- include("viewer-gestures") %>
+        function setReady(value, message) {
+          ready = value;
+          stage.dataset.ready = String(value);
+          document.querySelector("header").dataset.ready = String(value);
+          $("keyboard").disabled = !value;
+          layout.disabled = !controlling;
+          for (const name of ["back", "forward", "refresh", "close-tab"])
+            $(name).disabled = !value;
+          $("url").readOnly = !value;
+          if (message) status.textContent = message;
+          mobileInput?.update();
+        }
+        function send(message) {
+          if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+          socket.send(JSON.stringify({ version: VERSION, generation, ...message }));
+          return true;
+        }
+        function action(message) {
+          if (!ready) return false;
+          return send({ pageId, viewportGeneration, sequence: ++sequence, ...message });
+        }
+        function clearLocalInput() {
+          gesture = undefined;
+          cancelLocalGesture();
+          pendingMove = undefined;
+          clearTimeout(moveTimer);
+          moveTimer = undefined;
+          composing = false;
+          clearKeyboard();
+          clipboardRequests.clear();
+          mobileInput?.invalidate();
+        }
+        function cancelInput() {
+          if (controlling) send({ type: "cancelInput" });
+          clearLocalInput();
+        }
+        function control(actionName) {
+          return send({ type: "control", action: actionName });
+        }
+        function takeControl() {
+          if (!supported || acquiring || controlling || !interactive) return;
+          desiredControl = true;
+          acquiring = true;
+          controlButton.disabled = true;
+          status.textContent = "Connecting control…";
+          control("acquire");
+        }
+        function requestViewport(nextMode = mode, reload = false) {
+          if (nextMode !== mode) resetLocalView();
+          if (!controlling) return;
+          cancelInput();
+          setReady(false, "Waiting for a fresh frame…");
+          send({
+            type: "viewport",
+            mode: nextMode,
+            width: Math.round(stage.clientWidth),
+            height: Math.max(160, Math.round(mobileInput?.viewportHeight(nextMode) ?? stage.clientHeight)),
+            reload,
           });
-          function finishViewportConfirmation(reload) {
-              const pending = pendingConfirmation;
-              pendingConfirmation = null;
-              viewportConfirm?.close();
-              if (!pending || !tabs[pending.pageId]) return;
-              if (reload) {
-                  requestViewport(pending.pageId, pending.mode, true);
-              } else {
-                  tabs[pending.pageId].pendingMode = null;
-                  if (viewportMode && activeTabId === pending.pageId) {
-                      viewportMode.value = tabs[pending.pageId].viewportMode;
-                      viewportMode.disabled = !tabs[pending.pageId].controlling;
-                  }
-              }
+        }
+        function scheduleReconnect(immediate = false) {
+          clearTimeout(reconnectTimer);
+          if (
+            suspended ||
+            expired ||
+            Date.now() >= expiresAt ||
+            (socket && socket.readyState <= WebSocket.OPEN)
+          )
+            return;
+          if (!navigator.onLine) {
+            setReady(false, "Offline — waiting for a connection.");
+            return;
           }
-          document.getElementById('viewport-cancel')?.addEventListener('click', () => finishViewportConfirmation(false));
-          document.getElementById('viewport-reload')?.addEventListener('click', () => finishViewportConfirmation(true));
-          viewportConfirm?.addEventListener('cancel', (event) => {
-              event.preventDefault();
-              finishViewportConfirmation(false);
-          });
-          let resizeTimer;
-          new ResizeObserver(() => {
-              if (activeTabId) updateCanvasSize(activeTabId);
-              clearTimeout(resizeTimer);
-              resizeTimer = setTimeout(() => {
-                  if (tabs[activeTabId]?.controlling) requestViewport(activeTabId);
-              }, 150);
-          }).observe(contentContainer);
-
-          // Function to set connection status
-          function setConnectionStatus(online) {
-              if (connectionStatus) {
-                  if (online) {
-                      // Connected - remove both connecting and offline classes
-                      connectionStatus.classList.remove('connecting');
-                      connectionStatus.classList.remove('offline');
-                      connectionStatus.classList.add('online');
-                  } else {
-                      // Disconnected/error - show the offline status
-                      connectionStatus.classList.remove('connecting');
-                      connectionStatus.classList.remove('online');
-                      connectionStatus.classList.add('offline');
-                      updateUrlBar('Session not connected');
-                  }
-              }
+          if (retries >= 8 && !immediate) {
+            $("reconnect").hidden = false;
+            setReady(false, "Connection lost. Reconnect to continue.");
+            return;
           }
-
-          // Function to create WebSocket URL for a specific page
-          function createWebSocketUrl(pageId) {
-              // For single-page mode, the URL already includes the pageId
-              if (singlePageMode) return baseWsUrl;
-
-              // For tab discovery, add tabInfo parameter
-              if (pageId === 'tab-discovery') {
-                  return `${baseWsUrl}?tabInfo=true`;
-              }
-
-              // Regular tab connection
-              return `${baseWsUrl}?pageId=${encodeURIComponent(pageId)}`;
+          setReady(false, "Reconnecting…");
+          reconnectTimer = setTimeout(
+            connect,
+            immediate ? 0 : Math.min(250 * 2 ** retries++, 5000),
+          );
+        }
+        function connect() {
+          if (
+            expired ||
+            suspended ||
+            Date.now() >= expiresAt ||
+            (socket && socket.readyState <= WebSocket.OPEN)
+          )
+            return;
+          clearTimeout(reconnectTimer);
+          const epoch = ++connection;
+          supported = false;
+          acquiring = false;
+          controlling = false;
+          setReady(false, retries ? "Reconnecting…" : "Connecting…");
+          clearLocalInput();
+          paintedFrame = sentFrame = sequence = 0;
+          metadata = undefined;
+          const pageUrl = new URL(suppliedUrl);
+          if (!singlePageMode) {
+            if (!selectedPage) return;
+            pageUrl.searchParams.delete("pageIndex");
+            pageUrl.searchParams.set("pageId", selectedPage);
           }
-
-          // Function to establish WebSocket connection for a tab
-          function connectTabWebSocket(pageId) {
-              // Prevent reconnection if already in progress
-              if (tabs[pageId] && tabs[pageId].reconnecting) {
-                  console.log(`Reconnection for tab ${pageId} already in progress, ignoring duplicate request`);
-                  return;
-              }
-
-              // If tab has an existing connection and it's open or connecting, don't create a new one
-              if (tabs[pageId] && tabs[pageId].websocket) {
-                  const ws = tabs[pageId].websocket;
-                  if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-                      console.log(`Tab ${pageId} already has an active connection, not reconnecting`);
-                      return ws;
-                  }
-
-                  // Only attempt to close if the socket is not already closing or closed
-                  if (ws.readyState !== WebSocket.CLOSING && ws.readyState !== WebSocket.CLOSED) {
-                      try {
-                          ws.close();
-                      } catch (err) {
-                          console.error(`Error closing existing WebSocket for tab ${pageId}: ${err}`);
-                      }
-                  }
-              }
-
-              // Mark tab as loading and reconnecting
-              if (tabs[pageId]) {
-                  tabs[pageId].canvasContainer.classList.add('loading');
-                  tabs[pageId].canvasContainer.classList.remove('error');
-                  tabs[pageId].reconnecting = true;
-              }
-
-              // Create a new WebSocket for this tab
-              const ws = new WebSocket(createWebSocketUrl(pageId));
-              console.log(`Connecting websocket for tab ${pageId}`);
-
-              if (tabs[pageId]) {
-                  tabs[pageId].websocket = ws;
-              }
-
-              // Set up event handlers
-              ws.onopen = () => {
-                  console.log(`WebSocket connection opened for tab ${pageId}`);
-
-                  // Clear reconnection status
-                  if (tabs[pageId]) {
-                      tabs[pageId].reconnecting = false;
-                      tabs[pageId].canvasContainer.classList.remove('loading');
-                      tabs[pageId].canvasContainer.classList.remove('error');
-
-                      // Reset retry counter on successful connection
-                      activeConnectionRetries[pageId] = 0;
-
-                      if (pageId !== 'tab-discovery') {
-                          // Remove loading indicator
-                          tabs[pageId].canvasContainer.classList.remove('loading');
-                          tabs[pageId].canvasContainer.classList.remove('error');
-
-                          // Set up canvas event listeners immediately when connection opens
-                          if (tabs[pageId].canvas) {
-                              setupCanvasEventListeners(tabs[pageId].canvas, pageId, ws);
-                          }
-                      }
-
-                      // Update connection status if this is the active tab
-                      if (activeTabId === pageId) {
-                          setConnectionStatus(true);
-                      }
-                  }
-              };
-
-              ws.onclose = () => {
-                  console.log(`WebSocket connection closed for tab ${pageId}`);
-
-                  if (tabs[pageId]) {
-                      // Only show error if this wasn't an intentional close
-                      if (!tabs[pageId].intentionalClose) {
-                          tabs[pageId].canvasContainer.classList.add('error');
-                          // Only set connection status to offline if this is the active tab
-                          // and it's not a normal shutdown
-                          if (activeTabId === pageId) {
-                              setConnectionStatus(false);
-                          }
-                      }
-                      tabs[pageId].reconnecting = false;
-                      tabs[pageId].intentionalClose = false;
-                      tabs[pageId].viewportReady = false;
-                      tabs[pageId].controlling = false;
-                      tabs[pageId].pendingMode = null;
-                      if (activeTabId === pageId && viewportMode) {
-                          viewportMode.disabled = true;
-                          viewportStatus.textContent = 'Disconnected';
-                      }
-                      if (pendingConfirmation?.pageId === pageId) finishViewportConfirmation(false);
-                  }
-              };
-
-              // Add error handler to explicitly handle connection failures
-              ws.onerror = () => {
-                  console.log(`WebSocket connection error for tab ${pageId}`);
-
-                  if(pageId === 'tab-discovery') {
-                    setConnectionStatus(false);
-                    updateUrlBar('Session not connected');
-                  }
-
-                  if (tabs[pageId] && activeTabId === pageId) {
-                      // Mark connection as offline on error
-                      setConnectionStatus(false);
-                  }
-              };
-
-              ws.onmessage = (event) => {
-                  const payload = JSON.parse(event.data);
-
-                  // Handle tab-discovery messages
-                  if (pageId === 'tab-discovery') {
-                      if (payload.type === "tabList") {
-                          handleTabList(payload.tabs, payload.firstTabId);
-                          return;
-                      } else if (payload.type === "tabClosed") {
-                          handleTabClosed(payload.pageId);
-                          return;
-                      } else if (payload.type === "activeTabChange") {
-                        // Handle tab activation from server
-                        if (tabs[payload.pageId] && activeTabId !== payload.pageId) {
-                            activateTab(payload.pageId);
-                        }
-                        return;
-                    }
-                      return;
-                  }
-
-                  // For regular tabs, handle data
-                  if (payload.type === 'viewportState') {
-                      const tab = tabs[pageId];
-                      if (!tab) return;
-                      tab.viewportReady = true;
-                      tab.viewportMode = payload.mode;
-                      tab.controlling = payload.controlling;
-                      tab.viewportWidth = payload.width;
-                      tab.viewportHeight = payload.height;
-                      tab.awaitingFrame = tab.frameMetadata?.deviceWidth !== payload.width || tab.frameMetadata?.deviceHeight !== payload.height;
-                      const modeFinished = tab.pendingMode === payload.mode;
-                      if (modeFinished) tab.pendingMode = null;
-                      if (activeTabId === pageId && viewportMode) {
-                          viewportMode.value = tab.pendingMode || payload.mode;
-                          viewportMode.disabled = !!tab.pendingMode || (!payload.controlling && !payload.available);
-                          viewportStatus.textContent = payload.controlling || payload.available
-                              ? (payload.mode === 'auto' ? 'Fits this screen' : payload.mode === 'mobile' ? 'Mobile emulation' : 'Desktop layout')
-                              : 'Another viewer has control';
-                          for (const button of [backButton, forwardButton, refreshButton]) {
-                              if (button) button.disabled = !payload.controlling;
-                          }
-                          if (urlText) urlText.readOnly = !payload.controlling;
-                      }
-                      if (payload.available && activeTabId === pageId) requestViewport(pageId);
-                      else if (modeFinished && payload.controlling) requestViewport(pageId);
-                      return;
-                  }
-                  if (payload.type === 'viewportReloadRequired') {
-                      if (viewportConfirm && activeTabId === pageId) {
-                          pendingConfirmation = { pageId, mode: payload.mode };
-                          if (!viewportConfirm.open) viewportConfirm.showModal();
-                      }
-                      return;
-                  }
-                  if (payload.type === 'viewportError') {
-                      if (tabs[pageId]) {
-                          tabs[pageId].pendingMode = null;
-                          if (viewportMode && activeTabId === pageId) {
-                              viewportMode.value = tabs[pageId].viewportMode;
-                              viewportMode.disabled = !tabs[pageId].controlling;
-                          }
-                      }
-                      if (viewportStatus) viewportStatus.textContent = payload.message;
-                      return;
-                  }
-                  if (payload.type === "tabUpdate") {
-                      updateTabInfo(pageId, payload.url, payload.title, payload.favicon);
-                      return;
-                  } else if (payload.type === "targetClosed") {
-                      handleTabClosed(pageId);
-                      return;
-                  }
-
-                  // Handle canvas image data
-                  if (payload.data) {
-                      if (!tabs[pageId]) {
-                          // console.error(`Received data for nonexistent tab ${pageId}`);
-                          return;
-                      }
-                      const timestamp = payload.metadata?.timestamp;
-                      if (Number.isFinite(timestamp)) {
-                          if (timestamp < (tabs[pageId].lastFrameTimestamp || 0)) return;
-                          tabs[pageId].lastFrameTimestamp = timestamp;
-                      }
-
-                      // Remove tab switching indicator when we receive the first frame
-                      tabs[pageId].canvasContainer.classList.remove('tab-switching');
-
-                      // Mark that we've received at least one frame for this tab
-                      tabs[pageId].receivedFirstFrame = true;
-                      if(urlText) urlText.disabled = false;
-
-                      if (urlText && document.activeElement !== urlText){
-                        updateUrlBar(payload.url);
-                        updateSecurityIcon(payload.url);
-                        updateTabInfo(pageId, payload.url, payload.title, payload.favicon);
-                      }
-
-                      // Track frame count for loading state
-                      if (tabs[pageId].isLoading) {
-                          tabs[pageId].frameCount++;
-
-                          // After receiving 2 frames, turn off loading state
-                          if (tabs[pageId].frameCount >= 2) {
-                              setTabLoadingState(pageId, false);
-                          }
-                      }
-                      window.parent.postMessage({
-                          type: 'navigation',
-                          url: payload.url,
-                          favicon: payload.favicon
-                      }, '*');
-
-                const img = new Image();
-                      const frameNumber = tabs[pageId].frameNumber = (tabs[pageId].frameNumber || 0) + 1;
-                      const imageData = 'data:image/jpeg;base64,' + payload.data;
-                      tabs[pageId].lastImageData = imageData;
-
-                img.onload = () => {
-                          if (!tabs[pageId] || tabs[pageId].frameNumber !== frameNumber) return;
-                          tabs[pageId].currentImageWidth = img.naturalWidth;
-                          tabs[pageId].currentImageHeight = img.naturalHeight;
-                          tabs[pageId].frameMetadata = payload.metadata;
-                          tabs[pageId].awaitingFrame = payload.metadata?.deviceWidth !== tabs[pageId].viewportWidth || payload.metadata?.deviceHeight !== tabs[pageId].viewportHeight;
-                          tabs[pageId].lastImage = img;
-                          updateCanvasSize(pageId);
-
-                          tabs[pageId].canvasContainer.style.backgroundColor = 'var(--bg-secondary)';
-                      };
-
-                      img.src = imageData;
-                  }
-              };
-
-              return ws;
-          }
-
-          // Function to create a new tab
-          function createTab(pageId, url = '', title = 'New Tab', favicon = null) {
-              if (tabs[pageId]) {
-                  console.log(`Tab ${pageId} already exists, activating it instead of creating a new one`);
-                  activateTab(pageId);
-                  return;
-              }
-
-              // Create tab UI elements
-              const tab = document.createElement('div');
-              tab.className = 'tab';
-              tab.setAttribute('data-page-id', pageId);
-              if(!interactive) tab.setAttribute('disabled', 'true');
-
-              // Add favicon
-              const faviconElement = document.createElement('img');
-              faviconElement.className = 'tab-favicon';
-              if (favicon) {
-                  faviconElement.src = favicon;
-              } else {
-                  faviconElement.style.display = 'none';
-              }
-              tab.appendChild(faviconElement);
-
-              // Add loading spinner (initially hidden)
-              const spinnerElement = document.createElement('div');
-              spinnerElement.className = 'tab-favicon-spinner';
-              tab.appendChild(spinnerElement);
-
-              // Add title
-              const titleElement = document.createElement('div');
-              titleElement.className = 'tab-title';
-              titleElement.textContent = title || 'New Tab';
-              tab.appendChild(titleElement);
-
-              // Add close button if not in single-page mode
-              if (!singlePageMode) {
-                  const closeButton = document.createElement('div');
-                  closeButton.className = 'tab-close';
-                  closeButton.innerHTML = '&times;';
-                  closeButton.onclick = (e) => {
-                      e.stopPropagation();
-                      if(interactive) closeTab(pageId);
-                  };
-                  tab.appendChild(closeButton);
-              }
-
-              // Add click handler to switch tabs
-              tab.onclick = () => {
-                  if(interactive) activateTab(pageId);
-              };
-
-              // Add tab to tab bar
-              const tabBar = document.getElementById('tab-bar');
-              if (tabBar) {
-                  tabBar.appendChild(tab);
-              }
-
-              // Create canvas container
-              const canvasContainer = document.createElement('div');
-              canvasContainer.className = 'canvas-container';
-              if (document.getElementById('content')) {
-                  document.getElementById('content').appendChild(canvasContainer);
-              }
-
-              // Create canvas element
-              const canvas = document.createElement('canvas');
-              canvas.className = 'canvas';
-              canvasContainer.appendChild(canvas);
-
-              // Initialize canvas context here
-              const ctx = canvas.getContext('2d');
-
-              // Store tab information including ctx
-              tabs[pageId] = {
-                  tab,
-                  canvas,
-                  ctx,
-                  canvasContainer,
-                  url,
-                  title,
-                  favicon,
-                  websocket: null,
-                  reconnecting: false,
-                  intentionalClose: false,
-                  currentImageWidth: defaultWidth,
-                  currentImageHeight: defaultHeight,
-                  lastImageData: null,
-                  receivedFirstFrame: false,
-                  isLoading: false,
-                  frameCount: 0,
-                  lastNavigationUrl: null
-              };
-
-              return tabs[pageId];
-          }
-
-          // Function to activate a tab
-          function activateTab(pageId) {
-              if (!tabs[pageId]) {
-                  console.error(`Attempted to activate nonexistent tab ${pageId}`);
-                  return;
-              }
-
-              // Deactivate the current active tab if there is one
-              if (activeTabId && tabs[activeTabId]) {
-                  tabs[activeTabId].tab.classList.remove('active');
-                  tabs[activeTabId].canvasContainer.classList.remove('active');
-
-                  // Intentionally close the WebSocket for the inactive tab if it exists to save resources
-                  if (tabs[activeTabId].websocket &&
-                      tabs[activeTabId].websocket.readyState === WebSocket.OPEN) {
-                      tabs[activeTabId].intentionalClose = true;
-                      tabs[activeTabId].websocket.close();
-                      tabs[activeTabId].websocket = null;
-                      console.log(`Closed WebSocket for inactive tab ${activeTabId}`);
-                  }
-              }
-
-              // Set the new active tab
-              activeTabId = pageId;
-              tabs[pageId].tab.classList.add('active');
-              tabs[pageId].canvasContainer.classList.add('active');
-
-              // Update URL and security status based on active tab
-              if (tabs[pageId].url) {
-                  updateUrlBar(tabs[pageId].url);
-                  updateSecurityIcon(tabs[pageId].url);
-              }
-
-              // Don't change connection status on tab switch - maintain current status
-              // We'll update it once we confirm the actual connection state
-
-              // Add tab-switching loading indicator if we haven't received a frame yet
-              if (!tabs[pageId].receivedFirstFrame) {
-                  tabs[pageId].canvasContainer.classList.add('tab-switching');
-              }
-
-              // Ensure the WebSocket is connected for the newly activated tab
-              if (!tabs[pageId].websocket ||
-                  tabs[pageId].websocket.readyState === WebSocket.CLOSED ||
-                  tabs[pageId].websocket.readyState === WebSocket.CLOSING) {
-                  connectTabWebSocket(pageId);
-              } else if (tabs[pageId].websocket && tabs[pageId].websocket.readyState === WebSocket.OPEN) {
-                  // WebSocket is already open, set up canvas event listeners
-                  setupCanvasEventListeners(tabs[pageId].canvas, pageId, tabs[pageId].websocket);
-
-                  // Since the WebSocket is open, update the connection status to true
-                  setConnectionStatus(true);
-              }
-
-              // Update canvas size for the active tab
-              updateCanvasSize(pageId);
-          }
-
-          // Function to attempt reconnection for a tab WebSocket
-          function attemptReconnect(pageId) {
-              // Make sure tab still exists
-              if (!tabs[pageId]) return;
-
-              // Prevent multiple reconnection attempts
-              if (tabs[pageId].reconnecting) {
-                  console.log(`Already attempting to reconnect tab ${pageId}, ignoring duplicate request`);
-                  return;
-              }
-
-              // Initialize retry counter if not set
-              if (!activeConnectionRetries[pageId]) {
-                  activeConnectionRetries[pageId] = 0;
-              }
-
-              const maxRetries = 5;
-              const retryDelay = Math.min(2000 * Math.pow(1.5, activeConnectionRetries[pageId]), 30000);
-
-              // Add exponential backoff with jitter to prevent synchronized reconnection attempts
-              const jitter = Math.random() * 1000;
-              const delay = retryDelay + jitter;
-
-              if (activeConnectionRetries[pageId] < maxRetries) {
-                  console.log(`Attempting to reconnect ${pageId} in ${Math.round(delay)}ms (attempt ${activeConnectionRetries[pageId] + 1}/${maxRetries})`);
-
-                  // Mark tab as reconnecting to prevent duplicate attempts
-                  tabs[pageId].reconnecting = true;
-
-                  // If this is the active tab, update the connection status to show we're offline
-                  if (activeTabId === pageId) {
-                      setConnectionStatus(false);
-                  }
-
-                  setTimeout(() => {
-                      activeConnectionRetries[pageId]++;
-
-                      // Reconnect only if the tab still exists and we should still be reconnecting
-                      if (tabs[pageId]) {
-                          connectTabWebSocket(pageId);
-                      }
-                  }, delay);
-              } else {
-                  console.error(`Maximum retry attempts (${maxRetries}) reached for ${pageId}`);
-
-                  // Mark tab as error state but clear reconnecting flag
-                  if (tabs[pageId]) {
-                      tabs[pageId].reconnecting = false;
-                      tabs[pageId].canvasContainer.classList.remove('loading');
-                      tabs[pageId].canvasContainer.classList.add('error');
-
-                      // Ensure offline status is shown after max retries
-                      if (activeTabId === pageId) {
-                          setConnectionStatus(false);
-                      }
-                  }
-              }
-          }
-
-          // Set up WebSocket-related event listeners for a canvas
-          function setupCanvasEventListeners(canvas, pageId, ws) {
-              if (!canvas || !ws || !interactive) return;
-              const inputReady = () => ws.readyState === WebSocket.OPEN && tabs[pageId]?.controlling && !tabs[pageId].awaitingFrame;
-
-              // Remove any existing event listeners first to prevent duplicates
-              canvas.removeEventListener('mousedown', canvas._mouseDownHandler);
-              canvas.removeEventListener('mouseup', canvas._mouseUpHandler);
-              canvas.removeEventListener('mousemove', canvas._mouseMoveHandler);
-              canvas.removeEventListener('mousemove', canvas._debouncedMouseMoveHandler);
-              canvas.removeEventListener('wheel', canvas._wheelHandler);
-
-              // Helper function for scaled coordinates
-              function getScaledCoordinates(e, canvas, pageId) {
-                  if (!tabs[pageId]) return { x: 0, y: 0 };
-
-                  const tabData = tabs[pageId];
-                  const rect = canvas.getBoundingClientRect();
-                  const canvasWidth = rect.width;
-                  const canvasHeight = rect.height;
-
-                  const metadata = tabData.frameMetadata;
-                  if (!metadata || !canvasWidth || !canvasHeight) return { x: 0, y: 0 };
-                  const scale = metadata.pageScaleFactor || 1;
-                  const x = (e.clientX - rect.left) * metadata.deviceWidth / canvasWidth / scale;
-                  const y = ((e.clientY - rect.top) * metadata.deviceHeight / canvasHeight - metadata.offsetTop) / scale;
-                  return {
-                      x: Math.max(0, Math.round(x)),
-                      y: Math.max(0, Math.round(y))
-                  };
-              }
-
-              // MouseDown event
-              canvas._mouseDownHandler = (e) => {
-                  if (!inputReady()) return;
-
-                  const coords = getScaledCoordinates(e, canvas, pageId);
-
-                  ws.send(JSON.stringify({
-                      type: 'mouseEvent',
-                      pageId: pageId,
-                      event: {
-                          type: 'mousePressed',
-                          x: coords.x,
-                          y: coords.y,
-                          button: e.button === 0 ? 'left' : e.button === 1 ? 'middle' : 'right',
-                          modifiers: (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 8 : 0) | (e.altKey ? 1 : 0) | (e.metaKey ? 4 : 0),
-                          clickCount: e.detail
-                      }
-                  }));
-
-                  console.log(`Mouse down at ${coords.x},${coords.y} with button ${e.button}`);
-              };
-              canvas.addEventListener('mousedown', canvas._mouseDownHandler);
-
-              // MouseUp event
-              canvas._mouseUpHandler = (e) => {
-                  if (!inputReady()) return;
-
-                  const coords = getScaledCoordinates(e, canvas, pageId);
-
-                  ws.send(JSON.stringify({
-                      type: 'mouseEvent',
-                      pageId: pageId,
-                      event: {
-                          type: 'mouseReleased',
-                          x: coords.x,
-                          y: coords.y,
-                          button: e.button === 0 ? 'left' : e.button === 1 ? 'middle' : 'right',
-                          modifiers: (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 8 : 0) | (e.altKey ? 1 : 0) | (e.metaKey ? 4 : 0),
-                          clickCount: e.detail
-                      }
-                  }));
-
-                  console.log(`Mouse up at ${coords.x},${coords.y} with button ${e.button}`);
-              };
-              canvas.addEventListener('mouseup', canvas._mouseUpHandler);
-
-              // MouseMove event
-              canvas._mouseMoveHandler = (e) => {
-                  if (!inputReady()) return;
-
-                  const coords = getScaledCoordinates(e, canvas, pageId);
-
-                  ws.send(JSON.stringify({
-                      type: 'mouseEvent',
-                      pageId: pageId,
-                      event: {
-                          type: 'mouseMoved',
-                          x: coords.x,
-                          y: coords.y,
-                          button: 'none',
-                          modifiers: (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 8 : 0) | (e.altKey ? 1 : 0) | (e.metaKey ? 4 : 0)
-                      }
-                  }));
-              };
-
-              // Debounce function to limit how often events are sent
-              function debounce(func, wait) {
-                  let timeout;
-                  return function(...args) {
-                      const context = this;
-                      clearTimeout(timeout);
-                      timeout = setTimeout(() => func.apply(context, args), wait);
-                  };
-              }
-
-              // Create debounced version of mouseMoveHandler
-              canvas._debouncedMouseMoveHandler = debounce((e) => {
-                  if (!inputReady()) return;
-
-                  const coords = getScaledCoordinates(e, canvas, pageId);
-
-                  ws.send(JSON.stringify({
-                      type: 'mouseEvent',
-                      pageId: pageId,
-                      event: {
-                          type: 'mouseMoved',
-                          x: coords.x,
-                          y: coords.y,
-                          button: 'none',
-                          modifiers: (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 8 : 0) | (e.altKey ? 1 : 0) | (e.metaKey ? 4 : 0)
-                      }
-                  }));
-              }, 20); // 20ms debounce time - adjust as needed for performance vs responsiveness
-
-              // Attach the debounced handler to mousemove event
-              canvas.addEventListener('mousemove', canvas._debouncedMouseMoveHandler);
-
-              // Wheel event
-              canvas._wheelHandler = (e) => {
-                  if (!inputReady()) return;
-
-                  const coords = getScaledCoordinates(e, canvas, pageId);
-
-                  ws.send(JSON.stringify({
-                      type: 'mouseEvent',
-                      pageId: pageId,
-                      event: {
-                          type: 'mouseWheel',
-                          x: coords.x,
-                          y: coords.y,
-                          button: 'none',
-                          modifiers: (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 8 : 0) | (e.altKey ? 1 : 0) | (e.metaKey ? 4 : 0),
-                          deltaX: e.deltaX,
-                          deltaY: e.deltaY
-                      }
-                  }));
-
-                  // Prevent scrolling the page
-                  e.preventDefault();
-              };
-              canvas.addEventListener('wheel', canvas._wheelHandler);
-
-              // Touch taps become clicks; drags scroll the remote page, not the local canvas.
-              canvas._touchAbort?.abort();
-              canvas._touchAbort = new AbortController();
-              const touchOptions = { signal: canvas._touchAbort.signal };
-              let touch = null;
-              canvas.addEventListener('pointerdown', (event) => {
-                  if (event.pointerType === 'mouse' || !event.isPrimary || !inputReady()) return;
-                  event.preventDefault();
-                  canvas.setPointerCapture(event.pointerId);
-                  touch = { id: event.pointerId, startX: event.clientX, startY: event.clientY, point: getScaledCoordinates(event, canvas, pageId), moved: false };
-              }, touchOptions);
-              canvas.addEventListener('pointermove', (event) => {
-                  if (!touch || event.pointerId !== touch.id || !inputReady()) return;
-                  event.preventDefault();
-                  const point = getScaledCoordinates(event, canvas, pageId);
-                  if (Math.hypot(event.clientX - touch.startX, event.clientY - touch.startY) > 6) touch.moved = true;
-                  if (touch.moved && ws.readyState === WebSocket.OPEN) {
-                      ws.send(JSON.stringify({ type: 'mouseEvent', pageId, event: {
-                          type: 'mouseWheel', x: point.x, y: point.y, button: 'none', modifiers: 0,
-                          deltaX: touch.point.x - point.x, deltaY: touch.point.y - point.y,
-                      }}));
-                  }
-                  touch.point = point;
-              }, touchOptions);
-              canvas.addEventListener('pointerup', (event) => {
-                  if (!touch || event.pointerId !== touch.id || !inputReady()) return;
-                  event.preventDefault();
-                  if (!touch.moved && ws.readyState === WebSocket.OPEN) {
-                      const point = getScaledCoordinates(event, canvas, pageId);
-                      for (const type of ['mousePressed', 'mouseReleased']) {
-                          ws.send(JSON.stringify({ type: 'mouseEvent', pageId, event: { type, ...point, button: 'left', modifiers: 0, clickCount: 1 } }));
-                      }
-                  }
-                  touch = null;
-              }, touchOptions);
-              canvas.addEventListener('pointercancel', () => { touch = null; }, touchOptions);
-
-              console.log(`Event listeners set up for canvas of tab ${pageId}`);
-              return true;
-          }
-
-          // Add tab navigation and keyboard event listeners (global)
-          if (interactive) {
-              const directClipboardBridge =
-                  new URLSearchParams(window.location.search).get('clipboardBridge') === 'true' &&
-                  window.parent === window;
-
-              document.addEventListener('keydown', (e) => {
-                  if (e.target.closest?.('input, textarea, select, button')) return;
-                  // Skip if URL input is focused
-                  if (urlText && document.activeElement === urlText){
-                    console.log("URL input is focused, skipping keydown event");
-                    return;
-                  }
-
-                  // Let the local browser dispatch a real paste event. Forwarding
-                  // Ctrl/Cmd+V as an ordinary remote key would type a literal "v".
-                  if (directClipboardBridge && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
-                      return;
-                  }
-
-                  if (!activeTabId || !tabs[activeTabId] || !tabs[activeTabId].websocket) return;
-
-                  const ws = tabs[activeTabId].websocket;
-                  if (ws.readyState !== WebSocket.OPEN) return;
-
-                  ws.send(JSON.stringify({
-                      type: 'keyEvent',
-                      pageId: activeTabId,
-                      event: {
-                          type: 'keyDown',
-                          text: e.key.length === 1 ? e.key : undefined,
-                          code: e.code,
-                          key: e.key,
-                          keyCode: e.keyCode
-                      }
-                  }));
-              });
-
-              document.addEventListener('keyup', (e) => {
-                  if (e.target.closest?.('input, textarea, select, button')) return;
-                  // Skip if URL input is focused
-                  if (urlText && document.activeElement === urlText) return;
-                  if (directClipboardBridge && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') return;
-                  if (!activeTabId || !tabs[activeTabId] || !tabs[activeTabId].websocket) return;
-
-                  const ws = tabs[activeTabId].websocket;
-                  if (ws.readyState !== WebSocket.OPEN) return;
-
-                  ws.send(JSON.stringify({
-                      type: 'keyEvent',
-                      pageId: activeTabId,
-                      event: {
-                          type: 'keyUp',
-                          text: e.key.length === 1 ? e.key : undefined,
-                          code: e.code,
-                          key: e.key,
-                          keyCode: e.keyCode
-                      }
-                  }));
-              });
-
-              if (urlText) {
-                  urlText.addEventListener('keydown', (e) => {
-                      if (e.key === 'Enter') {
-                          e.preventDefault();
-                          e.stopPropagation(); // Stop event propagation to prevent the document keydown handler from firing
-                          if (!activeTabId || !tabs[activeTabId] || !tabs[activeTabId].websocket) return;
-
-                          const url = urlText.value;
-                          updateSecurityIcon(url);
-
-                          const ws = tabs[activeTabId].websocket;
-                          if (ws.readyState !== WebSocket.OPEN) return;
-
-                          // Set tab loading state when navigation starts
-                          setTabLoadingState(activeTabId, true, url);
-
-                          ws.send(JSON.stringify({
-                              type: 'navigation',
-                              pageId: activeTabId,
-                              event: {
-                                  url: url
-                              }
-                          }));
-
-                          // Send message to parent frame about manual URL change
-                          window.parent.postMessage({
-                              type: 'navigation',
-                              url: url
-                          }, '*');
-
-                          urlText.blur();
-                      }
-                  });
-
-                  // Add keyup event listener to URL input to prevent bubbling to document
-                  urlText.addEventListener('keyup', (e) => {
-                      e.stopPropagation(); // Prevent the event from bubbling up to document
-                  });
-              }
-
-              if (backButton) {
-                  backButton.addEventListener('click', () => {
-                      if (!activeTabId || !tabs[activeTabId] || !tabs[activeTabId].websocket) return;
-
-                      const ws = tabs[activeTabId].websocket;
-                      if (ws.readyState !== WebSocket.OPEN) return;
-
-                      // Set tab loading state when navigation starts
-                      setTabLoadingState(activeTabId, true);
-
-                      ws.send(JSON.stringify({
-                          type: 'navigation',
-                          pageId: activeTabId,
-                          event: {
-                              action: 'back'
-                          }
-                      }));
-                  });
-              }
-
-              if (forwardButton) {
-                  forwardButton.addEventListener('click', () => {
-                      if (!activeTabId || !tabs[activeTabId] || !tabs[activeTabId].websocket) return;
-
-                      const ws = tabs[activeTabId].websocket;
-                      if (ws.readyState !== WebSocket.OPEN) return;
-
-                      // Set tab loading state when navigation starts
-                      setTabLoadingState(activeTabId, true);
-
-                      ws.send(JSON.stringify({
-                          type: 'navigation',
-                          pageId: activeTabId,
-                          event: {
-                              action: 'forward'
-                          }
-                      }));
-                  });
-              }
-
-              if (refreshButton) {
-                  refreshButton.addEventListener('click', () => {
-                      if (!activeTabId || !tabs[activeTabId] || !tabs[activeTabId].websocket) return;
-
-                      const ws = tabs[activeTabId].websocket;
-                      if (ws.readyState !== WebSocket.OPEN) return;
-
-                      // Set tab loading state when navigation starts
-                      setTabLoadingState(activeTabId, true);
-
-                      ws.send(JSON.stringify({
-                          type: 'navigation',
-                          pageId: activeTabId,
-                          event: {
-                              action: 'refresh'
-                          }
-                      }));
-                  });
-              }
-          }
-
-          // Function to handle tab list updates from server
-          function handleTabList(tabList, firstTabId = null) {
-              if (!tabList || !Array.isArray(tabList)) return;
-
-              // console.log("Received tab list:", tabList);
-
-              // Create any tabs that don't exist
-              tabList.forEach((tab, index) => {
-                  if (!tabs[tab.id]) {
-                      // Make sure we pass parameters in the right order: id, url, title, favicon
-                      createTab(tab.id, tab.url || '', tab.title || 'New Tab', tab.favicon || null);
-                      if (index === tabList.length - 1) {
-                          activateTab(tab.id);
-                      }
-                  } else {
-                      // Update existing tab info
-                      updateTabInfo(tab.id, tab.url, tab.title, tab.favicon);
-                  }
-              });
-
-              // Remove tabs that are no longer present
-              const currentPageIds = tabList.map(tab => tab.id);
-              Object.keys(tabs).forEach(pageId => {
-                  if (pageId !== 'tab-discovery' && !currentPageIds.includes(pageId)) {
-                      // Only remove DOM elements, don't send closeTab message since
-                      // the server already knows this tab is closed
-                      closeTab(pageId);
-                  }
-              });
-
-              // If no tab is active but tabs exist, activate the first tab
-              // or activate the specified firstTabId if provided
-              if ((!activeTabId || !tabs[activeTabId] || activeTabId === 'tab-discovery') && tabList.length > 0) {
-                  // If firstTabId is provided, use it; otherwise use the first tab in the list
-                  const tabToActivate = firstTabId && tabs[firstTabId] ? firstTabId : tabList[0].id;
-                  activateTab(tabToActivate);
-              }
-          }
-
-          // Function to update tab info
-          function updateTabInfo(pageId, url, title, favicon) {
-              if (!tabs[pageId]) {
-                  console.error(`Attempted to update tab ${pageId} which doesn't exist`);
-                  return;
-              }
-
-              // console.log(`Updating tab ${pageId}:`, {url, title, favicon});
-
-              const tabData = tabs[pageId];
-
-              // Update the tab's stored data
-              if (url !== undefined) tabData.url = url;
-              if (title !== undefined) tabData.title = title;
-              if (favicon !== undefined) tabData.favicon = favicon;
-
-              // Update the tab's title element
-              const titleElem = tabData.tab.querySelector('.tab-title');
-              if (titleElem) {
-                  titleElem.textContent = tabData.title || 'New Tab';
-              }
-
-              // Update favicon if available
-              const faviconElem = tabData.tab.querySelector('.tab-favicon');
-              if (faviconElem && tabData.favicon) {
-                  faviconElem.src = tabData.favicon;
-                  faviconElem.style.display = 'block';
-              } else if (faviconElem) {
-                  faviconElem.style.display = 'none';
-              }
-
-              // Only update URL bar and security icon if this is the active tab
-              if (activeTabId === pageId) {
-                  updateUrlBar(tabData.url || '');
-                  updateSecurityIcon(tabData.url || '');
-              }
-          }
-
-          // Function to handle tab closed by server
-          function handleTabClosed(pageId) {
-              if (!tabs[pageId]) return;
-              closeTab(pageId);
-          }
-
-          // Function to close a tab manually
-          function closeTab(pageId) {
-              if (!tabs[pageId]) return;
-
-              const tabIndexes = Object.keys(tabs).filter(id => id !== 'tab-discovery');
-
-              if (tabIndexes.length <= 1) {
-                  return;
-              }
-
-              const tabIndex = tabIndexes.indexOf(pageId);
-
-              console.log(`Closing tab ${pageId}`);
-
-              // Intentionally close the WebSocket
-              if (tabs[pageId].websocket) {
-                  tabs[pageId].intentionalClose = true;
-                  tabs[pageId].websocket.send(JSON.stringify({
-                      type: 'closeTab',
-                      pageId: pageId
-                  }));
-                  tabs[pageId].websocket.close();
-                  tabs[pageId].websocket = null;
-              }
-
-              // Remove tab from DOM
-              if (tabs[pageId].tab) {
-                  tabs[pageId].tab.remove();
-              }
-
-              // Remove canvas container from DOM
-              if (tabs[pageId].canvasContainer) {
-                  tabs[pageId].canvasContainer.remove();
-              }
-
-              // If this was the active tab, activate another tab if available
-              if (activeTabId === pageId) {
-                  const tabIds = Object.keys(tabs).filter(id => id !== 'tab-discovery');
-                  if (tabIds.length > 0) {
-                      // Activate the last available tab
-                      const tabIndex = tabIds.indexOf(pageId);
-                      activateTab(tabIds[Math.min(tabIndex + 1, tabIds.length - 1)]);
-                  } else {
-                      // No tabs left, clear active tab ID
-                      activeTabId = null;
-                      setConnectionStatus(false);
-                  }
-              }
-
-              // Delete tab from tabs object
-              delete tabs[pageId];
-          }
-
-          // Initialize connection - in single-page mode we have only one connection
-          if (singlePageMode) {
-              // In single-page mode, create a single tab with no ID (will use URL parameter)
-              createTab('default');
-              activateTab('default');
-          } else {
-              // In multi-page mode, first connect to the tab discovery service
-              connectTabWebSocket('tab-discovery');
-          }
-
-          // Set initial security icon state
-          updateSecurityIcon('');
-
-          // Function to update the URL input field
-          function updateUrlBar(url) {
-              const urlInput = document.getElementById('url-input');
-              if (urlInput && urlInput.value !== url) {
-                  urlInput.value = url || '';
-              } else {
-                  const urlText = document.getElementById('url-text');
-                  if (urlText && urlText.value !== url) {
-                      urlText.value = url || 'Session not connected';
-                  }
-              }
-          }
-
-          // Add the updateSecurityIcon function that's being referenced but was missing
-          function updateSecurityIcon(url) {
-              const lockIcon = document.getElementById('lock-icon');
-              const unlockIcon = document.getElementById('unlock-icon');
-              const securityIcon = document.getElementById('url-security-icon');
-
-              if (!lockIcon || !unlockIcon || !securityIcon) return;
-
-              // Case-insensitive check for https
-              if (url && (url.toLowerCase().startsWith('https://') || url.toLowerCase().startsWith('https:'))) {
-                  lockIcon.style.display = 'block';
-                  unlockIcon.style.display = 'none';
-                  securityIcon.classList.add('secure');
-              } else {
-                  lockIcon.style.display = 'none';
-                  unlockIcon.style.display = 'block';
-                  securityIcon.classList.remove('secure');
-              }
-          }
-
-          // Add the missing updateCanvasSize function
-          function updateCanvasSize(pageId) {
-              if (!tabs[pageId]) return;
-
-              const tabData = tabs[pageId];
-              const container = tabData.canvasContainer;
-              const canvas = tabData.canvas;
-              const ctx = tabData.ctx;
-
-              if (!ctx) {
-                  console.error(`Canvas context not initialized for tab ${pageId}`);
-                  return;
-              }
-
-              const scale = Math.min(container.clientWidth / tabData.currentImageWidth, container.clientHeight / tabData.currentImageHeight);
-              canvas.width = tabData.currentImageWidth;
-              canvas.height = tabData.currentImageHeight;
-              canvas.style.width = `${canvas.width * scale}px`;
-              canvas.style.height = `${canvas.height * scale}px`;
-              if (tabData.lastImage) ctx.drawImage(tabData.lastImage, 0, 0);
-          }
-
-          // Add a function to handle tab loading state
-          function setTabLoadingState(pageId, isLoading, navigationUrl = null) {
-              if (!tabs[pageId]) return;
-              // If we're starting to load
-              if (isLoading) {
-                  tabs[pageId].isLoading = true;
-                  tabs[pageId].frameCount = 0;
-                  tabs[pageId].lastNavigationUrl = navigationUrl || tabs[pageId].url;
-                  tabs[pageId].tab.classList.add('loading');
-              } else {
-                  // If we're finishing loading
-                  tabs[pageId].isLoading = false;
-                  tabs[pageId].tab.classList.remove('loading');
-              }
-          }
-
-          // Global clipboard variables
-          let clipboardRequestId = 0;
-          const pendingRequests = new Map();
-
-          (function() {
-              // Check if clipboard bridge is enabled
-              const urlParams = new URLSearchParams(window.location.search);
-              const clipboardBridgeEnabled = urlParams.get('clipboardBridge') === 'true';
-
-              if (!clipboardBridgeEnabled || !interactive) {
-                  return;
-              }
-
-              // The public session viewer is top-level rather than embedded in the
-              // Steel dashboard. A paste event already carries the user-selected
-              // clipboard text, so it needs no clipboard permission or parent app.
-              if (window.parent === window) {
-                  document.addEventListener('paste', (event) => {
-                      if (urlText && document.activeElement === urlText) return;
-                      const text = event.clipboardData?.getData('text/plain');
-                      if (!text) return;
-                      event.preventDefault();
-                      event.stopPropagation();
-                      handlePasteEvent(text);
-                  }, true);
-                  return;
-              }
-
-              window.parent.postMessage({
-                  type: 'clipboardBridgeReady'
-              }, '*');
-
-              // Handle messages from parent window
-              window.addEventListener('message', (event) => {
-                  switch (event.data.type) {
-                      case 'triggerCopy':
-                          handleCopyEvent();
-                          break;
-                      case 'triggerPaste':
-                          handlePasteEvent(event.data.text);
-                          break;
-                      case 'clipboardReadResponse':
-                      case 'clipboardWriteResponse':
-                          handleClipboardResponse(event.data);
-                          break;
-                  }
-              });
-
-              function handleCopyEvent() {
-                  if (!activeTabId || !tabs[activeTabId] || !tabs[activeTabId].websocket) {
-                      return;
-                  }
-
-                  const ws = tabs[activeTabId].websocket;
-                  if (ws.readyState !== WebSocket.OPEN) {
-                      return;
-                  }
-
-                  ws.send(JSON.stringify({
-                      type: 'getSelectedText',
-                      pageId: activeTabId
-                  }));
-              }
-
-              function handlePasteEvent(text) {
-                  if (!text || !activeTabId || !tabs[activeTabId] || !tabs[activeTabId].websocket) {
-                      return;
-                  }
-
-                  const ws = tabs[activeTabId].websocket;
-                  if (ws.readyState !== WebSocket.OPEN) {
-                      return;
-                  }
-
-                  ws.send(JSON.stringify({
-                      type: 'insertText',
-                      pageId: activeTabId,
-                      text: text
-                  }));
-              }
-
-              function handleClipboardResponse(data) {
-                  const request = pendingRequests.get(data.requestId);
-                  if (request) {
-                      pendingRequests.delete(data.requestId);
-
-                      if (data.type === 'clipboardWriteResponse') {
-                          if (!data.success) {
-                            console.error('Clipboard write failed:', data.error);
-                          }
-                      } else if (data.type === 'clipboardReadResponse') {
-                          if (data.text) {
-                              handlePasteEvent(data.text);
-                          } else {
-                              console.error('Clipboard read failed:', data.error);
-                          }
-                      }
-                  }
-              }
-
-              // Override existing keyboard handlers to intercept copy/paste
-              const originalKeydownHandler = document.onkeydown;
-
-              document.addEventListener('keydown', (e) => {
-                  // Skip if URL input is focused
-                  if (urlText && document.activeElement === urlText) {
-                      return;
-                  }
-
-                  const isCtrlOrCmd = e.ctrlKey || e.metaKey;
-
-                  if (isCtrlOrCmd && (e.key === 'c' || e.key === 'C')) {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      handleCopyEvent();
-                      return false;
-                  }
-
-                  if (isCtrlOrCmd && (e.key === 'v' || e.key === 'V')) {
-                      e.preventDefault();
-                      e.stopPropagation();
-
-                      const requestId = ++clipboardRequestId;
-                      pendingRequests.set(requestId, { type: 'read' });
-
-                      window.parent.postMessage({
-                          type: 'requestClipboardRead',
-                          requestId: requestId
-                      }, '*');
-
-                      return false;
-                  }
-
-                  // For other keys, continue with normal processing
-                  return true;
-              }, true);
-          })();
-
-          const originalConnectTabWebSocket = connectTabWebSocket;
-          connectTabWebSocket = function(pageId) {
-              const ws = originalConnectTabWebSocket(pageId);
-
-              const originalOnMessage = ws.onmessage;
-              ws.onmessage = function(event) {
-                  const payload = JSON.parse(event.data);
-
-                  if (payload.type === "selectedTextResponse") {
-
-                      if (payload.text && payload.text.length > 0) {
-                          const requestId = ++clipboardRequestId;
-                          pendingRequests.set(requestId, { type: 'write', text: payload.text });
-
-                          window.parent.postMessage({
-                              type: 'requestClipboardWrite',
-                              text: payload.text,
-                              requestId: requestId
-                          }, '*');
-                      } else {
-                          console.log('No text selected in browser');
-                      }
-                      return;
-                  }
-
-                  originalOnMessage.call(this, event);
-              };
-
-              return ws;
+          socket = new WebSocket(pageUrl);
+          const ws = socket;
+          ws.onopen = () => {
+            if (epoch === connection) send({ type: "hello" });
           };
-    })();
+          ws.onmessage = (event) => {
+            if (epoch !== connection) return;
+            let data;
+            try {
+              data = JSON.parse(event.data);
+            } catch {
+              return;
+            }
+            if (data.type === "hello") {
+              if (data.version !== VERSION) {
+                expired = true;
+                terminalMessage = "This viewer needs a matching browser update.";
+                setReady(false, terminalMessage);
+                ws.close();
+                return;
+              }
+              supported = true;
+              pageId = data.pageId;
+              expiresAt = data.expiresAt;
+              $("reconnect").hidden = true;
+              return;
+            }
+            if (data.type === "controlState") {
+              const gained =
+                data.controlling && (!controlling || generation !== data.generation);
+              if (
+                generation !== data.generation ||
+                controlling !== data.controlling ||
+                viewportGeneration !== data.viewportGeneration
+              ) {
+                clearLocalInput();
+                setReady(false);
+              }
+              generation = data.generation;
+              viewportGeneration = data.viewportGeneration;
+              controlling = data.controlling;
+              acquiring = acquiring && !controlling && data.available;
+              controlButton.disabled =
+                !interactive || !supported || acquiring || (!controlling && !data.available);
+              controlButton.textContent = controlling ? "Hand back" : "Take control";
+              if (gained) {
+                requestViewport(openingLayout ?? mode, openingLayout !== undefined);
+                openingLayout = undefined;
+              }
+              else if (!controlling) {
+                setReady(
+                  false,
+                  acquiring
+                    ? "Connecting control…"
+                    : data.available
+                    ? "Watching the browser."
+                    : "Another viewer has control.",
+                );
+                if (desiredControl && data.available && supported) takeControl();
+              }
+              return;
+            }
+            if (data.type === "viewportState") {
+              mode = data.mode;
+              serverWidth = data.width;
+              serverHeight = data.height;
+              viewportGeneration = data.viewportGeneration;
+              layout.value = mode;
+              mobileInput?.update();
+              return;
+            }
+            if (data.type === "viewportReloadRequired") {
+              pendingMode = data.mode;
+              if (mobileInput) { mobileInput.reloadRequired(data.mode); return; }
+              if (!$("viewport-confirm").open) $("viewport-confirm").showModal();
+              return;
+            }
+            if (data.type === "viewportError") {
+              setReady(false, "Could not change the page layout.");
+              return;
+            }
+            if (data.type === "inputReady") {
+              if (
+                controlling &&
+                data.generation === generation &&
+                data.viewportGeneration === viewportGeneration
+              ) {
+                retries = 0;
+                setReady(true, "You have control. Hand back when finished.");
+              }
+              return;
+            }
+            if (data.type === "inputError") {
+              if (
+                data.code === "session_expired" ||
+                data.code === "unsupported_input_version"
+              ) {
+                expired = true;
+                terminalMessage =
+                  data.code === "session_expired"
+                    ? "This browser session or viewer link has expired. Open a fresh handoff."
+                    : "This viewer needs a matching browser update.";
+                setReady(false, terminalMessage);
+                ws.close();
+              } else if (data.code === "another_viewer_controlling") {
+                acquiring = false;
+                desiredControl = false;
+                setReady(false, "Another viewer has control.");
+              } else if (data.code !== "stale_frame" && data.code !== "waiting_for_frame") {
+                cancelInput();
+                setReady(false, "Input paused. Reconnect to continue.");
+                $("reconnect").hidden = false;
+              }
+              return;
+            }
+            if (data.type === "targetClosed") {
+              expired = singlePageMode;
+              terminalMessage = "This browser page is closed.";
+              setReady(false, terminalMessage);
+              ws.close();
+              return;
+            }
+            if (data.type === "selectedTextResponse") {
+              if (clipboardBridge && ready && data.text)
+                tellParent({
+                  type: "requestClipboardWrite",
+                  requestId: ++clipboardRequest,
+                  text: data.text,
+                });
+              return;
+            }
+            if (!data.data || !data.metadata) return;
+            const frameConnection = connection;
+            const image = new Image();
+            image.onload = () => {
+              if (
+                frameConnection !== connection ||
+                data.frameId <= paintedFrame ||
+                (controlling &&
+                  (data.generation !== generation ||
+                    data.viewportGeneration !== viewportGeneration))
+              )
+                return;
+              paintedFrame = data.frameId;
+              canvas.width = image.naturalWidth;
+              canvas.height = image.naturalHeight;
+              updateCanvasSize();
+              context.drawImage(image, 0, 0);
+              metadata = data.metadata;
+              if (document.activeElement !== $("url")) $("url").value = data.url || "";
+              tellParent({ type: "navigation", url: data.url, favicon: data.favicon });
+              if (
+                controlling &&
+                (mode === "agent" || (metadata.deviceWidth === serverWidth &&
+                metadata.deviceHeight === serverHeight)) &&
+                sentFrame !== data.frameId
+              ) {
+                sentFrame = data.frameId;
+                send({ type: "frameReady", frameId: data.frameId });
+              } else if (!controlling && supported) retries = 0;
+            };
+            image.src = "data:image/jpeg;base64," + data.data;
+          };
+          ws.onclose = (event) => {
+            if (epoch !== connection) return;
+            socket = undefined;
+            clearLocalInput();
+            controlling = false;
+            acquiring = false;
+            controlButton.disabled = true;
+            if ((event.code === 4001 && singlePageMode) || Date.now() >= expiresAt)
+              expired = true;
+            if (expired)
+              setReady(
+                false,
+                terminalMessage ||
+                  "This browser session or viewer link has expired. Open a fresh handoff.",
+              );
+            else scheduleReconnect();
+          };
+          ws.onerror = () => {
+            if (epoch === connection) setReady(false, "Connection interrupted…");
+          };
+        }
+
+        function selectPage(id) {
+          if (!id || selectedPage === id) return;
+          cancelInput();
+          if (controlling) control("release");
+          ++connection;
+          socket?.close();
+          socket = undefined;
+          selectedPage = id;
+          $("tabs").value = id;
+          expired = false;
+          terminalMessage = "";
+          retries = 0;
+          connect();
+        }
+        function discoverTabs() {
+          clearTimeout(discoveryTimer);
+          if (
+            singlePageMode ||
+            suspended ||
+            expired ||
+            !navigator.onLine ||
+            discoverySocket?.readyState <= WebSocket.OPEN
+          )
+            return;
+          const url = new URL(suppliedUrl);
+          url.searchParams.delete("pageId");
+          url.searchParams.delete("pageIndex");
+          url.searchParams.set("tabInfo", "true");
+          const ws = (discoverySocket = new WebSocket(url));
+          ws.onmessage = (event) => {
+            if (ws !== discoverySocket) return;
+            let data;
+            try {
+              data = JSON.parse(event.data);
+            } catch {
+              return;
+            }
+            if (data.type === "inputError" && data.code === "session_expired") {
+              expired = true;
+              setReady(
+                false,
+                "This browser session or viewer link has expired. Open a fresh handoff.",
+              );
+              return;
+            }
+            if (data.type !== "tabList" || !Array.isArray(data.tabs)) return;
+            discoveryRetries = 0;
+            $("tabs").replaceChildren(
+              ...data.tabs.map((tab) => {
+                const option = document.createElement("option");
+                option.value = tab.id;
+                option.textContent = tab.title || tab.url || "New tab";
+                return option;
+              }),
+            );
+            if (data.tabs.some((tab) => tab.id === selectedPage))
+              $("tabs").value = selectedPage;
+            else if (data.tabs.length) selectPage(data.firstTabId || data.tabs[0].id);
+            else setReady(false, "No browser tabs are open.");
+          };
+          ws.onclose = (event) => {
+            if (ws !== discoverySocket) return;
+            discoverySocket = undefined;
+            if (event.code === 4001) expired = true;
+            if (!expired && !suspended && discoveryRetries < 8)
+              discoveryTimer = setTimeout(
+                discoverTabs,
+                Math.min(250 * 2 ** discoveryRetries++, 5000),
+              );
+            else if (!suspended && !expired) {
+              $("reconnect").hidden = false;
+              setReady(false, "Tab connection lost. Reconnect to continue.");
+            }
+          };
+        }
+        $("tabs").addEventListener("change", () => selectPage($("tabs").value));
+        $("close-tab").addEventListener("click", () => action({ type: "closeTab" }));
+
+        controlButton.addEventListener("click", () => {
+          if (controlling) {
+            desiredControl = false;
+            cancelInput();
+            control("release");
+            setReady(false, "Handing the browser back…");
+            panel.hidden = true;
+            keyboard.blur();
+          } else takeControl();
+        });
+        $("reconnect").addEventListener("click", () => {
+          expired = false;
+          retries = discoveryRetries = 0;
+          discoverTabs();
+          if (socket) {
+            cancelInput();
+            socket.close();
+          } else scheduleReconnect(true);
+        });
+        layout.addEventListener("change", () => requestViewport(layout.value));
+        $("viewport-cancel").addEventListener("click", () => {
+          $("viewport-confirm").close();
+          pendingMode = undefined;
+          requestViewport(mode);
+        });
+        $("viewport-reload").addEventListener("click", () => {
+          $("viewport-confirm").close();
+          requestViewport(pendingMode, true);
+          pendingMode = undefined;
+        });
+
+        function coordinates(event) {
+          if (!metadata) return null;
+          const rect = canvas.getBoundingClientRect();
+          if (!rect.width || !rect.height) return null;
+          const scale = metadata.pageScaleFactor || 1;
+          return {
+            x: Math.max(
+              0,
+              Math.min(
+                metadata.deviceWidth / scale,
+                ((event.clientX - rect.left) * metadata.deviceWidth) / rect.width / scale,
+              ),
+            ),
+            y: Math.max(
+              0,
+              Math.min(
+                (metadata.deviceHeight - metadata.offsetTop) / scale,
+                (((event.clientY - rect.top) * metadata.deviceHeight) / rect.height -
+                  metadata.offsetTop) /
+                  scale,
+              ),
+            ),
+          };
+        }
+        const modifiers = (event) =>
+          (event.altKey ? 1 : 0) |
+          (event.ctrlKey ? 2 : 0) |
+          (event.metaKey ? 4 : 0) |
+          (event.shiftKey ? 8 : 0);
+        const mouseButton = (button) =>
+          ["left", "middle", "right", "back", "forward"][button] || "none";
+        function mouse(type, point, button = "none", event = {}) {
+          action({
+            type: "mouseEvent",
+            event: {
+              type,
+              ...point,
+              button,
+              modifiers: modifiers(event),
+              clickCount: Math.min(3, event.detail || 1),
+              ...(type === "mouseWheel"
+                ? { deltaX: event.deltaX, deltaY: event.deltaY }
+                : {}),
+            },
+          });
+        }
+        function move(point) {
+          if (!gesture || !ready) return;
+          if (gesture.kind === "drag") mouse("mouseMoved", point);
+          else {
+            if (Math.hypot(point.x - gesture.start.x, point.y - gesture.start.y) > 6)
+              gesture.moved = true;
+            if (gesture.moved)
+              mouse("mouseWheel", point, "none", {
+                deltaX: gesture.point.x - point.x,
+                deltaY: gesture.point.y - point.y,
+              });
+          }
+          gesture.point = point;
+        }
+        function flushMove() {
+          clearTimeout(moveTimer);
+          moveTimer = undefined;
+          if (pendingMove) {
+            const point = pendingMove;
+            pendingMove = undefined;
+            move(point);
+          }
+        }
+        canvas.addEventListener("pointerdown", (event) => {
+          if (!ready || event.pointerType !== "mouse" || !event.isPrimary || gesture) return;
+          event.preventDefault();
+          canvas.focus({ preventScroll: true });
+          panel.hidden = true;
+          const point = coordinates(event);
+          if (!point) return;
+          canvas.setPointerCapture(event.pointerId);
+          const kind = event.pointerType === "mouse" ? "drag" : "scroll";
+          gesture = {
+            id: event.pointerId,
+            kind,
+            point,
+            start: point,
+            button: event.pointerType === "mouse" ? mouseButton(event.button) : "left",
+            moved: false,
+          };
+          if (kind === "drag") mouse("mousePressed", point, gesture.button, event);
+        });
+        canvas.addEventListener("pointermove", (event) => {
+          if (!ready || event.pointerType !== "mouse") return;
+          if (!gesture) {
+            if (event.pointerType === "mouse") {
+              const point = coordinates(event);
+              if (point) mouse("mouseMoved", point);
+            }
+            return;
+          }
+          if (event.pointerId !== gesture.id) return;
+          event.preventDefault();
+          pendingMove = coordinates(event);
+          if (!moveTimer)
+            moveTimer = setTimeout(() => {
+              moveTimer = undefined;
+              flushMove();
+            }, 16);
+        });
+        canvas.addEventListener("pointerup", (event) => {
+          if (!gesture || event.pointerId !== gesture.id) return;
+          event.preventDefault();
+          flushMove();
+          const point = coordinates(event) || gesture.point;
+          if (point.x !== gesture.point.x || point.y !== gesture.point.y) move(point);
+          if (gesture.kind === "drag") mouse("mouseReleased", point, gesture.button, event);
+          else if (!gesture.moved) {
+            mouse("mousePressed", point, "left");
+            mouse("mouseReleased", point, "left");
+          }
+          gesture = undefined;
+          moveTimer = undefined;
+          canvas.releasePointerCapture(event.pointerId);
+        });
+        for (const eventName of ["pointercancel", "lostpointercapture"])
+          canvas.addEventListener(eventName, (event) => {
+            if (gesture?.id === event.pointerId) cancelInput();
+          });
+        canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+        canvas.addEventListener(
+          "wheel",
+          (event) => {
+            if (!ready || gesture) return;
+            event.preventDefault();
+            const point = coordinates(event);
+            if (point)
+              mouse("mouseWheel", point, "none", {
+                deltaX: Math.max(-10000, Math.min(10000, event.deltaX)),
+                deltaY: Math.max(-10000, Math.min(10000, event.deltaY)),
+              });
+          },
+          { passive: false },
+        );
+
+        function key(type, key, code, keyCode, mods = 0) {
+          action({ type: "keyEvent", event: { type, key, code, keyCode, modifiers: mods } });
+        }
+        function press(keyName, code, keyCode, mods = 0) {
+          key("keyDown", keyName, code, keyCode, mods);
+          key("keyUp", keyName, code, keyCode, mods);
+        }
+        function text(value) {
+          if (value) action({ type: "insertText", text: value });
+        }
+        function clearKeyboard() {
+          keyboard.value = "";
+          keyboardText = "";
+          keyboardCaret = 0;
+        }
+        function syncKeyboard() {
+          if (!ready || composing || keyboard.value === keyboardText) return;
+          const before = characters(keyboardText);
+          const after = characters(keyboard.value);
+          let start = 0;
+          while (
+            start < before.length &&
+            start < after.length &&
+            before[start] === after[start]
+          )
+            start++;
+          let end = before.length;
+          let nextEnd = after.length;
+          while (end > start && nextEnd > start && before[end - 1] === after[nextEnd - 1]) {
+            end--;
+            nextEnd--;
+          }
+          // The local draft starts at the remote field's caret when the keyboard opens.
+          const direction = end < keyboardCaret ? "ArrowLeft" : "ArrowRight";
+          for (let i = 0; i < Math.abs(end - keyboardCaret); i++)
+            press(direction, direction, direction === "ArrowLeft" ? 37 : 39);
+          for (let i = start; i < end; i++) press("ArrowLeft", "ArrowLeft", 37, 8);
+          const inserted = after.slice(start, nextEnd).join("");
+          if (inserted) text(inserted);
+          else if (end > start) press("Backspace", "Backspace", 8);
+          keyboardText = keyboard.value;
+          keyboardCaret = nextEnd;
+        }
+        $("keyboard").addEventListener("click", () => {
+          if (!ready) return;
+          if (panel.hidden) clearKeyboard();
+          panel.hidden = false;
+          keyboard.focus();
+        });
+        $("keyboard-close").addEventListener("click", () => {
+          cancelInput();
+          panel.hidden = true;
+          keyboard.blur();
+        });
+        keyboard.addEventListener("compositionstart", () => {
+          composing = true;
+        });
+        keyboard.addEventListener("compositionend", () => {
+          composing = false;
+          syncKeyboard();
+        });
+        keyboard.addEventListener("beforeinput", (event) => {
+          if (!ready) {
+            event.preventDefault();
+            return;
+          }
+          if (composing || event.isComposing) return;
+          if (
+            event.inputType === "insertLineBreak" ||
+            event.inputType === "insertParagraph"
+          ) {
+            event.preventDefault();
+            press("Enter", "Enter", 13);
+            clearKeyboard();
+          } else if (!keyboard.value && event.inputType.startsWith("delete")) {
+            const forward = event.inputType.includes("Forward");
+            press(
+              forward ? "Delete" : "Backspace",
+              forward ? "Delete" : "Backspace",
+              forward ? 46 : 8,
+            );
+          }
+        });
+        keyboard.addEventListener("input", (event) => {
+          if (!event.isComposing) syncKeyboard();
+        });
+        document.addEventListener("paste", (event) => {
+          if (
+            !ready ||
+            (event.target !== keyboard &&
+              event.target !== canvas &&
+              event.target !== document.body)
+          )
+            return;
+          event.preventDefault();
+          const pasted = event.clipboardData?.getData("text/plain") || "";
+          if (event.target === keyboard) {
+            keyboard.setRangeText(
+              pasted,
+              keyboard.selectionStart,
+              keyboard.selectionEnd,
+              "end",
+            );
+            syncKeyboard();
+          } else text(pasted);
+        });
+        if (clipboardBridge) {
+          tellParent({ type: "clipboardBridgeReady" });
+          window.addEventListener("message", (event) => {
+            if (event.source !== window.parent || event.origin !== parentOrigin || !ready)
+              return;
+            const data = event.data;
+            if (data?.type === "triggerCopy") action({ type: "getSelectedText" });
+            else if (data?.type === "triggerPaste" && typeof data.text === "string")
+              text(data.text);
+            else if (
+              data?.type === "clipboardReadResponse" &&
+              clipboardRequests.delete(data.requestId) &&
+              typeof data.text === "string"
+            )
+              text(data.text);
+          });
+          document.addEventListener("keydown", (event) => {
+            if (
+              !ready ||
+              (event.target !== canvas && event.target !== document.body) ||
+              (!event.ctrlKey && !event.metaKey)
+            )
+              return;
+            const shortcut = event.key.toLowerCase();
+            if (shortcut !== "c" && shortcut !== "v") return;
+            event.preventDefault();
+            if (shortcut === "c") action({ type: "getSelectedText" });
+            else {
+              const requestId = ++clipboardRequest;
+              clipboardRequests.add(requestId);
+              tellParent({ type: "requestClipboardRead", requestId });
+            }
+          });
+        }
+        document.addEventListener("keydown", (event) => {
+          if (!ready || (event.target !== canvas && event.target !== document.body)) return;
+          if (
+            (event.ctrlKey || event.metaKey) &&
+            ["v", "c", "x"].includes(event.key.toLowerCase())
+          )
+            return;
+          event.preventDefault();
+          key("keyDown", event.key, event.code, event.keyCode, modifiers(event));
+        });
+        document.addEventListener("keyup", (event) => {
+          if (!ready || (event.target !== canvas && event.target !== document.body)) return;
+          if (
+            (event.ctrlKey || event.metaKey) &&
+            ["v", "c", "x"].includes(event.key.toLowerCase())
+          )
+            return;
+          event.preventDefault();
+          key("keyUp", event.key, event.code, event.keyCode, modifiers(event));
+        });
+        for (const name of ["back", "forward", "refresh"])
+          $(name).addEventListener("click", () =>
+            action({ type: "navigation", event: { action: name } }),
+          );
+        $("url").addEventListener("keydown", (event) => {
+          if (event.key !== "Enter" || !ready) return;
+          event.preventDefault();
+          let url = $("url").value.trim();
+          if (!/^https?:\/\//i.test(url)) url = "https://" + url;
+          action({ type: "navigation", event: { url } });
+          canvas.focus();
+        });
+        window.addEventListener("blur", cancelInput);
+        let viewerWidth = window.innerWidth;
+        window.addEventListener("resize", () => {
+          const widthChanged = viewerWidth !== window.innerWidth;
+          viewerWidth = window.innerWidth;
+          updateCanvasSize();
+          if (!controlling) return;
+          // Native keyboard animations change only the visible height. Neither
+          // opening nor closing it should cancel a pinch or resize the session.
+          if (mobileInput && (!widthChanged || mobileInput.keyboardOpen())) return;
+          if (mode === "agent") { cancelInput(); return; }
+          cancelInput();
+          setReady(false, "Adjusting the page…");
+          clearTimeout(resizeTimer);
+          resizeTimer = setTimeout(() => requestViewport(), 150);
+        });
+        window.addEventListener("online", () => {
+          discoverTabs();
+          scheduleReconnect(true);
+        });
+        document.addEventListener("visibilitychange", () => {
+          suspended = document.hidden;
+          if (suspended) {
+            cancelInput();
+            if (controlling) control("pause");
+            socket?.close();
+            discoverySocket?.close();
+          } else {
+            discoverTabs();
+            scheduleReconnect(true);
+          }
+        });
+        window.addEventListener("pagehide", () => {
+          suspended = true;
+          cancelInput();
+          if (controlling) control("pause");
+          socket?.close();
+          discoverySocket?.close();
+        });
+        window.addEventListener("pageshow", () => {
+          suspended = false;
+          discoverTabs();
+          scheduleReconnect(true);
+        });
+        if (!interactive) {
+          desiredControl = false;
+          controlButton.hidden = true;
+          $("keyboard").hidden = true;
+        }
+        if (singlePageMode) connect();
+        else discoverTabs();
+      })();
     </script>
-</body>
+  </body>
 </html>

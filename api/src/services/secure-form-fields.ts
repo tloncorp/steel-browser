@@ -125,7 +125,7 @@ export const secureFieldDefinitions = [
   },
 ] as const;
 
-export type SecureFieldPurpose = (typeof secureFieldDefinitions)[number]["purpose"];
+export type SecureFieldPurpose = (typeof secureFieldDefinitions)[number]["purpose"] | "field";
 export interface SecureFormField {
   id: string;
   purpose: SecureFieldPurpose;

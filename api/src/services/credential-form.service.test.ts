@@ -21,10 +21,14 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
   let origin: string;
   let html = "";
   const requests: string[] = [];
+  const framePages = new Map<string, string>();
   const site = createServer((req, res) => {
     requests.push(req.url || "");
     res.setHeader("Content-Type", "text/html");
-    res.end(req.url?.startsWith("/done") ? "<h1>Account home</h1>" : html);
+    res.end(
+      framePages.get(req.url || "") ??
+        (req.url?.startsWith("/done") ? "<h1>Account home</h1>" : html),
+    );
   });
   beforeAll(async () => {
     browser = await puppeteer.launch({
@@ -39,7 +43,10 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
   });
   beforeEach(async () => {
     requests.length = 0;
+    framePages.clear();
     page = await browser.newPage();
+    page.setDefaultNavigationTimeout(5000);
+    await page.setViewport({ width: 1920, height: 1080 });
     service = { getAllPages: async () => [page] } as unknown as CDPService;
   });
   afterEach(async () => {
@@ -61,7 +68,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       '<form action="/done"><input name="username" autocomplete="username"><input type="password" autocomplete="current-password"><button type="submit">Sign in</button></form>',
     );
     const baseline = browserMonitorStatus(service);
-    const form = await discoverCredentialForm(service);
+    const form = await discoverCredentialForm(service, "all");
     const values = Object.fromEntries(
       form.fields.map((field) => [
         field.id,
@@ -79,7 +86,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
   const fields =
     '<label>Username<input name="username"></label><label>Password<input name="password" type="password"></label>';
   async function fill(submit = true) {
-    const target = await discoverCredentialForm(service);
+    const target = await discoverCredentialForm(service, "all");
     return fillCredentialForm(service, target, {
       values: Object.fromEntries(
         target.fields.map((field) => [
@@ -95,7 +102,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     await load(`<form onsubmit="event.preventDefault()">${fields}<button>Sign in</button></form>`);
     expect((await fill()).submitted).toBe(true);
     const filled = browserMonitorStatus(service);
-    const redisplayed = await discoverCredentialForm(service);
+    const redisplayed = await discoverCredentialForm(service, "all");
     const observed = browserMonitorStatus(service);
     expect(redisplayed.formId).toBe(filled.fill!.formId);
     expect(observed.form!.revision).toBeGreaterThan(filled.fill!.revision);
@@ -140,10 +147,16 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     });
   });
 
-  it("leaves unsupported required fields for the live browser", async () => {
+  it("includes additional required fields and leaves submission in the live browser", async () => {
     await load(
       `<form action="/done">${fields}<input required name="extra"><button>Log in</button></form>`,
     );
+    const target = await discoverCredentialForm(service, "all");
+    expect(target.fields).toHaveLength(3);
+    expect(target.fields[2]).toMatchObject({ label: "extra", purpose: "field", required: true });
+    await expect(
+      fillCredentialForm(service, target, { values: { f0: "user", f1: "secret" } }),
+    ).rejects.toMatchObject({ statusCode: 400 });
     expect((await fill()).submitted).toBe(false);
     expect(page.url()).toBe(`${origin}/login`);
     expect(await getCredentialContinuation(service)).toMatchObject({
@@ -196,7 +209,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
   it("fills an OTP and leaves the next credential step to a new handoff", async () => {
     await load(`<form onsubmit="event.preventDefault()"><input autocomplete="one-time-code" maxlength="6">
       <button type="button" onclick="document.querySelector('input').value='';document.querySelector('input').type='password'">Verify</button></form>`);
-    const target = await discoverCredentialForm(service);
+    const target = await discoverCredentialForm(service, "all");
     expect(target.fields[0].purpose).toBe("one-time-code");
     const result = await fillCredentialForm(service, target, {
       values: { [target.fields[0].id]: "123456" },
@@ -207,7 +220,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
   });
 
   async function fillValues(values: Record<string, string>, submit = true) {
-    const target = await discoverCredentialForm(service);
+    const target = await discoverCredentialForm(service, "all");
     return {
       target,
       result: await fillCredentialForm(service, target, {
@@ -228,14 +241,14 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
         e.target.innerHTML=step===1 ? '<input type="password" autocomplete="current-password"><button>Sign in</button>' :
         step===2 ? '<p>Verification code</p>'+Array.from({length:6},()=>'<input maxlength="1" inputmode="numeric">').join('')+'<button>Verify</button>' : '<h2>Account home</h2>';
       }</script>`);
-    const first = await discoverCredentialForm(service);
+    const first = await discoverCredentialForm(service, "all");
     expect(first.fields.map((field) => field.purpose)).toEqual(["username"]);
-    expect((await discoverCredentialForm(service)).formId).toBe(first.formId);
+    expect((await discoverCredentialForm(service, "all")).formId).toBe(first.formId);
     await fillCredentialForm(service, first, {
       values: { f0: "person@example.test" },
       submit: true,
     });
-    const second = await discoverCredentialForm(service);
+    const second = await discoverCredentialForm(service, "all");
     expect(second.formId).not.toBe(first.formId);
     expect(second.fields.map((field) => field.purpose)).toEqual(["current-password"]);
     expect(await page.$eval("input", (input) => input.value)).toBe("");
@@ -243,11 +256,11 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       fillCredentialForm(service, first, { values: { f0: "do-not-replay" } }),
     ).rejects.toMatchObject({ statusCode: 409 });
     await fillCredentialForm(service, second, { values: { f0: "private-password" }, submit: true });
-    const third = await discoverCredentialForm(service);
+    const third = await discoverCredentialForm(service, "all");
     expect(third.fields).toMatchObject([{ purpose: "one-time-code", exactLength: 6 }]);
     await fillCredentialForm(service, third, { values: { f0: "aBc123" }, submit: true });
     expect(await page.$eval("h2", (el) => el.textContent)).toBe("Account home");
-    await expect(discoverCredentialForm(service)).rejects.toMatchObject({ statusCode: 404 });
+    await expect(discoverCredentialForm(service, "all")).rejects.toMatchObject({ statusCode: 404 });
   });
 
   it("recognizes login forms with account-creation and recovery links", async () => {
@@ -255,6 +268,24 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       `<form onsubmit="event.preventDefault()">${fields}<a href="/register">Sign up</a><a href="/reset">Reset password</a><button>Sign in</button></form>`,
     );
     expect((await fill()).submitted).toBe(true);
+  });
+
+  it("keeps login submission available with optional checkboxes", async () => {
+    await load(`<form onsubmit="event.preventDefault();document.body.dataset.sent='yes'">${fields}
+      <label>Remember me<input type="checkbox"></label><button>Sign in</button></form>`);
+    const target = await discoverCredentialForm(service, "all");
+    expect(target.kind).toBe("login");
+    expect(target.fields[2]).toMatchObject({ label: "Remember me", required: false });
+    expect(
+      await fillCredentialForm(service, target, {
+        values: { f0: "user", f1: "secret", f2: "1" },
+        submit: true,
+      }),
+    ).toEqual({ submitted: true });
+    expect(
+      await page.$eval('[type="checkbox"]', (input) => (input as HTMLInputElement).checked),
+    ).toBe(true);
+    expect(await page.evaluate(() => document.body.dataset.sent)).toBe("yes");
   });
 
   it("revokes a receipt if any filled field changes identity or is cleared", async () => {
@@ -295,13 +326,350 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     '<form><label>Coupon code<input name="code"></label><button>Apply</button></form>',
     '<form><label>Search<input name="search"></label><button>Search</button></form>',
     '<form><input name="email"><button>Next</button></form>',
-    '<form><input type="password"><button>Sign in</button></form><form><input type="password"><button>Sign in</button></form>',
-  ])("does not guess a sensitive destination in unrelated or ambiguous forms", async (body) => {
+  ])("fills general forms without classifying them as logins", async (body) => {
     await load(body);
-    // A generic /login route alone must not identify an unnamed field.
+    // Identifier fields without a sign-in context are general fields.
     if (body.includes('name="email"'))
       await page.evaluate(() => history.replaceState(null, "", "/form"));
+    const target = await discoverCredentialForm(service, "all");
+    expect(target.kind).toBe("details");
+    expect(target.fields[0].purpose).toBe("field");
+    expect(
+      await fillCredentialForm(service, target, {
+        values: { f0: "test@example.test" },
+        submit: true,
+      }),
+    ).toEqual({ submitted: false });
+    expect(await page.$eval("input", (input) => input.value)).toBe("test@example.test");
+  });
+
+  it("requires focus to choose between multiple visible forms", async () => {
+    await load(
+      '<form><input name="search"><button>Search</button></form><form><input name="feedback"><button>Send</button></form>',
+    );
+    await expect(discoverCredentialForm(service, "all")).rejects.toMatchObject({ statusCode: 404 });
+    await page.focus('[name="feedback"]');
+    const target = await discoverCredentialForm(service, "all");
+    expect(target.fields.map((field) => field.label)).toEqual(["feedback"]);
+    await fillCredentialForm(service, target, { values: { f0: "A suggestion" } });
+    expect(await page.$$eval("input", (inputs) => inputs.map((input) => input.value))).toEqual([
+      "",
+      "A suggestion",
+    ]);
+  });
+
+  it.each(["main", 'div role="main"'])(
+    "selects the primary form in %s while respecting explicit focus",
+    async (landmark) => {
+      const tag = landmark.split(" ")[0];
+      await load(
+        `<${landmark}><form><input name="email" type="email"><input name="address"></form></${tag}><aside><form><input name="discount"></form></aside>`,
+      );
+      const target = await discoverCredentialForm(service, "all");
+      expect(target.fields.map((field) => field.label)).toEqual(["email", "address"]);
+      await fillCredentialForm(service, target, {
+        values: { f0: "person@example.test", f1: "123 Main St" },
+        submit: true,
+      });
+      expect(
+        await page.$eval('[name="discount"]', (input) => (input as HTMLInputElement).value),
+      ).toBe("");
+      await page.focus('[name="discount"]');
+      const focused = await discoverCredentialForm(service, "all");
+      expect(focused.fields.map((field) => field.label)).toEqual(["discount"]);
+    },
+  );
+
+  it("does not count nested secondary landmarks as primary forms", async () => {
+    await load(
+      '<main><form><input name="address"></form><aside><form><input name="discount"></form></aside></main>',
+    );
+    expect(
+      (await discoverCredentialForm(service, "all")).fields.map((field) => field.label),
+    ).toEqual(["address"]);
+  });
+
+  it("requires focus when the primary content has multiple forms", async () => {
+    await load(
+      '<main><form><input name="login"></form><form><input name="signup"></form></main><aside><form><input name="discount"></form></aside>',
+    );
+    await expect(discoverCredentialForm(service, "all")).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  async function loadFramedCheckout() {
+    const paymentOrigin = origin.replace("127.0.0.1", "localhost");
+    framePages.set(
+      "/number",
+      '<label>Card number<input autocomplete="cc-number" required></label>',
+    );
+    framePages.set("/expiry", '<label>Expiry<input autocomplete="cc-exp" required></label>');
+    framePages.set("/code", '<label>Security code<input autocomplete="cc-csc" required></label>');
+    framePages.set("/unrelated", '<label>Search<input name="search"></label>');
+    html =
+      '<main><form id="checkout" action="/done"><label>Email<input name="email" type="email" autocomplete="email" required></label><button>Pay now</button></form></main><aside></aside>';
+    await page.goto(`${origin}/checkout`);
+    for (const path of ["/number", "/expiry", "/code", "/unrelated"]) {
+      const url = paymentOrigin + path;
+      await page.evaluate(
+        (url, secondary) => {
+          const frame = document.createElement("iframe");
+          frame.src = url;
+          document.querySelector(secondary ? "aside" : "form")!.append(frame);
+        },
+        url,
+        path === "/unrelated",
+      );
+      const frame = await page.waitForFrame((frame) => frame.url() === url);
+      await frame.waitForSelector("input", { timeout: 5000 });
+    }
+  }
+
+  it("discovers and fills one checkout across cross-origin payment frames without submitting", async () => {
+    await loadFramedCheckout();
+    const target = await discoverCredentialForm(service, "all");
+    expect(target.kind).toBe("details");
+    expect(target.fields.map((field) => field.purpose)).toEqual([
+      "email",
+      "cc-number",
+      "cc-exp",
+      "cc-csc",
+    ]);
+    expect(new Set(target.fields.map((field) => field.id)).size).toBe(4);
+    expect((await discoverCredentialForm(service, "all")).formId).toBe(target.formId);
+    const number = page.frames().find((frame) => frame.url().endsWith("/number"))!;
+    await number.focus("input");
+    expect((await discoverCredentialForm(service, "all")).fields).toEqual(target.fields);
+    const values = { f0: "person@example.test", f1: "4242424242424242", f2: "12/30", f3: "123" };
+    expect(await fillCredentialForm(service, target, { values, submit: true })).toEqual({
+      submitted: false,
+    });
+    expect(await page.$eval("input", (input) => input.value)).toBe(values.f0);
+    expect(await number.$eval("input", (input) => input.value)).toBe(values.f1);
+    expect(
+      await page
+        .frames()
+        .find((frame) => frame.url().endsWith("/unrelated"))!
+        .$eval("input", (input) => input.value),
+    ).toBe("");
+    expect(requests).not.toContain("/done");
+    expect(await getCredentialContinuation(service)).toMatchObject({
+      formId: target.formId,
+      frameUrl: page.url(),
+    });
+    await number.$eval("input", (input) => {
+      input.value = "";
+    });
+    expect(await getCredentialContinuation(service)).toBeNull();
+  });
+
+  it("hands off only payment fields across frames and preserves bot-entered details", async () => {
+    await loadFramedCheckout();
+    await page.$eval("input", (input) => {
+      input.value = "person@example.test";
+    });
+    const target = await discoverCredentialForm(service);
+    expect(target.fields.map((field) => field.purpose)).toEqual(["cc-number", "cc-exp", "cc-csc"]);
+    expect((await discoverCredentialForm(service)).formId).toBe(target.formId);
+    // Ordinary checkout rerenders and an unrelated hidden frame do not change
+    // the payment destinations that the owner approves.
+    await page.$eval("input", (input) => input.replaceWith(input.cloneNode()));
+    await page.$eval("aside", (element) => {
+      element.style.display = "none";
+    });
+    expect((await discoverCredentialForm(service)).formId).toBe(target.formId);
+    expect(
+      await fillCredentialForm(service, target, {
+        values: { f0: "4242424242424242", f1: "12/30", f2: "123" },
+        submit: true,
+      }),
+    ).toEqual({ submitted: false });
+    expect(await page.$eval("input", (input) => input.value)).toBe("person@example.test");
+    const receipt = await getCredentialContinuation(service);
+    expect(receipt).toMatchObject({
+      kind: "details",
+      formId: target.formId,
+      submissionAttempted: false,
+    });
+    const client = await page.createCDPSession();
+    const { node } = await client.send("DOM.describeNode", {
+      backendNodeId: receipt!.anchorBackendNodeId,
+    });
+    expect(node.nodeName).toBe("FORM");
+    await client.detach();
+    expect(requests).not.toContain("/done");
+    const number = page.frames().find((frame) => frame.url().endsWith("/number"))!;
+    await number.$eval("input", (input) => {
+      input.value = "";
+    });
+    expect(await getCredentialContinuation(service)).toBeNull();
+  });
+
+  it("ignores required ordinary fields and their synchronous updates while filling cards", async () => {
+    await load(`<form onsubmit="event.preventDefault();document.body.dataset.paid='yes'">
+      <input autocomplete="street-address" required><select autocomplete="country" required><option>US</option></select>
+      <input autocomplete="cc-number" required><input autocomplete="cc-exp" required><input autocomplete="cc-csc" required>
+      <button>Pay now</button></form><script>
+      document.querySelector('[autocomplete=cc-number]').oninput=()=>{
+        const address=document.querySelector('[autocomplete=street-address]');address.replaceWith(address.cloneNode());
+        document.querySelector('select').innerHTML='<option>Canada</option>';
+      };</script>`);
+    const target = await discoverCredentialForm(service);
+    expect(target.fields.map((field) => field.purpose)).toEqual(["cc-number", "cc-exp", "cc-csc"]);
+    await expect(
+      fillCredentialForm(service, target, { values: { f0: "4242424242424242", f3: "address" } }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(
+      await fillCredentialForm(service, target, {
+        values: { f0: "4242424242424242", f1: "12/30", f2: "123" },
+        submit: true,
+      }),
+    ).toEqual({ submitted: false });
+    expect(
+      await page.$eval(
+        "[autocomplete=street-address]",
+        (input) => (input as HTMLInputElement).value,
+      ),
+    ).toBe("");
+    expect(await page.evaluate(() => document.body.dataset.paid)).toBeUndefined();
+    expect(await getCredentialContinuation(service)).not.toBeNull();
+  });
+
+  it.each(["replace", "navigate", "hide"])(
+    "rejects a changed scoped payment destination: %s",
+    async (change) => {
+      await loadFramedCheckout();
+      const target = await discoverCredentialForm(service);
+      const number = page.frames().find((frame) => frame.url().endsWith("/number"))!;
+      const code = page.frames().find((frame) => frame.url().endsWith("/code"))!;
+      if (change === "replace")
+        await code.$eval("input", (input) => input.replaceWith(input.cloneNode()));
+      if (change === "hide")
+        await page.$eval('iframe[src$="/code"]', (frame) => {
+          (frame as HTMLElement).hidden = true;
+        });
+      if (change === "navigate") {
+        await page.$eval(
+          'iframe[src$="/code"]',
+          (frame, url) => {
+            (frame as HTMLIFrameElement).src = url;
+          },
+          origin + "/unrelated",
+        );
+        await page.waitForFrame((frame) => frame.url() === origin + "/unrelated");
+      }
+      await expect(
+        fillCredentialForm(service, target, {
+          values: { f0: "4242424242424242", f1: "12/30", f2: "123" },
+        }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(await number.$eval("input", (input) => input.value)).toBe("");
+    },
+  );
+
+  it("keeps ordinary checkout input outside the authentication handoff", async () => {
+    await load(`<form>${fields}<input name="extra" required><button>Log in</button></form>`);
+    const target = await discoverCredentialForm(service);
+    expect(target.fields.map((field) => field.purpose)).toEqual(["username", "current-password"]);
+    expect(
+      await fillCredentialForm(service, target, {
+        values: { f0: "user", f1: "secret" },
+        submit: true,
+      }),
+    ).toEqual({ submitted: false });
+    expect(await page.$eval("[name=extra]", (input) => (input as HTMLInputElement).value)).toBe("");
+  });
+
+  it.each([
+    '<form><input autocomplete="street-address" required><input autocomplete="email" required><button>Pay now</button></form>',
+    '<form><input name="search"><button>Search</button></form>',
+  ])("leaves ordinary-only forms to the bot", async (body) => {
+    await load(body);
     await expect(discoverCredentialForm(service)).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  it.each(["replace", "navigate", "hide"])(
+    "rejects a payment-frame %s before filling any part of a checkout",
+    async (change) => {
+      await loadFramedCheckout();
+      const target = await discoverCredentialForm(service, "all");
+      const code = page.frames().find((frame) => frame.url().endsWith("/code"))!;
+      if (change === "replace")
+        await code.$eval("input", (input) => input.replaceWith(input.cloneNode()));
+      if (change === "navigate") {
+        await page.$eval(
+          'iframe[src$="/code"]',
+          (frame, url) => {
+            (frame as HTMLIFrameElement).src = url;
+          },
+          origin + "/unrelated",
+        );
+        const navigated = await page.waitForFrame((frame) => frame.url() === origin + "/unrelated");
+        await navigated.waitForSelector("input");
+      }
+      if (change === "hide")
+        await page.$eval('iframe[src$="/code"]', (frame) => {
+          (frame as HTMLElement).style.display = "none";
+        });
+      await expect(
+        fillCredentialForm(service, target, {
+          values: { f0: "person@example.test", f1: "4242424242424242", f2: "12/30", f3: "123" },
+        }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(await page.$eval("input", (input) => input.value)).toBe("");
+      expect(
+        await page
+          .frames()
+          .find((frame) => frame.url().endsWith("/number"))!
+          .$eval("input", (input) => input.value),
+      ).toBe("");
+    },
+  );
+
+  it("combines generic fields through a nested frame without requiring payment semantics", async () => {
+    const embeddedOrigin = origin.replace("127.0.0.1", "localhost");
+    framePages.set("/wrapper", "<div id=content></div>");
+    framePages.set(
+      "/message",
+      '<label>Message<textarea name="message" required></textarea></label>',
+    );
+    await load(
+      `<form><label>Topic<input name="topic"></label><iframe src="${embeddedOrigin}/wrapper"></iframe></form>`,
+    );
+    const wrapper = page.frames().find((frame) => frame.url().endsWith("/wrapper"))!;
+    await wrapper.evaluate((url) => {
+      const frame = document.createElement("iframe");
+      frame.src = url;
+      document.body.append(frame);
+    }, origin + "/message");
+    const message = await page.waitForFrame((frame) => frame.url().endsWith("/message"));
+    await message.waitForSelector("textarea");
+    const target = await discoverCredentialForm(service, "all");
+    expect(target.fields.map((field) => field.label)).toEqual(["Topic", "Message"]);
+    await fillCredentialForm(service, target, { values: { f1: "A message" } });
+    expect(await message.$eval("textarea", (input) => input.value)).toBe("A message");
+    expect(await page.$eval("input", (input) => input.value)).toBe("");
+    const receipt = await getCredentialContinuation(service);
+    expect(receipt?.frameUrl).toBe(page.url());
+    const client = await page.createCDPSession();
+    const { node } = await client.send("DOM.describeNode", {
+      backendNodeId: receipt!.anchorBackendNodeId,
+    });
+    expect(node.nodeName).toBe("FORM");
+    await client.detach();
+  });
+
+  it("requires focus for unrelated sibling frame forms", async () => {
+    framePages.set("/one", '<input name="one">');
+    framePages.set("/two", '<input name="two">');
+    await load(`<iframe src="${origin}/one"></iframe><iframe src="${origin}/two"></iframe>`);
+    await expect(discoverCredentialForm(service, "all")).rejects.toMatchObject({ statusCode: 404 });
+    await page
+      .frames()
+      .find((frame) => frame.url().endsWith("/two"))!
+      .focus("input");
+    expect(
+      (await discoverCredentialForm(service, "all")).fields.map((field) => field.label),
+    ).toEqual(["two"]);
   });
 
   it("rejects changed nodes and field semantics on the same URL before writing", async () => {
@@ -309,7 +677,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       await load(
         `<form id="login">${fields}<button>Sign in</button></form><form id="other"></form>`,
       );
-      const target = await discoverCredentialForm(service);
+      const target = await discoverCredentialForm(service, "all");
       await page.$eval(
         "[type=password]",
         (element, mutation) => {
@@ -333,7 +701,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     await load(`<form>${fields}<button>Sign in</button></form><script>
       document.querySelector('input').oninput=()=>{const p=document.querySelector('[type=password]');p.replaceWith(p.cloneNode())}
     </script>`);
-    const target = await discoverCredentialForm(service);
+    const target = await discoverCredentialForm(service, "all");
     await expect(
       fillCredentialForm(service, target, { values: { f0: "user", f1: "secret" }, submit: true }),
     ).rejects.toMatchObject({ statusCode: 409 });
@@ -359,6 +727,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     });
     expect(target.kind).toBe("details");
     expect(target.fields.at(-1)?.options).toEqual([
+      { value: "0", label: "Choose country" },
       { value: "1", label: "United States" },
       { value: "2", label: "Canada" },
     ]);
@@ -376,7 +745,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     await load(
       '<form><select autocomplete="country"><option value="US">US</option></select><input autocomplete="address-line1"><button>Continue</button></form>',
     );
-    const target = await discoverCredentialForm(service);
+    const target = await discoverCredentialForm(service, "all");
     await page.$eval("option", (option) => (option.value = "CA"));
     await expect(
       fillCredentialForm(service, target, { values: { f0: "0", f1: "1 Test St" } }),
@@ -388,7 +757,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     await load(
       '<form><h1>Billing address</h1><label>Card number<input name="cardNumber"></label><label>CVV<input name="cvv"></label><label>Street address<input name="address1"></label><label>City<input name="city"></label><label>Postal code<input name="zip"></label><button>Pay</button></form>',
     );
-    const target = await discoverCredentialForm(service);
+    const target = await discoverCredentialForm(service, "all");
     expect(target.kind).toBe("details");
     expect(target.fields.map((field) => field.purpose)).toEqual([
       "cc-number",
@@ -402,7 +771,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
   it("ignores hidden and inert controls and discovers open shadow-root fields", async () => {
     await load(`<input type="password" style="display:none"><div inert><input type="password"></div><div id="host"></div>
       <script>document.querySelector('#host').attachShadow({mode:'open'}).innerHTML='<form><input type="password" autocomplete="current-password"><button>Sign in</button></form>'</script>`);
-    const target = await discoverCredentialForm(service);
+    const target = await discoverCredentialForm(service, "all");
     expect(target.fields.map((field) => field.purpose)).toEqual(["current-password"]);
     await fillCredentialForm(service, target, { values: { f0: "secret" } });
     expect(
@@ -410,5 +779,176 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
         () => document.querySelector("#host")!.shadowRoot!.querySelector("input")!.value,
       ),
     ).toBe("secret");
+  });
+
+  it("fills native text controls using page labels without exposing existing values", async () => {
+    await load(`<form onsubmit="event.preventDefault();document.body.dataset.sent='yes'">
+      <label>Subject<input name="subject" required value="private-subject"></label>
+      <label>Message<textarea required>private-message</textarea></label>
+      <span id="when">Appointment date</span><input type="date" aria-labelledby="when">
+      <input type="number" aria-label="Party size" min="1" max="12">
+      <input type="url" placeholder="Website">
+      <input type="search" name="query">
+      <input type="time" id="time">
+      <input>
+      <input disabled name="disabled"><input readonly name="readonly"><input type="hidden" name="hidden">
+      <button>Send</button></form>`);
+    const target = await discoverCredentialForm(service, "all");
+    expect(target.kind).toBe("details");
+    expect(target.fields.map((field) => field.label)).toEqual([
+      "Subject",
+      "Message",
+      "Appointment date",
+      "Party size",
+      "Website",
+      "query",
+      "time",
+      "Field 8",
+    ]);
+    expect(target.fields[1].inputType).toBe("textarea");
+    expect(JSON.stringify(target)).not.toMatch(/private-subject|private-message/);
+    const values = [
+      "A question",
+      "First line\nSecond line",
+      "2026-10-09",
+      "3",
+      "https://example.test",
+      "find me",
+      "12:30",
+      "unnamed",
+    ];
+    expect(
+      await fillCredentialForm(service, target, {
+        values: Object.fromEntries(values.map((value, i) => [`f${i}`, value])),
+        submit: true,
+      }),
+    ).toEqual({ submitted: false });
+    expect(
+      await page.$$eval(
+        "input:not(:disabled):not([readonly]):not([type=hidden]), textarea",
+        (inputs) => inputs.map((input) => (input as HTMLInputElement).value),
+      ),
+    ).toEqual(values);
+    expect(await page.evaluate(() => document.body.dataset.sent)).toBeUndefined();
+  });
+
+  it("fills checkbox, radio, and multiple-select choices through field events", async () => {
+    await load(`<form>
+      <label>Accept terms<input type="checkbox" required></label>
+      <label>Updates<input type="checkbox" checked></label>
+      <fieldset><legend>Contact method</legend>
+        <label>Email<input type="radio" name="contact" value="private-email" required checked></label>
+        <label>Phone<input type="radio" name="contact" value="private-phone"></label>
+      </fieldset>
+      <label>Topics<select multiple required>
+        <option value="private-news" selected>News</option><option value="private-events">Events</option>
+        <optgroup disabled><option>Disabled</option></optgroup>
+      </select></label>
+      <button>Save</button></form>
+      <script>document.querySelector('form').addEventListener('change',()=>{
+        document.body.dataset.changes=String(Number(document.body.dataset.changes||0)+1);
+      }); document.querySelector('form').addEventListener('click',event=>{
+        if(event.target.matches('input')) document.body.dataset.clicks=String(Number(document.body.dataset.clicks||0)+1);
+      })</script>`);
+    const target = await discoverCredentialForm(service, "all");
+    expect(target.fields.map((field) => field.label)).toEqual([
+      "Accept terms",
+      "Updates",
+      "Contact method",
+      "Topics: News",
+      "Topics: Events",
+    ]);
+    expect(JSON.stringify(target)).not.toContain("private-");
+    expect(target.fields[0].options).toEqual([{ value: "1", label: "Yes" }]);
+    expect(target.fields[2].options).toEqual([
+      { value: "0", label: "Email" },
+      { value: "1", label: "Phone" },
+    ]);
+    for (const values of [
+      { f0: "0", f1: "0", f2: "1", f3: "0", f4: "1" },
+      { f0: "1", f1: "0", f2: "2", f3: "0", f4: "1" },
+      { f0: "1", f1: "0", f2: "1", f3: "0", f4: "0" },
+    ]) {
+      await expect(fillCredentialForm(service, target, { values })).rejects.toMatchObject({
+        statusCode: 400,
+      });
+      expect(await page.evaluate(() => document.body.dataset.changes)).toBeUndefined();
+    }
+    expect(
+      await fillCredentialForm(service, target, {
+        values: { f0: "1", f1: "0", f2: "1", f3: "0", f4: "1" },
+      }),
+    ).toEqual({ submitted: false });
+    expect(await page.$$eval("input", (inputs) => inputs.map((input) => input.checked))).toEqual([
+      true,
+      false,
+      false,
+      true,
+    ]);
+    expect(
+      await page.$eval("select", (select) =>
+        Array.from(select.selectedOptions).map((option) => option.value),
+      ),
+    ).toEqual(["private-events"]);
+    expect(await page.evaluate(() => document.body.dataset.changes)).toBe("5");
+    expect(await page.evaluate(() => document.body.dataset.clicks)).toBe("3");
+    expect(await getCredentialContinuation(service)).toMatchObject({ kind: "details" });
+  });
+
+  it("clears optional fields and preserves omitted fields", async () => {
+    await load(
+      '<form><input name="clear" value="draft"><input name="keep" value="keep"><button>Save</button></form>',
+    );
+    const target = await discoverCredentialForm(service, "all");
+    await fillCredentialForm(service, target, { values: { f0: "" } });
+    expect(await page.$$eval("input", (inputs) => inputs.map((input) => input.value))).toEqual([
+      "",
+      "keep",
+    ]);
+  });
+
+  it("binds externally associated controls and form-less fields", async () => {
+    for (const body of [
+      '<form id="feedback"><button>Send</button></form><label>Message<textarea form="feedback" required></textarea></label>',
+      "<div><label>Message<textarea required></textarea></label><button>Send</button></div>",
+    ]) {
+      await load(body);
+      const target = await discoverCredentialForm(service, "all");
+      expect(target.fields).toMatchObject([{ label: "Message", inputType: "textarea" }]);
+      await fillCredentialForm(service, target, { values: { f0: "Feedback" } });
+      expect(await page.$eval("textarea", (input) => input.value)).toBe("Feedback");
+    }
+  });
+
+  it("rejects changed choice semantics before filling another field", async () => {
+    for (const mutation of ["multiple", "option", "required"] as const) {
+      await load(
+        '<form><input name="message"><select multiple><option>One</option><option>Two</option></select><button>Save</button></form>',
+      );
+      const target = await discoverCredentialForm(service, "all");
+      await page.$eval(
+        "select",
+        (select, mutation) => {
+          if (mutation === "multiple") select.multiple = false;
+          if (mutation === "option") select.options[0].label = "Changed";
+          if (mutation === "required") select.required = true;
+        },
+        mutation,
+      );
+      await expect(
+        fillCredentialForm(service, target, { values: { f0: "Private", f1: "1" } }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(await page.$eval("input", (input) => input.value)).toBe("");
+    }
+  });
+  it("limits the selected handoff fields rather than ordinary checkout fields", async () => {
+    await load(`<form>${Array.from(
+      { length: 41 },
+      (_, i) => `<label>Shipping detail ${i}<input name="detail${i}"></label>`,
+    ).join("")}
+      <label>Card number<input autocomplete="cc-number"></label><button>Pay</button></form>`);
+    const target = await discoverCredentialForm(service);
+    expect(target.fields.map((field) => field.purpose)).toEqual(["cc-number"]);
+    await expect(discoverCredentialForm(service, "all")).rejects.toMatchObject({ statusCode: 404 });
   });
 });

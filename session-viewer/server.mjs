@@ -48,6 +48,7 @@ export function mintCapability({ sessionId, expiresAt }, secret) {
       v: 1,
       aud: "session-viewer",
       sid: sessionId,
+      nonce: randomBytes(16).toString("base64url"),
       exp: Math.floor(expiresAt / 1000),
     }),
   );
@@ -364,7 +365,7 @@ function writeUpgradeError(socket, status, message) {
   );
 }
 
-function proxyUpgrade(request, socket, head, target, forwardedPath) {
+function proxyUpgrade(request, socket, head, target, forwardedPath, expiresAt) {
   const upstream = net.connect(Number(target.port), target.hostname);
   upstream.once("connect", () => {
     const lines = [
@@ -374,6 +375,7 @@ function proxyUpgrade(request, socket, head, target, forwardedPath) {
       const lower = name.toLowerCase();
       if (
         lower === "host" ||
+        lower === "x-viewer-expires-at" ||
         lower === "cookie" ||
         lower.startsWith("x-forwarded-")
       )
@@ -384,7 +386,13 @@ function proxyUpgrade(request, socket, head, target, forwardedPath) {
         lines.push(`${name}: ${value}`);
       }
     }
-    lines.push(`host: ${target.host}`, "x-forwarded-proto: https", "", "");
+    lines.push(
+      `host: ${target.host}`,
+      "x-forwarded-proto: https",
+      `x-viewer-expires-at: ${expiresAt}`,
+      "",
+      "",
+    );
     upstream.write(lines.join("\r\n"));
     if (head.length) upstream.write(head);
     socket.pipe(upstream).pipe(socket);
@@ -397,10 +405,17 @@ export function createGateway(config) {
   const upstreamOrigin = new URL(config.upstreamOrigin);
   const publicOrigin = new URL(config.publicOrigin);
   const credentialHandoffs = new Map();
+  // Login steps share a viewer capability, but every fill handle is single-use.
+  // Keep each round object until expiry to fence discovery that overlaps a fill,
+  // including discovery that returns after the next login step becomes available.
+  const credentialRounds = new Map();
 
   const removeExpiredHandoffs = (now = Date.now()) => {
     for (const [id, handoff] of credentialHandoffs) {
       if (handoff.expiresAt <= now) credentialHandoffs.delete(id);
+    }
+    for (const [token, round] of credentialRounds) {
+      if (round.expiresAt <= now) credentialRounds.delete(token);
     }
   };
 
@@ -442,11 +457,21 @@ export function createGateway(config) {
 
     const credentialEntry = /^\/credentials\/([^/]+)$/.exec(url.pathname);
     if (request.method === "GET" && credentialEntry) {
-      const capability = verifyCapability(credentialEntry[1], config.secret);
+      const token = credentialEntry[1];
+      const capability = verifyCapability(token, config.secret);
       if (!capability)
         return sendCredentialJson(response, 401, {
           error: "Credential handoff is invalid or expired.",
         });
+
+      removeExpiredHandoffs();
+      const endRound = () =>
+        sendCredentialJson(response, 404, {
+          error:
+            "This form handoff is complete. Request a fresh handoff for another step.",
+        });
+      const round = credentialRounds.get(token);
+      if (round && round.status !== "ready") return endRound();
 
       try {
         const target = new URL(
@@ -456,10 +481,12 @@ export function createGateway(config) {
           upstreamOrigin,
         );
         const discovered = await upstreamJson(target);
+        // Discovery can overlap a fill. Do not publish a new handle after that
+        // fill starts, even if the upstream lookup was already in flight.
+        if (credentialRounds.get(token) !== round) return endRound();
         if (!discovered.response.ok) {
           return sendCredentialJson(response, discovered.response.status, {
-            error:
-              discovered.body?.error ?? "No live credential form is available.",
+            error: discovered.body?.error ?? "No live form is available.",
           });
         }
         const { formId, pageId, frameUrl, origin, kind } =
@@ -501,6 +528,8 @@ export function createGateway(config) {
           Date.now() + 5 * 60_000,
         );
         credentialHandoffs.set(handoffId, {
+          token,
+          capabilityExpiresAt: capability.expiresAt,
           sessionId: capability.sessionId,
           target: { formId, pageId, frameUrl, origin, kind },
           fields,
@@ -557,14 +586,20 @@ export function createGateway(config) {
       }
 
       if (
+        handoff.expiresAt <= Date.now() ||
         handoff.status !== "ready" ||
         credentialHandoffs.get(credentialFill[1]) !== handoff
       ) {
         return sendCredentialJson(response, 401, {
-          error: "Secure form is already used or replaced.",
+          error: "Secure form is expired, already used, or replaced.",
         });
       }
       handoff.status = "submitting";
+      const round = {
+        expiresAt: handoff.capabilityExpiresAt,
+        status: "submitting",
+      };
+      credentialRounds.set(handoff.token, round);
       try {
         const target = new URL(
           `/v1/sessions/${encodeURIComponent(
@@ -582,6 +617,7 @@ export function createGateway(config) {
           }),
         });
         if (!filled.response.ok) {
+          round.status = "ready";
           credentialHandoffs.delete(credentialFill[1]);
           return sendCredentialJson(response, filled.response.status, {
             error:
@@ -589,11 +625,13 @@ export function createGateway(config) {
           });
         }
         credentialHandoffs.delete(credentialFill[1]);
+        round.status = handoff.target.kind === "login" ? "ready" : "closed";
         return sendCredentialJson(response, 200, {
           ok: true,
           submitted: filled.body?.submitted === true,
         });
       } catch {
+        round.status = "ready";
         credentialHandoffs.delete(credentialFill[1]);
         return sendCredentialJson(response, 502, {
           error: "Browser unavailable.",
@@ -685,7 +723,14 @@ export function createGateway(config) {
     } else {
       return writeUpgradeError(socket, 404, "Not Found");
     }
-    proxyUpgrade(request, socket, head, upstreamOrigin, forwardedPath);
+    proxyUpgrade(
+      request,
+      socket,
+      head,
+      upstreamOrigin,
+      forwardedPath,
+      capability.expiresAt,
+    );
   });
 
   return { internal, publicServer };
