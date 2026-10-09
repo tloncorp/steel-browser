@@ -123,13 +123,25 @@ async function routes(server: FastifyInstance) {
     {
       schema: {
         operationId: "discover_session_credential_form",
-        description: "Discover a visible form for a trusted session viewer handoff",
+        description: "Discover payment and authentication fields, or explicitly request all fields",
         tags: ["Sessions"],
         summary: "Discover a form",
+        querystring: {
+          type: "object",
+          properties: {
+            scope: { type: "string", enum: ["sensitive", "all"], default: "sensitive" },
+          },
+          additionalProperties: false,
+        },
       },
     },
-    async (request: FastifyRequest<{ Params: { sessionId: string } }>, reply: FastifyReply) =>
-      handleDiscoverCredentialForm(server, request, reply),
+    async (
+      request: FastifyRequest<{
+        Params: { sessionId: string };
+        Querystring: { scope?: "sensitive" | "all" };
+      }>,
+      reply: FastifyReply,
+    ) => handleDiscoverCredentialForm(server, request, reply),
   );
 
   server.get(

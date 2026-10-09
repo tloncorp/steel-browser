@@ -89,18 +89,22 @@ connection closes at that deadline or the session deadline, whichever comes firs
 also recheck their deadline after reading the request body and before dispatching to the browser.
 Deploy the API and viewer template together: the input protocol requires matching versions.
 
-Secure form handoffs discover visible, editable native controls without requiring login or autofill
-semantics. Field labels come from the page's accessible labels, placeholders, or names; discovery
-does not return existing input values. Text fields and textareas retain their labels and required
-status. Radio groups appear as choices, while checkboxes and individual multiple-select options
-appear as Yes/No choices. A focused form takes precedence when a page has several forms; without
-focus, discovery selects a single form in the page's primary-content landmark (`main` or
-`role="main"`), or the sole form on the page. Secondary landmarks such as `aside` do not compete
-with a unique primary form. Multiple primary forms still require focus. Fields in frames contained
-by the selected form, including nested cross-origin frames, join the same handoff. Each frame retains
-its own URL, origin, and node bindings; detached, hidden, navigated, or replaced destinations reject
-filling. Unrelated frame forms stay separate. General forms fill without submitting. Login forms
-can submit when explicitly requested. File uploads and custom widgets require the live browser.
+Secure form handoffs request payment-card fields and authentication fields (login identifiers,
+passwords, and one-time codes). The bot collects ordinary contact, shipping, and preference details
+in chat and enters them before requesting secure entry. The internal credential-discovery endpoint
+accepts `scope=all` for callers that need a general native form; its default is `scope=sensitive`.
+Discovery returns page labels and field requirements without existing input values. General forms
+fill without submitting. Login forms can submit when explicitly requested; a payment fill grants
+no purchase approval.
+
+A focused form takes precedence when a page has several forms; without focus, discovery selects
+a single form in the page's primary-content landmark (`main` or `role="main"`), or the sole form
+on the page. Secondary landmarks such as `aside` do not compete with a unique primary form.
+Multiple primary forms require focus. Fields in frames contained by the selected form, including
+nested cross-origin frames, join the same handoff. Each selected frame retains its URL, origin,
+and node bindings; detached, hidden, navigated, or replaced destinations reject filling. Ordinary
+fields and unrelated frames are excluded from sensitive field bindings, so shipping-field updates
+do not invalidate card entry. File uploads and custom widgets require the live browser.
 
 Each signed viewer link offers one successful secure form fill. After filling, credential discovery
 with that link returns 404, allowing the app to finish its polling and return control to the bot.

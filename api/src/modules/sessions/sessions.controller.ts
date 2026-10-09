@@ -269,7 +269,10 @@ export const handleGetSessionLiveDetails = async (
 
 export const handleDiscoverCredentialForm = async (
   server: FastifyInstance,
-  request: FastifyRequest<{ Params: { sessionId: string } }>,
+  request: FastifyRequest<{
+    Params: { sessionId: string };
+    Querystring: { scope?: "sensitive" | "all" };
+  }>,
   reply: FastifyReply,
 ) => {
   if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.ip)) {
@@ -282,6 +285,7 @@ export const handleDiscoverCredentialForm = async (
     }
     const description = await discoverCredentialForm(
       server.sessionService.getCDPService(request.params.sessionId),
+      request.query.scope ?? "sensitive",
     );
     return reply.send(description);
   } catch (error) {

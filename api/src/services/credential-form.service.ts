@@ -18,6 +18,7 @@ export interface CredentialFormTarget {
 export interface CredentialFormDescription extends CredentialFormTarget {
   fields: SecureFormField[];
 }
+export type CredentialFormScope = "all" | "sensitive";
 export interface CredentialFormValues {
   values: Record<string, string>;
   submit?: boolean;
@@ -41,7 +42,7 @@ const continuations = new WeakMap<
   CDPService,
   {
     receipt: CredentialContinuation;
-    anchor: ElementHandle<FormControl>;
+    anchor: ElementHandle<HTMLElement>;
     parts: BoundFormPart[];
     filledIds: string[];
     timer: ReturnType<typeof setTimeout>;
@@ -73,6 +74,9 @@ export async function getCredentialContinuation(
               (form, target, filledIds) =>
                 location.href === target.frameUrl &&
                 location.origin === target.origin &&
+                form.scope.isConnected &&
+                (form.scope instanceof HTMLFormElement ? form.scope.action : undefined) ===
+                  form.action &&
                 form.controls.every(
                   ({ input, form, attributes, action }) =>
                     input.isConnected &&
@@ -120,7 +124,7 @@ export async function getCredentialContinuation(
   return { ...state.receipt };
 }
 /** Click one unambiguous login control through the browser's input pipeline. */
-async function activateCredentialControl(anchor: ElementHandle<FormControl>): Promise<boolean> {
+async function activateCredentialControl(anchor: ElementHandle<HTMLElement>): Promise<boolean> {
   const deadline = Date.now() + 2_000;
   do {
     const handle = await anchor.evaluateHandle((input) => {
@@ -144,7 +148,7 @@ async function activateCredentialControl(anchor: ElementHandle<FormControl>): Pr
             "",
         ) &&
         !/\b(?:with|google|apple|facebook|register|sign\s*up)\b/i.test(element.textContent || "");
-      const form = input.form;
+      const form = input instanceof HTMLFormElement ? input : (input as FormControl).form;
       let candidates: HTMLElement[];
       if (form) {
         candidates = Array.from(
@@ -242,6 +246,7 @@ type BoundForm = {
   focused: boolean;
   primary: boolean;
   scope: Element;
+  action?: string;
   fields: BoundField[];
   controls: Array<{
     input: FormControl;
@@ -572,7 +577,7 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
         },
       });
     }
-    if (!fields.length || fields.length > 40) continue;
+    if (!fields.length) continue;
     // Optional checkboxes (such as Remember me) do not change a login's purpose.
     const purposes = fields
       .filter((field) => field.choice !== "checkbox" || field.descriptor.required)
@@ -643,6 +648,7 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
     matches.push({
       kind,
       scope,
+      action: scope instanceof HTMLFormElement ? scope.action : undefined,
       focused:
         !!active &&
         active !== document.body &&
@@ -673,7 +679,10 @@ async function releaseForm(cdpService: CDPService) {
   await Promise.all(current.parts.map((part) => part.handle.dispose().catch(() => {})));
 }
 
-async function discoverBoundForm(cdpService: CDPService): Promise<CredentialFormDescription> {
+async function discoverBoundForm(
+  cdpService: CDPService,
+  scope: CredentialFormScope,
+): Promise<CredentialFormDescription> {
   const pages = await cdpService.getAllPages();
   for (const page of [...pages].reverse()) {
     const candidates: Array<{
@@ -760,7 +769,7 @@ async function discoverBoundForm(cdpService: CDPService): Promise<CredentialForm
       if (candidates.length > 1) break;
       continue;
     }
-    const selected = [
+    let selected = [
       root,
       ...candidates.filter((candidate) => candidate !== root && rootOf(candidate) === root),
     ];
@@ -769,6 +778,40 @@ async function discoverBoundForm(cdpService: CDPService): Promise<CredentialForm
         .filter((candidate) => !selected.includes(candidate))
         .map((candidate) => candidate.handle.dispose()),
     );
+    if (scope === "sensitive") {
+      for (const candidate of selected) {
+        candidate.fields = await candidate.handle.evaluate((form) => {
+          form.fields = form.fields.filter(
+            ({ descriptor: { purpose } }) =>
+              purpose.startsWith("cc-") ||
+              ["username", "current-password", "new-password", "one-time-code"].includes(purpose),
+          );
+          const inputs = new Set(form.fields.flatMap((field) => field.inputs));
+          form.controls = form.controls.filter((control) => inputs.has(control.input));
+          return form.fields.map((field) => field.descriptor);
+        });
+      }
+      // Keep only selected destinations and the scopes that contain their frames.
+      // Ordinary fields neither require owner entry nor invalidate a sensitive fill.
+      const included = new Set(selected.filter((candidate) => candidate.fields.length > 0));
+      for (let candidate of included) {
+        while (parent.has(candidate)) {
+          candidate = parent.get(candidate)!;
+          included.add(candidate);
+        }
+      }
+      await Promise.all(
+        selected
+          .filter((candidate) => !included.has(candidate))
+          .map((candidate) => candidate.handle.dispose()),
+      );
+      selected = selected.filter((candidate) => included.has(candidate));
+      if (!selected.length) continue;
+    }
+    if (selected.reduce((count, candidate) => count + candidate.fields.length, 0) > 40) {
+      await Promise.all(selected.map((candidate) => candidate.handle.dispose()));
+      continue;
+    }
     let offset = 0;
     for (const candidate of selected) {
       candidate.fields = await candidate.handle.evaluate((form, offset) => {
@@ -805,6 +848,7 @@ async function discoverBoundForm(cdpService: CDPService): Promise<CredentialForm
                   (next, prior) =>
                     next.kind === prior.kind &&
                     next.scope === prior.scope &&
+                    next.action === prior.action &&
                     JSON.stringify(next.fields.map((field) => field.descriptor)) ===
                       JSON.stringify(prior.fields.map((field) => field.descriptor)) &&
                     next.controls.length === prior.controls.length &&
@@ -841,7 +885,9 @@ async function discoverBoundForm(cdpService: CDPService): Promise<CredentialForm
   }
   await releaseForm(cdpService);
   throw new CredentialFormError(
-    "No unambiguous supported form was found. Open the browser to continue.",
+    scope === "sensitive"
+      ? "No supported payment or authentication fields were found. Continue in the browser."
+      : "No unambiguous supported form was found. Open the browser to continue.",
     404,
   );
 }
@@ -855,6 +901,8 @@ function applyBoundValues(
   const valid = () =>
     location.href === target.frameUrl &&
     location.origin === target.origin &&
+    form.scope.isConnected &&
+    (form.scope instanceof HTMLFormElement ? form.scope.action : undefined) === form.action &&
     form.controls.every(({ input, form, attributes, action, options }) => {
       const rect = input.getBoundingClientRect();
       return (
@@ -1059,7 +1107,7 @@ async function fillBoundForm(
       throw new CredentialFormError("Select at least one option in each required field.", 400);
   }
   await clearContinuation(cdpService);
-  let anchor: ElementHandle<FormControl> | undefined;
+  let anchor: ElementHandle<HTMLElement> | undefined;
   let wrote = false;
   try {
     for (const part of located.parts) {
@@ -1079,8 +1127,8 @@ async function fillBoundForm(
         });
       if (!hasValues) {
         if (part === located.parts[0]) {
-          const primary = await part.handle.evaluateHandle((form) => form.controls[0].input);
-          anchor = primary.asElement() as ElementHandle<FormControl>;
+          const primary = await part.handle.evaluateHandle((form) => form.scope);
+          anchor = primary.asElement() as ElementHandle<HTMLElement>;
         }
         continue;
       }
@@ -1092,7 +1140,7 @@ async function fillBoundForm(
           true,
         )
         .catch(() => undefined);
-      const filled = result?.asElement() as ElementHandle<FormControl> | null;
+      const filled = result?.asElement() as ElementHandle<HTMLElement> | null;
       if (!filled) {
         await result?.dispose();
         throw changed();
@@ -1114,7 +1162,7 @@ async function fillBoundForm(
   }
   // A receipt identifies an exact node, so MCP never guesses which filled form
   // a continuation button belongs to. It carries no field values.
-  const client = (anchor as ElementHandle<FormControl> & { client: CDPSession }).client;
+  const client = (anchor as ElementHandle<HTMLElement> & { client: CDPSession }).client;
   const { node } = await client.send("DOM.describeNode", {
     objectId: anchor.remoteObject().objectId,
   });
@@ -1179,12 +1227,13 @@ export async function fillCredentialForm(
 
 export async function discoverCredentialForm(
   cdpService: CDPService,
+  scope: CredentialFormScope = "sensitive",
 ): Promise<CredentialFormDescription> {
   if (filling.has(cdpService))
     throw new CredentialFormError("A secure form operation is already in progress.", 409);
   filling.add(cdpService);
   try {
-    const result = await discoverBoundForm(cdpService);
+    const result = await discoverBoundForm(cdpService, scope);
     recordBrowserForm(cdpService, result.formId);
     return result;
   } finally {
