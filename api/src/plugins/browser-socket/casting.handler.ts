@@ -76,6 +76,8 @@ export async function handleCastSession(
     let viewport: ReturnType<PageViewport["attach"]> | undefined;
     let viewportGeneration = 0;
     let frameReady = false;
+    let reloadForViewer = false;
+    let awaitingNavigation = false;
     let bounds = { width: 0, height: 0 };
     let expected = { width: 0, height: 0 };
     let frameId = 0;
@@ -231,13 +233,7 @@ export async function handleCastSession(
             delete headers["user-agent"];
             await page.setExtraHTTPHeaders(headers);
             await page.setUserAgent(userAgent);
-            if (previousAgent !== userAgent && !closed) {
-              frameReady = false;
-              viewportGeneration++;
-              frames.clear();
-              await input.reset();
-              await page.reload({ waitUntil: "domcontentloaded", timeout: 15_000 });
-            }
+            reloadForViewer = previousAgent !== userAgent;
           });
           if (closed) await viewport?.close();
         } else if (data.action === "release") {
@@ -255,6 +251,7 @@ export async function handleCastSession(
         return;
       }
       if (message.type === "viewport") {
+        let reloadPage = reloadForViewer;
         frameReady = false;
         viewportGeneration++;
         frames.clear();
@@ -279,10 +276,17 @@ export async function handleCastSession(
               enabled: next.mobile,
               maxTouchPoints: 1,
             });
-            if (reload) await page.reload({ waitUntil: "domcontentloaded", timeout: 15_000 });
+            reloadPage ||= reload;
           },
           readAgent,
         );
+        if (reloadPage) {
+          // Apply identity and layout together. Navigation completion must not
+          // block control; a frame from the committed document enables input.
+          awaitingNavigation = true;
+          await client.send("Page.reload");
+          reloadForViewer = false;
+        }
         await client.send("Page.stopScreencast");
         await client.send("Page.startScreencast", {
           format: "jpeg",
@@ -294,6 +298,7 @@ export async function handleCastSession(
         return;
       }
       if (message.type === "frameReady") {
+        if (awaitingNavigation) throw new ViewerInputError("waiting_for_frame");
         const frame = frames.get(data.frameId);
         if (
           !frame ||
@@ -494,6 +499,29 @@ export async function handleCastSession(
         // changes emulation metrics. Restart capture on an agent resize instead
         // of relying on a new screencast frame to announce the new geometry.
         let resizeQueued = false;
+        client.on("Page.frameNavigated", ({ frame }) => {
+          if (frame.parentId || closed) return;
+          const operation = messageQueue.then(async () => {
+            if (closed || !client) return;
+            awaitingNavigation = false;
+            frameReady = false;
+            viewportGeneration++;
+            frames.clear();
+            await input.reset();
+            await client.send("Page.stopScreencast");
+            await client.send("Page.startScreencast", {
+              format: "jpeg",
+              quality: 75,
+              maxWidth: 2560,
+              maxHeight: 1600,
+            });
+            publishControl();
+          });
+          messageQueue = operation.catch(() => {
+            send({ type: "inputError", code: "session_expired" });
+            ws.close(4001, "Browser unavailable");
+          });
+        });
         client.on("Page.frameResized", () => {
           if (closed || resizeQueued) return;
           resizeQueued = true;

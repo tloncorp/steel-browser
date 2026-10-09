@@ -42,7 +42,7 @@ const continuations = new WeakMap<
   {
     receipt: CredentialContinuation;
     anchor: ElementHandle<FormControl>;
-    bound: JSHandle<BoundForm>;
+    parts: BoundFormPart[];
     filledIds: string[];
     timer: ReturnType<typeof setTimeout>;
   }
@@ -54,7 +54,7 @@ async function clearContinuation(cdpService: CDPService): Promise<void> {
   clearTimeout(state.timer);
   await Promise.all([
     state.anchor.dispose().catch(() => {}),
-    state.bound.dispose().catch(() => {}),
+    ...state.parts.map((part) => part.handle.dispose().catch(() => {})),
   ]);
 }
 export async function getCredentialContinuation(
@@ -64,48 +64,55 @@ export async function getCredentialContinuation(
   if (!state) return null;
   const valid =
     Date.now() < state.receipt.expiresAt &&
-    (await state.bound
-      .evaluate(
-        (form, target, filledIds) =>
-          location.href === target.frameUrl &&
-          location.origin === target.origin &&
-          form.controls.every(
-            ({ input, form, attributes, action }) =>
-              input.isConnected &&
-              input.form === form &&
-              input.form?.action === action &&
-              JSON.stringify(
-                [
-                  "type",
-                  "name",
-                  "id",
-                  "autocomplete",
-                  "maxlength",
-                  "required",
-                  "pattern",
-                  "form",
-                  "multiple",
-                  "min",
-                  "max",
-                  "step",
-                ].map((name) => input.getAttribute(name)),
-              ) === attributes,
-          ) &&
-          form.fields
-            .filter((field) => filledIds.includes(field.descriptor.id))
-            .every(
-              (field) =>
-                field.choice ||
-                field.inputs.every((input) =>
-                  input instanceof HTMLSelectElement
-                    ? input.selectedIndex >= 0
-                    : input.value.length > 0,
-                ),
-            ),
-        state.receipt,
-        state.filledIds,
+    (await attachedParts(state.parts)) &&
+    (
+      await Promise.all(
+        state.parts.map((part) =>
+          part.handle
+            .evaluate(
+              (form, target, filledIds) =>
+                location.href === target.frameUrl &&
+                location.origin === target.origin &&
+                form.controls.every(
+                  ({ input, form, attributes, action }) =>
+                    input.isConnected &&
+                    input.form === form &&
+                    input.form?.action === action &&
+                    JSON.stringify(
+                      [
+                        "type",
+                        "name",
+                        "id",
+                        "autocomplete",
+                        "maxlength",
+                        "required",
+                        "pattern",
+                        "form",
+                        "multiple",
+                        "min",
+                        "max",
+                        "step",
+                      ].map((name) => input.getAttribute(name)),
+                    ) === attributes,
+                ) &&
+                form.fields
+                  .filter((field) => filledIds.includes(field.descriptor.id))
+                  .every(
+                    (field) =>
+                      field.choice ||
+                      field.inputs.every((input) =>
+                        input instanceof HTMLSelectElement
+                          ? input.selectedIndex >= 0
+                          : input.value.length > 0,
+                      ),
+                  ),
+              { frameUrl: part.frameUrl, origin: part.origin },
+              state.filledIds,
+            )
+            .catch(() => false),
+        ),
       )
-      .catch(() => false));
+    ).every(Boolean);
   if (!valid) {
     if (continuations.get(cdpService) === state) await clearContinuation(cdpService);
     return null;
@@ -233,6 +240,8 @@ type BoundField = {
 type BoundForm = {
   kind: "login" | "details";
   focused: boolean;
+  primary: boolean;
+  scope: Element;
   fields: BoundField[];
   controls: Array<{
     input: FormControl;
@@ -242,10 +251,16 @@ type BoundForm = {
     options?: string;
   }>;
 };
+type BoundFormPart = {
+  parentIndex?: number;
+  frame: Frame;
+  frameUrl: string;
+  origin: string;
+  handle: JSHandle<BoundForm>;
+};
 type LocatedCredentialForm = {
   description: CredentialFormDescription;
-  frame: Frame;
-  handle: JSHandle<BoundForm>;
+  parts: BoundFormPart[];
   timer: ReturnType<typeof setTimeout>;
 };
 const forms = new WeakMap<CDPService, LocatedCredentialForm>();
@@ -627,13 +642,27 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
       });
     matches.push({
       kind,
-      focused: !!active && (group.includes(active as FormControl) || scope.contains(active)),
+      scope,
+      focused:
+        !!active &&
+        active !== document.body &&
+        active !== document.documentElement &&
+        document.hasFocus() &&
+        (group.includes(active as FormControl) || scope.contains(active)),
+      primary: !!scope
+        .closest(
+          'main, aside, nav, header, footer, [role="main"], [role="complementary"], [role="navigation"], [role="banner"], [role="contentinfo"]',
+        )
+        ?.matches('main, [role="main"]'),
       fields,
       controls,
     });
   }
   const focused = matches.filter((form) => form.focused);
-  return focused.length === 1 ? focused[0] : matches.length === 1 ? matches[0] : null;
+  if (focused.length === 1) return focused[0];
+  if (matches.length === 1) return matches[0];
+  const primary = matches.filter((form) => form.primary);
+  return primary.length === 1 ? primary[0] : null;
 }
 
 async function releaseForm(cdpService: CDPService) {
@@ -641,7 +670,7 @@ async function releaseForm(cdpService: CDPService) {
   if (!current) return;
   forms.delete(cdpService);
   clearTimeout(current.timer);
-  await current.handle.dispose().catch(() => {});
+  await Promise.all(current.parts.map((part) => part.handle.dispose().catch(() => {})));
 }
 
 async function discoverBoundForm(cdpService: CDPService): Promise<CredentialFormDescription> {
@@ -652,6 +681,7 @@ async function discoverBoundForm(cdpService: CDPService): Promise<CredentialForm
       handle: JSHandle<BoundForm>;
       kind: "login" | "details";
       focused: boolean;
+      primary: boolean;
       fields: SecureFormField[];
     }> = [];
     for (const frame of page.frames()) {
@@ -681,6 +711,7 @@ async function discoverBoundForm(cdpService: CDPService): Promise<CredentialForm
             form && {
               kind: form.kind,
               focused: form.focused,
+              primary: form.primary,
               fields: form.fields.map((field) => field.descriptor),
             },
         )
@@ -688,41 +719,110 @@ async function discoverBoundForm(cdpService: CDPService): Promise<CredentialForm
       if (metadata) candidates.push({ frame, handle: handle as JSHandle<BoundForm>, ...metadata });
       else await handle.dispose();
     }
-    const focused = candidates.filter((candidate) => candidate.focused);
-    const selected = focused.length === 1 ? focused : candidates;
-    if (selected.length !== 1) {
+    // A payment provider can render each field in its own cross-origin frame.
+    // Only frames physically contained by the same bound form belong together.
+    const parent = new Map<(typeof candidates)[number], (typeof candidates)[number]>();
+    for (const candidate of candidates) {
+      let child = candidate.frame;
+      while (child.parentFrame()) {
+        const container = candidates.find((other) => other.frame === child.parentFrame());
+        if (container) {
+          const owner = await child.frameElement().catch(() => null);
+          const contained =
+            owner &&
+            (await container.handle
+              .evaluate((form, owner) => form.scope.contains(owner), owner)
+              .catch(() => false));
+          await owner?.dispose();
+          if (contained) parent.set(candidate, container);
+          break;
+        }
+        child = child.parentFrame()!;
+      }
+    }
+    const rootOf = (candidate: (typeof candidates)[number]) => {
+      while (parent.has(candidate)) candidate = parent.get(candidate)!;
+      return candidate;
+    };
+    const roots = candidates.filter((candidate) => !parent.has(candidate));
+    const focused = [...new Set(candidates.filter((candidate) => candidate.focused).map(rootOf))];
+    const primary = roots.filter((candidate) => candidate.primary);
+    const root =
+      focused.length === 1
+        ? focused[0]
+        : roots.length === 1
+        ? roots[0]
+        : primary.length === 1
+        ? primary[0]
+        : undefined;
+    if (!root) {
       await Promise.all(candidates.map((candidate) => candidate.handle.dispose()));
       if (candidates.length > 1) break;
       continue;
     }
+    const selected = [
+      root,
+      ...candidates.filter((candidate) => candidate !== root && rootOf(candidate) === root),
+    ];
     await Promise.all(
       candidates
-        .filter((candidate) => candidate !== selected[0])
+        .filter((candidate) => !selected.includes(candidate))
         .map((candidate) => candidate.handle.dispose()),
     );
-    const { frame, handle, fields, kind } = selected[0];
+    let offset = 0;
+    for (const candidate of selected) {
+      candidate.fields = await candidate.handle.evaluate((form, offset) => {
+        form.fields.forEach((field, index) => {
+          field.descriptor.id = `f${offset + index}`;
+        });
+        return form.fields.map((field) => field.descriptor);
+      }, offset);
+      offset += candidate.fields.length;
+    }
+    const parts: BoundFormPart[] = selected.map((candidate) => ({
+      parentIndex: parent.has(candidate) ? selected.indexOf(parent.get(candidate)!) : undefined,
+      frame: candidate.frame,
+      handle: candidate.handle,
+      frameUrl: candidate.frame.url(),
+      origin: httpOrigin(candidate.frame.url())!,
+    }));
+    const { frame } = root;
+    const fields = selected.flatMap((candidate) => candidate.fields);
+    const kind = parts.length === 1 ? root.kind : "details";
     const previous = forms.get(cdpService);
     const same =
-      previous?.frame === frame &&
-      previous.description.frameUrl === frame.url() &&
-      (await handle
-        .evaluate(
-          (next, prior) =>
-            next.kind === prior.kind &&
-            JSON.stringify(next.fields.map((field) => field.descriptor)) ===
-              JSON.stringify(prior.fields.map((field) => field.descriptor)) &&
-            next.controls.length === prior.controls.length &&
-            next.controls.every(
-              (control, i) =>
-                control.input === prior.controls[i].input &&
-                control.form === prior.controls[i].form &&
-                control.attributes === prior.controls[i].attributes &&
-                control.action === prior.controls[i].action &&
-                control.options === prior.controls[i].options,
-            ),
-          previous.handle,
+      previous?.parts.length === parts.length &&
+      (
+        await Promise.all(
+          parts.map(async (part, index) => {
+            const prior = previous.parts[index];
+            return (
+              prior.parentIndex === part.parentIndex &&
+              prior.frame === part.frame &&
+              prior.frameUrl === part.frameUrl &&
+              (await part.handle
+                .evaluate(
+                  (next, prior) =>
+                    next.kind === prior.kind &&
+                    next.scope === prior.scope &&
+                    JSON.stringify(next.fields.map((field) => field.descriptor)) ===
+                      JSON.stringify(prior.fields.map((field) => field.descriptor)) &&
+                    next.controls.length === prior.controls.length &&
+                    next.controls.every(
+                      (control, i) =>
+                        control.input === prior.controls[i].input &&
+                        control.form === prior.controls[i].form &&
+                        control.attributes === prior.controls[i].attributes &&
+                        control.action === prior.controls[i].action &&
+                        control.options === prior.controls[i].options,
+                    ),
+                  prior.handle,
+                )
+                .catch(() => false))
+            );
+          }),
         )
-        .catch(() => false));
+      ).every(Boolean);
     const description: CredentialFormDescription = {
       formId: same ? previous.description.formId : randomUUID(),
       pageId: pageId(page),
@@ -736,7 +836,7 @@ async function discoverBoundForm(cdpService: CDPService): Promise<CredentialForm
       void releaseForm(cdpService);
     }, 5 * 60_000);
     timer.unref();
-    forms.set(cdpService, { description, frame, handle, timer });
+    forms.set(cdpService, { description, parts, timer });
     return description;
   }
   await releaseForm(cdpService);
@@ -744,6 +844,144 @@ async function discoverBoundForm(cdpService: CDPService): Promise<CredentialForm
     "No unambiguous supported form was found. Open the browser to continue.",
     404,
   );
+}
+
+function applyBoundValues(
+  form: BoundForm,
+  target: { frameUrl: string; origin: string },
+  values: Record<string, string>,
+  write: boolean,
+): FormControl | boolean | null {
+  const valid = () =>
+    location.href === target.frameUrl &&
+    location.origin === target.origin &&
+    form.controls.every(({ input, form, attributes, action, options }) => {
+      const rect = input.getBoundingClientRect();
+      return (
+        input.isConnected &&
+        input.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) &&
+        !input.disabled &&
+        !("readOnly" in input && input.readOnly) &&
+        rect.width > 0 &&
+        rect.height > 0 &&
+        getComputedStyle(input).visibility === "visible" &&
+        !input.closest('[inert], [aria-hidden="true"]') &&
+        input.form === form &&
+        input.form?.action === action &&
+        JSON.stringify(
+          [
+            "type",
+            "name",
+            "id",
+            "autocomplete",
+            "maxlength",
+            "required",
+            "pattern",
+            "form",
+            "multiple",
+            "min",
+            "max",
+            "step",
+          ].map((name) => input.getAttribute(name)),
+        ) === attributes &&
+        (!(input instanceof HTMLSelectElement) ||
+          JSON.stringify(
+            Array.from(input.options).map((option) => [
+              option.value,
+              option.label,
+              option.disabled,
+              option.parentElement?.matches("optgroup[disabled]"),
+            ]),
+          ) === options)
+      );
+    });
+  if (!valid()) return null;
+  if (!write) return true;
+  let anchor: FormControl | null = null;
+  for (const field of form.fields) {
+    const value = values[field.descriptor.id];
+    if (value === undefined) continue;
+    if (value === "" && field.descriptor.options) continue;
+    for (const [index, input] of field.inputs.entries()) {
+      // Event handlers can replace another field synchronously. Stop before
+      // delivering any value to a replacement or a different destination.
+      if (!valid()) return null;
+      if (field.choice === "radio" && index !== Number(value)) continue;
+      input.focus();
+      if (!valid()) return null;
+      if (field.choice === "checkbox" || field.choice === "radio") {
+        // Checkbox/radio change handlers in controlled forms listen for clicks.
+        const control = input as HTMLInputElement;
+        const checked = field.choice === "radio" || value === "1";
+        if (control.checked !== checked) control.click();
+        if (control.checked !== checked) return null;
+        input.blur();
+        anchor = input;
+        continue;
+      } else if (field.choice === "option" && input instanceof HTMLSelectElement) {
+        const setter = Object.getOwnPropertyDescriptor(HTMLOptionElement.prototype, "selected")
+          ?.set;
+        if (!setter) return null;
+        setter.call(input.options[field.optionIndex!], value === "1");
+      } else if (input instanceof HTMLSelectElement) {
+        const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "selectedIndex")
+          ?.set;
+        if (!setter) return null;
+        setter.call(input, Number(value));
+      } else {
+        const prototype =
+          input instanceof HTMLTextAreaElement
+            ? HTMLTextAreaElement.prototype
+            : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+        if (!setter) return null;
+        setter.call(input, field.inputs.length > 1 ? value[index] : value);
+      }
+      input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      input.blur();
+      anchor = input;
+    }
+  }
+  return anchor;
+}
+
+async function attachedParts(parts: BoundFormPart[]): Promise<boolean> {
+  for (const part of parts) {
+    const container = part.parentIndex === undefined ? undefined : parts[part.parentIndex];
+    let child = part.frame;
+    let foundContainer = !container;
+    while (child.parentFrame()) {
+      const owner = await child.frameElement().catch(() => null);
+      if (!owner) return false;
+      try {
+        const visible = await owner
+          .evaluate((element) => {
+            const rect = element.getBoundingClientRect();
+            return (
+              element.isConnected &&
+              element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) &&
+              rect.width > 0 &&
+              rect.height > 0 &&
+              !element.closest('[inert], [aria-hidden="true"]')
+            );
+          })
+          .catch(() => false);
+        if (!visible) return false;
+        if (container?.frame === child.parentFrame()) {
+          foundContainer = await container.handle
+            .evaluate((form, element) => form.scope.contains(element), owner)
+            .catch(() => false);
+          if (!foundContainer) return false;
+        }
+      } finally {
+        await owner.dispose();
+      }
+      child = child.parentFrame()!;
+    }
+    if (!foundContainer) return false;
+  }
+  return true;
 }
 
 async function fillBoundForm(
@@ -787,138 +1025,88 @@ async function fillBoundForm(
     )
       throw new CredentialFormError("A field does not match the form's requirements.", 400);
   }
-  const choicesValid = await located.handle
-    .evaluate(
-      (form, values) =>
-        form.fields.every(
-          (field) =>
-            field.choice !== "option" ||
-            !field.inputs[0].required ||
-            form.fields.some(
-              (other) =>
-                other.choice === "option" &&
-                other.inputs[0] === field.inputs[0] &&
-                values[other.descriptor.id] === "1",
-            ),
-        ),
-      values,
-    )
-    .catch(() => false);
-  if (!choicesValid)
-    throw new CredentialFormError("Select at least one option in each required field.", 400);
-  await clearContinuation(cdpService);
-  const anchorHandle = await located.handle
-    .evaluateHandle(
-      (form, target, values) => {
-        const valid = () =>
-          location.href === target.frameUrl &&
-          location.origin === target.origin &&
-          form.controls.every(({ input, form, attributes, action, options }) => {
-            const rect = input.getBoundingClientRect();
-            return (
-              input.isConnected &&
-              input.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) &&
-              !input.disabled &&
-              !("readOnly" in input && input.readOnly) &&
-              rect.width > 0 &&
-              rect.height > 0 &&
-              getComputedStyle(input).visibility === "visible" &&
-              !input.closest('[inert], [aria-hidden="true"]') &&
-              input.form === form &&
-              input.form?.action === action &&
-              JSON.stringify(
-                [
-                  "type",
-                  "name",
-                  "id",
-                  "autocomplete",
-                  "maxlength",
-                  "required",
-                  "pattern",
-                  "form",
-                  "multiple",
-                  "min",
-                  "max",
-                  "step",
-                ].map((name) => input.getAttribute(name)),
-              ) === attributes &&
-              (!(input instanceof HTMLSelectElement) ||
-                JSON.stringify(
-                  Array.from(input.options).map((option) => [
-                    option.value,
-                    option.label,
-                    option.disabled,
-                    option.parentElement?.matches("optgroup[disabled]"),
-                  ]),
-                ) === options)
-            );
-          });
-        if (!valid()) return null;
-        let anchor: FormControl | null = null;
-        for (const field of form.fields) {
-          const value = values[field.descriptor.id];
-          if (value === undefined) continue;
-          if (value === "" && field.descriptor.options) continue;
-          for (const [index, input] of field.inputs.entries()) {
-            // Event handlers can replace another field synchronously. Stop before
-            // delivering any value to a replacement or a different destination.
-            if (!valid()) return null;
-            if (field.choice === "radio" && index !== Number(value)) continue;
-            input.focus();
-            if (!valid()) return null;
-            if (field.choice === "checkbox" || field.choice === "radio") {
-              // Checkbox/radio change handlers in controlled forms listen for clicks.
-              const control = input as HTMLInputElement;
-              const checked = field.choice === "radio" || value === "1";
-              if (control.checked !== checked) control.click();
-              if (control.checked !== checked) return null;
-              input.blur();
-              anchor = input;
-              continue;
-            } else if (field.choice === "option" && input instanceof HTMLSelectElement) {
-              const setter = Object.getOwnPropertyDescriptor(
-                HTMLOptionElement.prototype,
-                "selected",
-              )?.set;
-              if (!setter) return null;
-              setter.call(input.options[field.optionIndex!], value === "1");
-            } else if (input instanceof HTMLSelectElement) {
-              const setter = Object.getOwnPropertyDescriptor(
-                HTMLSelectElement.prototype,
-                "selectedIndex",
-              )?.set;
-              if (!setter) return null;
-              setter.call(input, Number(value));
-            } else {
-              const prototype =
-                input instanceof HTMLTextAreaElement
-                  ? HTMLTextAreaElement.prototype
-                  : HTMLInputElement.prototype;
-              const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
-              if (!setter) return null;
-              setter.call(input, field.inputs.length > 1 ? value[index] : value);
-            }
-            input.dispatchEvent(
-              new InputEvent("input", { bubbles: true, inputType: "insertText" }),
-            );
-            input.dispatchEvent(new Event("change", { bubbles: true }));
-            input.blur();
-            anchor = input;
-          }
-        }
-        return anchor;
-      },
-      target,
-      values,
-    )
-    .catch(() => undefined);
-  const anchor = anchorHandle?.asElement() as ElementHandle<FormControl> | null;
-  if (!anchor) {
-    await anchorHandle?.dispose();
-    throw new CredentialFormError(
+  const changed = () =>
+    new CredentialFormError(
       "The form changed before it could be filled. Reconnect to continue.",
       409,
     );
+  if (!(await attachedParts(located.parts))) throw changed();
+  // Validate every destination before writing any field. Each write also checks
+  // its own live nodes so page event handlers cannot redirect subsequent values.
+  for (const part of located.parts) {
+    const valid = await part.handle
+      .evaluate(applyBoundValues, { frameUrl: part.frameUrl, origin: part.origin }, values, false)
+      .catch(() => false);
+    if (!valid) throw changed();
+    const choicesValid = await part.handle
+      .evaluate(
+        (form, values) =>
+          form.fields.every(
+            (field) =>
+              field.choice !== "option" ||
+              !field.inputs[0].required ||
+              form.fields.some(
+                (other) =>
+                  other.choice === "option" &&
+                  other.inputs[0] === field.inputs[0] &&
+                  values[other.descriptor.id] === "1",
+              ),
+          ),
+        values,
+      )
+      .catch(() => false);
+    if (!choicesValid)
+      throw new CredentialFormError("Select at least one option in each required field.", 400);
+  }
+  await clearContinuation(cdpService);
+  let anchor: ElementHandle<FormControl> | undefined;
+  let wrote = false;
+  try {
+    for (const part of located.parts) {
+      if (!(await attachedParts(located.parts))) throw changed();
+      const hasValues = await part.handle
+        .evaluate(
+          (form, values) =>
+            form.fields.some(
+              (field) =>
+                values[field.descriptor.id] !== undefined &&
+                !(values[field.descriptor.id] === "" && field.descriptor.options),
+            ),
+          values,
+        )
+        .catch(() => {
+          throw changed();
+        });
+      if (!hasValues) {
+        if (part === located.parts[0]) {
+          const primary = await part.handle.evaluateHandle((form) => form.controls[0].input);
+          anchor = primary.asElement() as ElementHandle<FormControl>;
+        }
+        continue;
+      }
+      const result = await part.handle
+        .evaluateHandle(
+          applyBoundValues,
+          { frameUrl: part.frameUrl, origin: part.origin },
+          values,
+          true,
+        )
+        .catch(() => undefined);
+      const filled = result?.asElement() as ElementHandle<FormControl> | null;
+      if (!filled) {
+        await result?.dispose();
+        throw changed();
+      }
+      wrote = true;
+      // Keep the root form anchor for continuation; card-frame nodes cannot
+      // identify the checkout's continue button.
+      if (!anchor) anchor = filled;
+      else await filled.dispose();
+    }
+    if (!anchor || !wrote) throw changed();
+  } catch (error) {
+    await anchor?.dispose();
+    throw error;
   }
   if (request.submit !== true && located.description.kind === "login") {
     await anchor.dispose();
@@ -944,11 +1132,16 @@ async function fillBoundForm(
     void clearContinuation(cdpService);
   }, 5 * 60_000);
   timer.unref();
-  const bound = await located.handle.evaluateHandle((form) => form);
+  const parts = await Promise.all(
+    located.parts.map(async (part) => ({
+      ...part,
+      handle: await part.handle.evaluateHandle((form) => form),
+    })),
+  );
   continuations.set(cdpService, {
     receipt,
     anchor,
-    bound,
+    parts,
     filledIds: Object.keys(values).filter((id) => values[id] !== ""),
     timer,
   });

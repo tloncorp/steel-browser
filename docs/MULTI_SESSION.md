@@ -58,8 +58,12 @@ use this browser's full concurrency.
 
 The session viewer turns finger swipes into scrolling and taps into clicks. A mouse supports
 held dragging and wheel scrolling. The toolbar keeps back, forward, address, keyboard, layout,
-and browser options on one row. The screen icon selects Agent View (default), Auto, Mobile, or Desktop layout;
-browser options contain tabs, reload, and viewer control.
+and browser options on one row. On opening, the viewer detects mobile devices from
+browser device information, including touch-capable iPads using a desktop identity. Phones and
+tablets start in Mobile layout using the viewer's dimensions; desktop browsers start in Agent View.
+A narrow desktop window alone does not select Mobile. Reconnecting preserves the selected layout.
+The screen icon selects Agent View, Auto, Mobile, or Desktop; browser options contain tabs, reload,
+and viewer control. Device detection also applies inside the native app viewer.
 
 To enter text, tap the browser field, then tap the keyboard icon. The keyboard panel displays
 and edits the text entered during that keyboard session. It supports composition, selection,
@@ -74,8 +78,9 @@ page-scoped; agent and direct CDP access operate independently.
 
 When a viewer takes control, its WebSocket `User-Agent` header becomes the remote tab's HTTP
 user agent and `navigator.userAgent`. A changed user agent reloads the current page so its next
-request uses the viewer's identity. Reconnecting with the same user agent does not reload. This
-does not change the viewport. The tab keeps that user agent after the viewer disconnects;
+request uses the viewer's identity. Initial layout and identity changes share one reload. Control
+does not wait for page loading to complete; input waits for a frame from the committed document.
+Reconnecting with the same user agent and layout does not reload. The tab keeps that user agent after the viewer disconnects;
 a new controlling viewer supplies its own. Watching a tab does not change its user agent. This
 changes the reported user agent, not Chrome's browser engine or the rest of its device fingerprint.
 
@@ -89,7 +94,12 @@ semantics. Field labels come from the page's accessible labels, placeholders, or
 does not return existing input values. Text fields and textareas retain their labels and required
 status. Radio groups appear as choices, while checkboxes and individual multiple-select options
 appear as Yes/No choices. A focused form takes precedence when a page has several forms; without
-focus, discovery requires one unambiguous form. General forms fill without submitting. Login forms
+focus, discovery selects a single form in the page's primary-content landmark (`main` or
+`role="main"`), or the sole form on the page. Secondary landmarks such as `aside` do not compete
+with a unique primary form. Multiple primary forms still require focus. Fields in frames contained
+by the selected form, including nested cross-origin frames, join the same handoff. Each frame retains
+its own URL, origin, and node bindings; detached, hidden, navigated, or replaced destinations reject
+filling. Unrelated frame forms stay separate. General forms fill without submitting. Login forms
 can submit when explicitly requested. File uploads and custom widgets require the live browser.
 
 Each signed viewer link offers one successful secure form fill. After filling, credential discovery
@@ -115,8 +125,9 @@ fixtures; a live challenge requires separate manual verification.
 ### Tlon native viewer
 
 Tlon embeds the same viewer with floating native Close, keyboard, paste, and
-Browser options controls. The options menu selects **Agent View** (default) or
-**Mobile View**. Agent View leaves the live browser viewport unchanged, including
+Browser options controls. The options menu selects **Agent View** or
+**Mobile View**. The viewer detects the device when it opens and starts phones in Mobile View.
+Agent View leaves the live browser viewport unchanged, including
 agent-initiated resizes. Pinch zoom and panning affect only the streamed image.
 In Agent View, double-tapping while zoomed in resets the image to its centered,
 default scale without clicking the remote page. Single taps while zoomed wait
