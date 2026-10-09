@@ -106,12 +106,17 @@ and node bindings; detached, hidden, navigated, or replaced destinations reject 
 fields and unrelated frames are excluded from sensitive field bindings, so shipping-field updates
 do not invalidate card entry. File uploads and custom widgets require the live browser.
 
-Each signed viewer link offers one successful secure form fill. After filling, credential discovery
-with that link returns 404, allowing the app to finish its polling and return control to the bot.
-The link still opens the live browser. The bot inspects the current page and requests a fresh
-handoff for each step needing owner input. Reading the session through the internal gateway mints
-a distinct signed link, even when the session deadline is unchanged. Failed fills require fresh
-field discovery and input; they do not close the link's secure-entry round.
+Each fill handle is single-use. A login handoff keeps the same signed viewer link available for
+fresh discovery so the app can show successive identifier, password, and verification-code steps
+without returning to the bot between them. Values are never replayed. If a submitted form remains,
+the app allows correction with fresh input. If no supported form appears during polling, the app
+returns control to the bot to inspect the page; form disappearance does not prove sign-in.
+After a successful card/details fill, discovery with that link returns 404 and the app returns
+control to the bot. The link still opens the live browser. A later secure step requires a fresh
+handoff. Reading the session through the internal gateway mints a distinct signed link, even when
+the session deadline is unchanged. Failed fills require fresh field discovery and input; they do
+not close the link's secure-entry round. If a fill fails, inspect the page before retrying; some
+fields may already have been filled.
 
 Run the input, viewport, and public-gateway browser checks with a local Chrome:
 

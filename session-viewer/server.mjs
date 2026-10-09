@@ -405,16 +405,17 @@ export function createGateway(config) {
   const upstreamOrigin = new URL(config.upstreamOrigin);
   const publicOrigin = new URL(config.publicOrigin);
   const credentialHandoffs = new Map();
-  // A viewer capability offers one successful form fill. Its live browser
-  // access remains valid after secure entry returns control to the bot.
-  const closedCredentialRounds = new Map();
+  // Login steps share a viewer capability, but every fill handle is single-use.
+  // Keep each round object until expiry to fence discovery that overlaps a fill,
+  // including discovery that returns after the next login step becomes available.
+  const credentialRounds = new Map();
 
   const removeExpiredHandoffs = (now = Date.now()) => {
     for (const [id, handoff] of credentialHandoffs) {
       if (handoff.expiresAt <= now) credentialHandoffs.delete(id);
     }
-    for (const [token, expiresAt] of closedCredentialRounds) {
-      if (expiresAt <= now) closedCredentialRounds.delete(token);
+    for (const [token, round] of credentialRounds) {
+      if (round.expiresAt <= now) credentialRounds.delete(token);
     }
   };
 
@@ -469,7 +470,8 @@ export function createGateway(config) {
           error:
             "This form handoff is complete. Request a fresh handoff for another step.",
         });
-      if (closedCredentialRounds.has(token)) return endRound();
+      const round = credentialRounds.get(token);
+      if (round && round.status !== "ready") return endRound();
 
       try {
         const target = new URL(
@@ -481,7 +483,7 @@ export function createGateway(config) {
         const discovered = await upstreamJson(target);
         // Discovery can overlap a fill. Do not publish a new handle after that
         // fill starts, even if the upstream lookup was already in flight.
-        if (closedCredentialRounds.has(token)) return endRound();
+        if (credentialRounds.get(token) !== round) return endRound();
         if (!discovered.response.ok) {
           return sendCredentialJson(response, discovered.response.status, {
             error: discovered.body?.error ?? "No live form is available.",
@@ -593,7 +595,11 @@ export function createGateway(config) {
         });
       }
       handoff.status = "submitting";
-      closedCredentialRounds.set(handoff.token, handoff.capabilityExpiresAt);
+      const round = {
+        expiresAt: handoff.capabilityExpiresAt,
+        status: "submitting",
+      };
+      credentialRounds.set(handoff.token, round);
       try {
         const target = new URL(
           `/v1/sessions/${encodeURIComponent(
@@ -611,7 +617,7 @@ export function createGateway(config) {
           }),
         });
         if (!filled.response.ok) {
-          closedCredentialRounds.delete(handoff.token);
+          round.status = "ready";
           credentialHandoffs.delete(credentialFill[1]);
           return sendCredentialJson(response, filled.response.status, {
             error:
@@ -619,12 +625,13 @@ export function createGateway(config) {
           });
         }
         credentialHandoffs.delete(credentialFill[1]);
+        round.status = handoff.target.kind === "login" ? "ready" : "closed";
         return sendCredentialJson(response, 200, {
           ok: true,
           submitted: filled.body?.submitted === true,
         });
       } catch {
-        closedCredentialRounds.delete(handoff.token);
+        round.status = "ready";
         credentialHandoffs.delete(credentialFill[1]);
         return sendCredentialJson(response, 502, {
           error: "Browser unavailable.",

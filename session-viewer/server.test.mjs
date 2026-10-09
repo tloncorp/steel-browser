@@ -317,9 +317,9 @@ async function secureGateway(
       return response.writeHead(404).end();
     if (request.method === "GET") {
       discovered.push(metadata.formId);
-      await hooks.discover?.();
+      const status = (await hooks.discover?.()) ?? 200;
       response
-        .writeHead(200, { "content-type": "application/json" })
+        .writeHead(status, { "content-type": "application/json" })
         .end(JSON.stringify(metadata));
       return;
     }
@@ -641,56 +641,79 @@ test("session reads mint distinct capabilities with the same session deadline", 
   );
 });
 
-for (const kind of ["login", "details"]) {
-  test(`${kind} fills end discovery on that link and a fresh bot handoff opens the next step`, async (context) => {
-    const gateway = await secureGateway(
-      context,
-      [secureField("username")],
-      kind,
-    );
-    let capability = await gateway.freshCapability();
-    const completed = [];
-    for (const [index, purpose] of [
-      "username",
-      "current-password",
-      "one-time-code",
-    ].entries()) {
-      gateway.metadata.formId = `form-${index}`;
-      gateway.metadata.fields = [secureField(purpose)];
-      const response = await gateway.discover(capability);
-      assert.equal(response.status, 200);
-      const handoff = await response.json();
-      assert.equal(handoff.fields[0].purpose, purpose);
-      assert.equal(
-        (
-          await gateway.fill(handoff.handoffId, {
-            values: { f0: "private" },
-            submit: true,
-          })
-        ).status,
-        200,
-      );
-      completed.push(capability);
-      const reads = gateway.discovered.length;
-      // Every follow-up poll gets the app's normal no-form response, whether
-      // the page stays on this form or advances to another one.
-      for (let poll = 0; poll < 17; poll++) {
-        if (poll === 1) gateway.metadata.formId = "next-live-form";
-        assert.equal((await gateway.discover(capability)).status, 404);
-      }
-      assert.equal(gateway.discovered.length, reads);
-      const viewer = await fetch(`${gateway.base}/s/${capability}`);
-      assert.equal(viewer.status, 200);
-      assert.equal(await viewer.text(), "Live browser");
-      capability = await gateway.freshCapability();
-      assert.ok(!completed.includes(capability));
-      for (const previous of completed)
-        assert.equal((await gateway.discover(previous)).status, 404);
-    }
-    assert.equal(gateway.posted.length, 3);
-    assert.equal(gateway.discovered.length, 3);
+test("login identifier, password, and code steps share one link with single-use fill handles", async (context) => {
+  let discoveryStatus = 200;
+  const gateway = await secureGateway(
+    context,
+    [secureField("username")],
+    "login",
+    200,
+    { discover: () => discoveryStatus },
+  );
+  const handles = new Set();
+  for (const [index, purpose] of [
+    "username",
+    "current-password",
+    "one-time-code",
+  ].entries()) {
+    gateway.metadata.formId = `form-${index}`;
+    gateway.metadata.fields = [secureField(purpose)];
+    const response = await gateway.discover();
+    assert.equal(response.status, 200);
+    const handoff = await response.json();
+    assert.equal(handoff.formId, `form-${index}`);
+    assert.equal(handoff.fields[0].purpose, purpose);
+    assert.equal(handoff.fields[0].value, undefined);
+    assert.ok(!handles.has(handoff.handoffId));
+    handles.add(handoff.handoffId);
+    // Discovering the next step must never replay previous input.
+    assert.equal(gateway.posted.length, index);
+    const input = { values: { f0: `private-${index}` }, submit: true };
+    const filled = await gateway.fill(handoff.handoffId, input);
+    assert.equal(filled.status, 200);
+    assert.deepEqual(await filled.json(), { ok: true, submitted: true });
+    assert.equal(gateway.posted.at(-1).target.formId, handoff.formId);
+    assert.deepEqual(gateway.posted.at(-1).values, input.values);
+    assert.equal((await gateway.fill(handoff.handoffId, input)).status, 401);
+  }
+  // Propagate the absence of a supported form so the app can return to the bot.
+  discoveryStatus = 404;
+  assert.equal((await gateway.discover()).status, 404);
+  assert.equal(gateway.posted.length, 3);
+});
+
+test("details fills end discovery on that link and a fresh bot handoff opens the next step", async (context) => {
+  const gateway = await secureGateway(
+    context,
+    [secureField("cc-number")],
+    "details",
+  );
+  const first = await (await gateway.discover()).json();
+  const filled = await gateway.fill(first.handoffId, {
+    values: { f0: "4111111111111111" },
+    submit: true,
   });
-}
+  assert.equal(filled.status, 200);
+  assert.deepEqual(await filled.json(), { ok: true, submitted: false });
+  gateway.metadata.formId = "next-live-form";
+  gateway.metadata.kind = "login";
+  gateway.metadata.fields = [secureField("one-time-code")];
+  const reads = gateway.discovered.length;
+  for (let poll = 0; poll < 17; poll++) {
+    assert.equal((await gateway.discover()).status, 404);
+  }
+  assert.equal(gateway.discovered.length, reads);
+  const viewer = await fetch(`${gateway.base}/s/${gateway.capability}`);
+  assert.equal(viewer.status, 200);
+  assert.equal(await viewer.text(), "Live browser");
+  const fresh = await gateway.freshCapability();
+  assert.notEqual(fresh, gateway.capability);
+  const next = await gateway.discover(fresh);
+  assert.equal(next.status, 200);
+  assert.equal((await next.json()).formId, "next-live-form");
+  assert.equal((await gateway.discover()).status, 404);
+  assert.equal(gateway.posted.length, 1);
+});
 
 test("a failed fill allows fresh discovery on the same link without replaying values", async (context) => {
   const gateway = await secureGateway(
@@ -718,56 +741,111 @@ function deferred() {
   return { promise, resolve };
 }
 
-test("discovery overlapping a fill cannot reopen the completed handoff", async (context) => {
-  const discoveryStarted = deferred();
-  const releaseDiscovery = deferred();
-  const fillStarted = deferred();
-  const releaseFill = deferred();
-  context.after(() => {
-    releaseDiscovery.resolve();
-    releaseFill.resolve();
-  });
-  let discoveries = 0;
-  const gateway = await secureGateway(
-    context,
-    [secureField("username")],
-    "login",
-    200,
-    {
-      discover: async () => {
-        if (++discoveries === 2) {
-          discoveryStarted.resolve();
-          await releaseDiscovery.promise;
-        }
-      },
-      fill: async () => {
-        fillStarted.resolve();
-        await releaseFill.promise;
-      },
-    },
-  );
-  const first = await (await gateway.discover()).json();
-  const pendingDiscovery = gateway.discover();
-  await discoveryStarted.promise;
-  const pendingFill = gateway.fill(first.handoffId, {
-    values: { f0: "private" },
-  });
-  await fillStarted.promise;
-  assert.equal((await gateway.discover()).status, 404);
-  releaseDiscovery.resolve();
-  assert.equal((await pendingDiscovery).status, 404);
-  releaseFill.resolve();
-  assert.equal((await pendingFill).status, 200);
-  assert.equal((await gateway.discover()).status, 404);
-  assert.equal(gateway.posted.length, 1);
-});
+for (const kind of ["login", "details"]) {
+  for (const discoveryFinishesFirst of [true, false]) {
+    test(`${kind} discovery overlapping a fill is discarded even if it finishes ${
+      discoveryFinishesFirst ? "before" : "after"
+    } the fill`, async (context) => {
+      const discoveryStarted = deferred();
+      const releaseDiscovery = deferred();
+      const fillStarted = deferred();
+      const releaseFill = deferred();
+      context.after(() => {
+        releaseDiscovery.resolve();
+        releaseFill.resolve();
+      });
+      let discoveries = 0;
+      const gateway = await secureGateway(
+        context,
+        [secureField(kind === "login" ? "username" : "cc-number")],
+        kind,
+        200,
+        {
+          discover: async () => {
+            if (++discoveries === 2) {
+              discoveryStarted.resolve();
+              await releaseDiscovery.promise;
+            }
+          },
+          fill: async () => {
+            fillStarted.resolve();
+            await releaseFill.promise;
+          },
+        },
+      );
+      const first = await (await gateway.discover()).json();
+      const pendingDiscovery = gateway.discover();
+      await discoveryStarted.promise;
+      const pendingFill = gateway.fill(first.handoffId, {
+        values: { f0: "private" },
+      });
+      await fillStarted.promise;
+      assert.equal((await gateway.discover()).status, 404);
+      let next;
+      if (discoveryFinishesFirst) {
+        releaseDiscovery.resolve();
+        assert.equal((await pendingDiscovery).status, 404);
+      }
+      releaseFill.resolve();
+      assert.equal((await pendingFill).status, 200);
+      const response = await gateway.discover();
+      assert.equal(response.status, kind === "login" ? 200 : 404);
+      if (kind === "login") next = await response.json();
+      if (!discoveryFinishesFirst) {
+        releaseDiscovery.resolve();
+        assert.equal((await pendingDiscovery).status, 404);
+      }
+      assert.equal(gateway.posted.length, 1);
+      // A late stale discovery must not invalidate a freshly discovered step.
+      if (next) {
+        assert.equal(
+          (
+            await gateway.fill(next.handoffId, {
+              values: { f0: "correction" },
+            })
+          ).status,
+          200,
+        );
+        assert.equal(gateway.posted.length, 2);
+      }
+    });
+  }
+}
 
-test("a successful fill ends the round even when the browser does not submit", async (context) => {
-  const gateway = await secureGateway(context, [secureField("username")]);
-  const handoff = await (await gateway.discover()).json();
-  const filled = await gateway.fill(handoff.handoffId, {
-    values: { f0: "private" },
+for (const submit of [true, false]) {
+  test(`a login form that remains allows fresh input without replay (submit=${submit})`, async (context) => {
+    const gateway = await secureGateway(context, [secureField("username")]);
+    const handoff = await (await gateway.discover()).json();
+    const filled = await gateway.fill(handoff.handoffId, {
+      values: { f0: "private" },
+      submit,
+    });
+    assert.deepEqual(await filled.json(), { ok: true, submitted: submit });
+    const response = await gateway.discover();
+    assert.equal(response.status, 200);
+    const next = await response.json();
+    assert.equal(next.formId, handoff.formId);
+    assert.notEqual(next.handoffId, handoff.handoffId);
+    assert.equal(gateway.posted.length, 1);
+    assert.equal(
+      (
+        await gateway.fill(handoff.handoffId, {
+          values: { f0: "private" },
+          submit,
+        })
+      ).status,
+      401,
+    );
+    assert.equal(
+      (
+        await gateway.fill(next.handoffId, {
+          values: { f0: "corrected" },
+          submit,
+        })
+      ).status,
+      200,
+    );
+    assert.deepEqual(gateway.posted.at(-1).values, { f0: "corrected" });
+    assert.equal(gateway.posted.length, 2);
   });
-  assert.deepEqual(await filled.json(), { ok: true, submitted: false });
-  assert.equal((await gateway.discover()).status, 404);
-});
+}
