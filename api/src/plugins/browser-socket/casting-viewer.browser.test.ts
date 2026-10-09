@@ -645,11 +645,12 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     );
     await observer.close();
     const reconnected = await viewer(1200, 800, "/native");
-    await reconnected.waitForFunction(
-      () => (document.querySelector("#viewport-mode") as HTMLSelectElement).value === "mobile",
+    await ready(reconnected);
+    expect(await reconnected.$eval("#viewport-mode", (el) => (el as HTMLSelectElement).value)).toBe(
+      "agent",
     );
-    await target.waitForFunction(() => innerWidth === 932 && navigator.maxTouchPoints === 1);
-    expect(await target.evaluate(() => sessionStorage.loads)).toBe("4");
+    expect(await target.evaluate(() => navigator.maxTouchPoints)).toBe(0);
+    expect(await target.evaluate(() => sessionStorage.loads)).toBe("5");
     expect(errors).toEqual([]);
     await reconnected.close();
   }, 60_000);
@@ -1071,16 +1072,18 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
   }
 
   it.each([
-    [390, 844],
-    [844, 390],
+    [390, 844, "/"],
+    [844, 390, "/"],
+    [390, 844, "/native"],
+    [844, 390, "/native"],
   ])(
-    "detects a phone when opened at %s x %s and preserves manual layout on reconnect",
-    async (width, height) => {
+    "detects a phone when opened at %s x %s via %s and preserves manual layout on reconnect",
+    async (width, height, route) => {
       await freshTarget(1920, 1080);
       const phone = await viewer(
         width,
         height,
-        "/",
+        route,
         "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1",
       );
       await ready(phone);
@@ -1093,7 +1096,31 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
       expect(await phone.$eval("#viewport-confirm", (el) => (el as HTMLDialogElement).open)).toBe(
         false,
       );
-      await setLayout(phone, "desktop");
+      if (route === "/native") {
+        await phone.evaluate(() => {
+          const host = window as any;
+          host.tlonBrowserInput.receive({
+            version: 1,
+            context: host.nativeStatuses.at(-1).context,
+            type: "layout",
+            mode: "agent",
+          });
+        });
+        await phone.waitForFunction(
+          () => (window as any).nativeStatuses.at(-1).reloadRequired === "agent",
+        );
+        await phone.evaluate(() => {
+          const host = window as any;
+          host.tlonBrowserInput.receive({
+            version: 1,
+            context: host.nativeStatuses.at(-1).context,
+            type: "layout",
+            mode: "agent",
+            reload: true,
+          });
+        });
+        await ready(phone);
+      } else await setLayout(phone, "desktop");
       for (const socket of wss.clients) socket.terminate();
       await phone.waitForFunction(
         () => document.querySelector("#stage")?.getAttribute("data-ready") === "false",
@@ -1101,7 +1128,7 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
 
       await ready(phone);
       expect(await phone.$eval("#viewport-mode", (el) => (el as HTMLSelectElement).value)).toBe(
-        "desktop",
+        route === "/native" ? "agent" : "desktop",
       );
       await phone.close();
       await target.setUserAgent(await browser.userAgent());

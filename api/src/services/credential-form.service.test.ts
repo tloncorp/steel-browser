@@ -21,10 +21,14 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
   let origin: string;
   let html = "";
   const requests: string[] = [];
+  const framePages = new Map<string, string>();
   const site = createServer((req, res) => {
     requests.push(req.url || "");
     res.setHeader("Content-Type", "text/html");
-    res.end(req.url?.startsWith("/done") ? "<h1>Account home</h1>" : html);
+    res.end(
+      framePages.get(req.url || "") ??
+        (req.url?.startsWith("/done") ? "<h1>Account home</h1>" : html),
+    );
   });
   beforeAll(async () => {
     browser = await puppeteer.launch({
@@ -39,7 +43,10 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
   });
   beforeEach(async () => {
     requests.length = 0;
+    framePages.clear();
     page = await browser.newPage();
+    page.setDefaultNavigationTimeout(5000);
+    await page.setViewport({ width: 1920, height: 1080 });
     service = { getAllPages: async () => [page] } as unknown as CDPService;
   });
   afterEach(async () => {
@@ -387,6 +394,158 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       '<main><form><input name="login"></form><form><input name="signup"></form></main><aside><form><input name="discount"></form></aside>',
     );
     await expect(discoverCredentialForm(service)).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  async function loadFramedCheckout() {
+    const paymentOrigin = origin.replace("127.0.0.1", "localhost");
+    framePages.set(
+      "/number",
+      '<label>Card number<input autocomplete="cc-number" required></label>',
+    );
+    framePages.set("/expiry", '<label>Expiry<input autocomplete="cc-exp" required></label>');
+    framePages.set("/code", '<label>Security code<input autocomplete="cc-csc" required></label>');
+    framePages.set("/unrelated", '<label>Search<input name="search"></label>');
+    html =
+      '<main><form id="checkout" action="/done"><label>Email<input name="email" type="email" autocomplete="email" required></label><button>Pay now</button></form></main><aside></aside>';
+    await page.goto(`${origin}/checkout`);
+    for (const path of ["/number", "/expiry", "/code", "/unrelated"]) {
+      const url = paymentOrigin + path;
+      await page.evaluate(
+        (url, secondary) => {
+          const frame = document.createElement("iframe");
+          frame.src = url;
+          document.querySelector(secondary ? "aside" : "form")!.append(frame);
+        },
+        url,
+        path === "/unrelated",
+      );
+      const frame = await page.waitForFrame((frame) => frame.url() === url);
+      await frame.waitForSelector("input", { timeout: 5000 });
+    }
+  }
+
+  it("discovers and fills one checkout across cross-origin payment frames without submitting", async () => {
+    await loadFramedCheckout();
+    const target = await discoverCredentialForm(service);
+    expect(target.kind).toBe("details");
+    expect(target.fields.map((field) => field.purpose)).toEqual([
+      "email",
+      "cc-number",
+      "cc-exp",
+      "cc-csc",
+    ]);
+    expect(new Set(target.fields.map((field) => field.id)).size).toBe(4);
+    expect((await discoverCredentialForm(service)).formId).toBe(target.formId);
+    const number = page.frames().find((frame) => frame.url().endsWith("/number"))!;
+    await number.focus("input");
+    expect((await discoverCredentialForm(service)).fields).toEqual(target.fields);
+    const values = { f0: "person@example.test", f1: "4242424242424242", f2: "12/30", f3: "123" };
+    expect(await fillCredentialForm(service, target, { values, submit: true })).toEqual({
+      submitted: false,
+    });
+    expect(await page.$eval("input", (input) => input.value)).toBe(values.f0);
+    expect(await number.$eval("input", (input) => input.value)).toBe(values.f1);
+    expect(
+      await page
+        .frames()
+        .find((frame) => frame.url().endsWith("/unrelated"))!
+        .$eval("input", (input) => input.value),
+    ).toBe("");
+    expect(requests).not.toContain("/done");
+    expect(await getCredentialContinuation(service)).toMatchObject({
+      formId: target.formId,
+      frameUrl: page.url(),
+    });
+    await number.$eval("input", (input) => {
+      input.value = "";
+    });
+    expect(await getCredentialContinuation(service)).toBeNull();
+  });
+
+  it.each(["replace", "navigate", "hide"])(
+    "rejects a payment-frame %s before filling any part of a checkout",
+    async (change) => {
+      await loadFramedCheckout();
+      const target = await discoverCredentialForm(service);
+      const code = page.frames().find((frame) => frame.url().endsWith("/code"))!;
+      if (change === "replace")
+        await code.$eval("input", (input) => input.replaceWith(input.cloneNode()));
+      if (change === "navigate") {
+        await page.$eval(
+          'iframe[src$="/code"]',
+          (frame, url) => {
+            (frame as HTMLIFrameElement).src = url;
+          },
+          origin + "/unrelated",
+        );
+        const navigated = await page.waitForFrame((frame) => frame.url() === origin + "/unrelated");
+        await navigated.waitForSelector("input");
+      }
+      if (change === "hide")
+        await page.$eval('iframe[src$="/code"]', (frame) => {
+          (frame as HTMLElement).style.display = "none";
+        });
+      await expect(
+        fillCredentialForm(service, target, {
+          values: { f0: "person@example.test", f1: "4242424242424242", f2: "12/30", f3: "123" },
+        }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(await page.$eval("input", (input) => input.value)).toBe("");
+      expect(
+        await page
+          .frames()
+          .find((frame) => frame.url().endsWith("/number"))!
+          .$eval("input", (input) => input.value),
+      ).toBe("");
+    },
+  );
+
+  it("combines generic fields through a nested frame without requiring payment semantics", async () => {
+    const embeddedOrigin = origin.replace("127.0.0.1", "localhost");
+    framePages.set("/wrapper", "<div id=content></div>");
+    framePages.set(
+      "/message",
+      '<label>Message<textarea name="message" required></textarea></label>',
+    );
+    await load(
+      `<form><label>Topic<input name="topic"></label><iframe src="${embeddedOrigin}/wrapper"></iframe></form>`,
+    );
+    const wrapper = page.frames().find((frame) => frame.url().endsWith("/wrapper"))!;
+    await wrapper.evaluate((url) => {
+      const frame = document.createElement("iframe");
+      frame.src = url;
+      document.body.append(frame);
+    }, origin + "/message");
+    const message = await page.waitForFrame((frame) => frame.url().endsWith("/message"));
+    await message.waitForSelector("textarea");
+    const target = await discoverCredentialForm(service);
+    expect(target.fields.map((field) => field.label)).toEqual(["Topic", "Message"]);
+    await fillCredentialForm(service, target, { values: { f1: "A message" } });
+    expect(await message.$eval("textarea", (input) => input.value)).toBe("A message");
+    expect(await page.$eval("input", (input) => input.value)).toBe("");
+    const receipt = await getCredentialContinuation(service);
+    expect(receipt?.frameUrl).toBe(page.url());
+    const client = await page.createCDPSession();
+    const { node } = await client.send("DOM.describeNode", {
+      backendNodeId: receipt!.anchorBackendNodeId,
+    });
+    expect(node.nodeName).toBe("INPUT");
+    expect(node.attributes).toContain("topic");
+    await client.detach();
+  });
+
+  it("requires focus for unrelated sibling frame forms", async () => {
+    framePages.set("/one", '<input name="one">');
+    framePages.set("/two", '<input name="two">');
+    await load(`<iframe src="${origin}/one"></iframe><iframe src="${origin}/two"></iframe>`);
+    await expect(discoverCredentialForm(service)).rejects.toMatchObject({ statusCode: 404 });
+    await page
+      .frames()
+      .find((frame) => frame.url().endsWith("/two"))!
+      .focus("input");
+    expect((await discoverCredentialForm(service)).fields.map((field) => field.label)).toEqual([
+      "two",
+    ]);
   });
 
   it("rejects changed nodes and field semantics on the same URL before writing", async () => {

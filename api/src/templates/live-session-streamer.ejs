@@ -336,9 +336,7 @@
           /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
           navigator.userAgentData?.mobile === true ||
           (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-        let openingLayout = window.ReactNativeWebView
-          ? undefined
-          : mobileDevice ? "mobile" : "agent";
+        let openingLayout = mobileDevice ? "mobile" : "agent";
         let metadata,
           paintedFrame = 0,
           sentFrame = 0,
