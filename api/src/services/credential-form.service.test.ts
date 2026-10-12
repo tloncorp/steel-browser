@@ -1,14 +1,18 @@
 import { createServer } from "node:http";
 import { existsSync } from "node:fs";
-import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import puppeteer, { type Browser, type Frame, type Page } from "puppeteer-core";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { CDPService } from "./cdp/cdp.service.js";
 import { browserMonitorStatus } from "./browser-monitor.service.js";
+import { createGateway, mintCapability } from "../../../session-viewer/server.mjs";
 import {
   discoverCredentialForm,
   fillCredentialForm,
   getCredentialContinuation,
+  prepareCredentialForm,
+  getPreparedCredentialForm,
 } from "./credential-form.service.js";
+import type { SelectedFormControl, SelectedFormRequest } from "./selected-form.service.js";
 
 const executablePath = process.env.CHROME_PATH || "/usr/bin/google-chrome";
 if (!existsSync(executablePath) && process.env.CI)
@@ -62,6 +66,273 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     html = body;
     await page.goto(`${origin}/login`);
   }
+
+  async function selection(
+    selectors: string[],
+    frame: Frame = page.mainFrame(),
+  ): Promise<SelectedFormRequest> {
+    const cdp = await page.createCDPSession();
+    const { targetInfo } = await cdp.send("Target.getTargetInfo");
+    const fields: SelectedFormControl[] = [];
+    try {
+      for (const selector of selectors) {
+        const input = await frame.$(selector);
+        if (!input) throw new Error("Missing fixture control");
+        const frameClient = (frame as unknown as { client: typeof cdp }).client;
+        const { node } = await frameClient.send("DOM.describeNode", {
+          objectId: input.remoteObject().objectId,
+        });
+        const ax = await frameClient.send("Accessibility.getPartialAXTree", {
+          backendNodeId: node.backendNodeId,
+          fetchRelatives: false,
+        });
+        const owner = await input.evaluateHandle((input) => (input as HTMLInputElement).form);
+        const metadata = await input.evaluate((element) => {
+          const input = element as HTMLInputElement;
+          return {
+            tagName: input.tagName as SelectedFormControl["tagName"],
+            type: input.type,
+            name: input.name,
+            id: input.id,
+          };
+        });
+        fields.push({
+          ...metadata,
+          backendNodeId: node.backendNodeId,
+          label: String(ax.nodes.find((node) => !node.ignored)?.name?.value || "")
+            .replace(/\s+/g, " ")
+            .trim(),
+          frameId: (frame as unknown as { _id: string })._id,
+          loaderId: (frame as unknown as { _loaderId: string })._loaderId,
+          ...(owner.asElement()
+            ? {
+                formBackendNodeId: (
+                  await frameClient.send("DOM.describeNode", {
+                    objectId: owner.remoteObject().objectId,
+                  })
+                ).node.backendNodeId,
+              }
+            : {}),
+        });
+        await owner.dispose();
+        await input.dispose();
+      }
+      return { pageId: targetInfo.targetId, fields };
+    } finally {
+      await cdp.detach();
+    }
+  }
+
+  it("fills only selected fields, preserving unrelated required fields and dropdown values", async () => {
+    await load(`<form action="/done"><label>Last name<input name="lastname" required></label>
+      <label>SSN<input name="ssn_3" required></label><label>Month<select name="bm" required>
+      <option disabled selected>Choose</option><option value="01">January</option><option value="02">February</option>
+      </select></label><button>Submit</button></form>`);
+    const form = await prepareCredentialForm(
+      service,
+      await selection(['[name="ssn_3"]', '[name="bm"]']),
+    );
+    expect(form.kind).toBe("details");
+    expect(form.fields.map((field) => field.label)).toEqual(["SSN", "Month"]);
+    expect(form.fields[1].options).toEqual([
+      { value: "1", label: "January" },
+      { value: "2", label: "February" },
+    ]);
+    expect(await getPreparedCredentialForm(service, form.formId)).toEqual(form);
+    expect(
+      await fillCredentialForm(service, form, { values: { f0: "123", f1: "2" }, submit: true }),
+    ).toMatchObject({ submitted: false });
+    expect(
+      await page.$$eval("input,select", (inputs) =>
+        inputs.map((input) => ({
+          name: (input as HTMLInputElement).name,
+          value: (input as HTMLInputElement).value,
+          private: input.getAttribute("data-steel-private"),
+        })),
+      ),
+    ).toEqual([
+      { name: "lastname", value: "", private: null },
+      { name: "ssn_3", value: "123", private: "true" },
+      { name: "bm", value: "02", private: "true" },
+    ]);
+    expect(new URL(page.url()).pathname).toBe("/login");
+  });
+
+  it("rebinds a replaced input by its exact name within the original form", async () => {
+    await load('<form><label>Member<input name="member"></label></form>');
+    const target = await selection(["input"]);
+    await page.$eval("input", (input) => input.replaceWith(input.cloneNode()));
+    const form = await prepareCredentialForm(service, target);
+    await fillCredentialForm(service, form, { values: { f0: "private-member" } });
+    expect(await page.$eval("input", (input) => input.value)).toBe("private-member");
+  });
+
+  it("rebinds an unnamed input by a unique label within the original form", async () => {
+    await load('<form><input aria-label="Member"></form>');
+    const target = await selection(["input"]);
+    await page.$eval("input", (input) => input.replaceWith(input.cloneNode()));
+    const form = await prepareCredentialForm(service, target);
+    expect(form.fields[0].label).toBe("Member");
+  });
+
+  it("uses Chrome's accessible labels when visible labels contain hidden annotations", async () => {
+    await load(
+      '<form><label>Member <span aria-hidden="true">required</span><input name="member"></label></form>',
+    );
+    const target = await selection(["input"]);
+    expect(target.fields[0].label).toBe("Member");
+    await page.$eval("input", (input) => input.replaceWith(input.cloneNode()));
+    expect((await prepareCredentialForm(service, target)).fields).toHaveLength(1);
+  });
+
+  it("uses visible field labels and compound-date prompts instead of raw element names", async () => {
+    await load(`<form>
+      <p><span for="lastname">Last Name:</span><input id="lastname" name="lastname"></p>
+      <span for="ssn_3">Last Four Digits of Social Security Number:</span><input id="ssn_3" name="ssn_3" maxlength="4">
+      <label for="bm">Date of Birth:</label><select id="bm" name="bm"><option value="">--Select Month--</option><option value="02">February</option></select>
+      <select name="bd"><option value="">--Select Day--</option><option value="03">3</option></select>
+      <select name="by"><option value="">--Select Year--</option><option value="2000">2000</option></select>
+      </form>`);
+    const form = await prepareCredentialForm(
+      service,
+      await selection(["#lastname", "#ssn_3", "#bm", '[name="bd"]', '[name="by"]']),
+    );
+    expect(form.fields.map((field) => field.label)).toEqual([
+      "Last Name:",
+      "Last Four Digits of Social Security Number:",
+      "Date of Birth: Month",
+      "Date of Birth: Day",
+      "Date of Birth: Year",
+    ]);
+    expect(form.fields[1].maxLength).toBe(4);
+  });
+
+  it("keeps unrelated adjacent dropdown labels separate", async () => {
+    await load(
+      '<form><label for="country">Country</label><select id="country"><option value="">Choose a country</option><option>US</option></select><select><option value="">Choose a city</option><option>Boston</option></select></form>',
+    );
+    const form = await discoverCredentialForm(service, "all");
+    expect(form.fields.map((field) => field.label)).toEqual(["Country", "city"]);
+  });
+
+  it("refuses a selected field whose displayed label changes before entry", async () => {
+    await load(
+      '<form><span for="member">Membership number</span><input id="member" name="member"></form>',
+    );
+    const form = await prepareCredentialForm(service, await selection(["input"]));
+    await page.$eval("span", (label) => {
+      label.textContent = "Government identifier";
+    });
+    await expect(getPreparedCredentialForm(service, form.formId)).rejects.toMatchObject({
+      statusCode: 409,
+    });
+    await expect(
+      fillCredentialForm(service, form, { values: { f0: "private-member" } }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(await page.$eval("input", (input) => input.value)).toBe("");
+  });
+
+  it.each(["duplicate", "different-form", "changed-type", "changed-label", "hidden"])(
+    "rejects a %s field without expanding the selection",
+    async (change) => {
+      await load('<form><input name="member" aria-label="Member"></form>');
+      const target = await selection(["input"]);
+      await page.evaluate((change) => {
+        const input = document.querySelector("input")!;
+        if (change === "duplicate") {
+          input.after(input.cloneNode(), input.cloneNode());
+          input.remove();
+        }
+        if (change === "different-form")
+          input.closest("form")!.outerHTML =
+            '<form><input name="member" aria-label="Member"></form>';
+        if (change === "changed-type") input.type = "password";
+        if (change === "changed-label") input.setAttribute("aria-label", "Another field");
+        if (change === "hidden") input.hidden = true;
+      }, change);
+      await expect(prepareCredentialForm(service, target)).rejects.toMatchObject({
+        statusCode: 409,
+      });
+      expect(
+        await page.$$eval("input", (inputs) => inputs.every((input) => input.value === "")),
+      ).toBe(true);
+    },
+  );
+
+  it("rejects navigation to a fresh document at the same URL", async () => {
+    await load('<form><input name="member"></form>');
+    const target = await selection(["input"]);
+    await page.reload();
+    await expect(prepareCredentialForm(service, target)).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("binds selected controls inside a frame and rejects a frame reload", async () => {
+    framePages.set("/member", '<form><input name="member" aria-label="Member"></form>');
+    await load('<iframe src="/member"></iframe>');
+    const frame = page.frames().find((frame) => frame.url().endsWith("/member"))!;
+    const target = await selection(["input"], frame);
+    expect((await prepareCredentialForm(service, target)).fields[0].label).toBe("Member");
+    await frame.goto(`${origin}/member`);
+    await expect(prepareCredentialForm(service, target)).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("binds selected sibling-frame controls through their containing form", async () => {
+    framePages.set(
+      "/month",
+      '<form><select name="month" aria-label="Month"><option value="jan">January</option></select></form>',
+    );
+    framePages.set("/year", '<form><input name="year" aria-label="Year"></form>');
+    await load(
+      '<form><input required name="unselected"><iframe src="/month"></iframe><iframe src="/year"></iframe></form>',
+    );
+    const monthFrame = page.frames().find((frame) => frame.url().endsWith("/month"))!;
+    const yearFrame = page.frames().find((frame) => frame.url().endsWith("/year"))!;
+    const month = await selection(["select"], monthFrame);
+    const year = await selection(["input"], yearFrame);
+    const form = await prepareCredentialForm(service, {
+      ...month,
+      fields: [...month.fields, ...year.fields],
+    });
+    expect(form.fields.map((field) => field.label)).toEqual(["Month", "Year"]);
+    await fillCredentialForm(service, form, { values: { f0: "0", f1: "2000" } });
+    expect(await yearFrame.$eval("input", (input) => input.value)).toBe("2000");
+    expect(await page.$eval("input", (input) => input.value)).toBe("");
+  });
+
+  it("rejects a changed selection on retrieval and dropdown changes before filling", async () => {
+    await load(
+      '<form><select name="month"><option value="jan">January</option></select><input required name="other"></form>',
+    );
+    const target = await selection(["select"]);
+    const form = await prepareCredentialForm(service, target);
+    await page.$eval("option", (option) => {
+      option.value = "other-value";
+    });
+    await expect(getPreparedCredentialForm(service, form.formId)).rejects.toMatchObject({
+      statusCode: 409,
+    });
+    await expect(fillCredentialForm(service, form, { values: { f0: "0" } })).rejects.toMatchObject({
+      statusCode: 409,
+    });
+    const next = await prepareCredentialForm(service, await selection(["select"]));
+    expect(next.formId).not.toBe(form.formId);
+    await expect(getPreparedCredentialForm(service, form.formId)).rejects.toMatchObject({
+      statusCode: 409,
+    });
+  });
+
+  it("treats a selected radio group as one field and ignores unselected changes", async () => {
+    await load(
+      '<form><label>Yes<input type="radio" name="answer" value="yes"></label><label>No<input type="radio" name="answer" value="no"></label><input name="other" required></form>',
+    );
+    const form = await prepareCredentialForm(service, await selection(['[value="yes"]']));
+    expect(form.fields).toHaveLength(1);
+    await page.$eval('[name="other"]', (input) => input.remove());
+    await fillCredentialForm(service, form, { values: { f0: "1" } });
+    expect(await page.$eval('[value="no"]', (input) => (input as HTMLInputElement).checked)).toBe(
+      true,
+    );
+  });
 
   it("keeps monitoring fill evidence after the page navigates and the app stops polling", async () => {
     await load(
@@ -831,6 +1102,173 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     ).toEqual(values);
     expect(await page.evaluate(() => document.body.dataset.sent)).toBeUndefined();
   });
+
+  it.each([false, true])(
+    "passes generic date dropdowns through the viewer and dispatches their field events (selected=%s)",
+    async (selected) => {
+      await load(`<form onsubmit="event.preventDefault();document.body.dataset.submitted='yes'">
+      <label>Reference<input name="reference" required></label>
+      <label>Month<select name="month" required>
+        <option value="">Choose month</option><option disabled>Unavailable</option>
+        <option value="month-02">February</option></select></label>
+      <label>Day<select name="day" required>
+        <option value="">Choose day</option><option value="day-03">3</option></select></label>
+      <label>Year<select name="year" required>
+        <option value="">Choose year</option><option value="year-2000">2000</option></select></label>
+      <button>Continue</button></form>
+      <script>for (const type of ['input', 'change']) {
+        document.querySelector('form').addEventListener(type, event => {
+          document.body.dataset.events = (document.body.dataset.events || '') + event.target.name + ':' + type + ',';
+        });
+      }</script>`);
+      await expect(discoverCredentialForm(service)).rejects.toMatchObject({ statusCode: 404 });
+      const sessionId = "123e4567-e89b-42d3-a456-426614174000";
+      const secret = "synthetic-test-secret-at-least-thirty-two-bytes";
+      const upstream = createServer(async (request, response) => {
+        const url = new URL(request.url!, "http://upstream.test");
+        try {
+          let result;
+          if (url.pathname === `/v1/sessions/${sessionId}`) {
+            result = {
+              id: sessionId,
+              status: "live",
+              createdAt: new Date().toISOString(),
+              timeout: 60_000,
+            };
+          } else if (url.pathname.endsWith("/credential-handoff")) {
+            const chunks: Buffer[] = [];
+            for await (const chunk of request) chunks.push(chunk);
+            result = {
+              ...(await prepareCredentialForm(
+                service,
+                JSON.parse(Buffer.concat(chunks).toString()),
+              )),
+              expiresAt: Date.now() + 300_000,
+            };
+          } else if (url.pathname !== `/v1/sessions/${sessionId}/credential-form`) {
+            return void response.writeHead(404).end();
+          } else if (request.method === "GET") {
+            result = url.searchParams.has("formId")
+              ? await getPreparedCredentialForm(service, url.searchParams.get("formId")!)
+              : await discoverCredentialForm(
+                  service,
+                  url.searchParams.get("scope") === "all" ? "all" : "sensitive",
+                );
+          } else {
+            const chunks: Buffer[] = [];
+            for await (const chunk of request) chunks.push(chunk);
+            const { target, ...values } = JSON.parse(Buffer.concat(chunks).toString());
+            result = { ok: true, ...(await fillCredentialForm(service, target, values)) };
+          }
+          response
+            .writeHead(200, { "content-type": "application/json" })
+            .end(JSON.stringify(result));
+        } catch (error) {
+          response
+            .writeHead(404, { "content-type": "application/json" })
+            .end(JSON.stringify({ error: String(error) }));
+        }
+      });
+      await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+      const address = upstream.address();
+      if (!address || typeof address === "string") throw new Error("No upstream listener");
+      const { publicServer, internal } = createGateway({
+        secret,
+        publicOrigin: "https://viewer.example.test",
+        upstreamOrigin: `http://127.0.0.1:${address.port}`,
+        maximumTtlMs: 60_000,
+      });
+      try {
+        await new Promise<void>((resolve) => publicServer.listen(0, "127.0.0.1", resolve));
+        await new Promise<void>((resolve) => internal.listen(0, "127.0.0.1", resolve));
+        const base = `http://127.0.0.1:${publicServer.address().port}`;
+        let token = mintCapability({ sessionId, expiresAt: Date.now() + 60_000 }, secret);
+        if (selected) {
+          const prepared = await fetch(
+            `http://127.0.0.1:${
+              internal.address().port
+            }/v1/sessions/${sessionId}/credential-handoff`,
+            {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(
+                await selection(['[name="month"]', '[name="day"]', '[name="year"]']),
+              ),
+            },
+          );
+          expect(prepared.status).toBe(200);
+          const body = await prepared.json();
+          token = new URL(body.viewer_url).pathname.slice(3);
+        }
+        const discovered = await fetch(`${base}/credentials/${token}`);
+        expect(discovered.status).toBe(200);
+        const handoff = await discovered.json();
+        expect(
+          handoff.fields.map(({ label, inputType }: { label: string; inputType: string }) => [
+            label,
+            inputType,
+          ]),
+        ).toEqual([
+          ...(selected ? [] : [["Reference", "text"]]),
+          ["Month", "select"],
+          ["Day", "select"],
+          ["Year", "select"],
+        ]);
+        expect(
+          handoff.fields
+            .slice(selected ? 0 : 1)
+            .map(({ options }: { options: unknown }) => options),
+        ).toEqual([
+          [{ value: "2", label: "February" }],
+          [{ value: "1", label: "3" }],
+          [{ value: "1", label: "2000" }],
+        ]);
+        if (selected) {
+          const rejected = await fetch(`${base}/credential-fills/${handoff.handoffId}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              values: { f0: "2", f1: "1", f2: "1", f3: "outside-selection" },
+            }),
+          });
+          expect(rejected.status).toBe(400);
+        }
+        const filled = await fetch(`${base}/credential-fills/${handoff.handoffId}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            values: selected
+              ? { f0: "2", f1: "1", f2: "1" }
+              : { f0: "synthetic-reference", f1: "2", f2: "1", f3: "1" },
+            submit: true,
+          }),
+        });
+        expect(filled.status).toBe(200);
+        expect(await filled.json()).toEqual({ ok: true, submitted: false });
+        expect(
+          await page.$$eval("select", (selects) => selects.map((select) => select.value)),
+        ).toEqual(["month-02", "day-03", "year-2000"]);
+        expect(await page.evaluate(() => document.body.dataset.events)).toBe(
+          (selected ? "" : "reference:input,reference:change,") +
+            "month:input,month:change,day:input,day:change,year:input,year:change,",
+        );
+        expect(await page.evaluate(() => document.body.dataset.submitted)).toBeUndefined();
+        if (selected) {
+          expect(await page.$eval("input", (input) => input.value)).toBe("");
+          expect((await fetch(`${base}/credentials/${token}`)).status).toBe(404);
+        }
+      } finally {
+        publicServer.closeAllConnections();
+        internal.closeAllConnections();
+        upstream.closeAllConnections();
+        await Promise.all([
+          new Promise<void>((resolve) => publicServer.close(resolve)),
+          new Promise<void>((resolve) => internal.close(resolve)),
+          new Promise<void>((resolve) => upstream.close(() => resolve())),
+        ]);
+      }
+    },
+  );
 
   it("fills checkbox, radio, and multiple-select choices through field events", async () => {
     await load(`<form>

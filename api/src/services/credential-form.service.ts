@@ -7,6 +7,12 @@ import {
 import type { CDPSession, ElementHandle, Frame, JSHandle, Page } from "puppeteer-core";
 import type { CDPService } from "./cdp/cdp.service.js";
 import { secureFieldDefinitions, type SecureFormField } from "./secure-form-fields.js";
+import {
+  disposeSelectedFields,
+  resolveSelectedFields,
+  type SelectedFormHandles,
+  type SelectedFormRequest,
+} from "./selected-form.service.js";
 
 export interface CredentialFormTarget {
   formId: string;
@@ -78,10 +84,11 @@ export async function getCredentialContinuation(
                 (form.scope instanceof HTMLFormElement ? form.scope.action : undefined) ===
                   form.action &&
                 form.controls.every(
-                  ({ input, form, attributes, action }) =>
+                  ({ input, form: owner, attributes, action, label }) =>
                     input.isConnected &&
-                    input.form === form &&
+                    input.form === owner &&
                     input.form?.action === action &&
+                    form.labelFor(input) === label &&
                     JSON.stringify(
                       [
                         "type",
@@ -248,10 +255,12 @@ type BoundForm = {
   scope: Element;
   action?: string;
   fields: BoundField[];
+  labelFor: (input: FormControl) => string;
   controls: Array<{
     input: FormControl;
     form: HTMLFormElement | null;
     attributes: string;
+    label: string;
     action?: string;
     options?: string;
   }>;
@@ -266,12 +275,16 @@ type BoundFormPart = {
 type LocatedCredentialForm = {
   description: CredentialFormDescription;
   parts: BoundFormPart[];
+  prepared: boolean;
   timer: ReturnType<typeof setTimeout>;
 };
 const forms = new WeakMap<CDPService, LocatedCredentialForm>();
 
 /** Runs in the document; nothing here reads or returns the controls' values. */
-function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm | null {
+function inspectDocument(
+  definitions: typeof secureFieldDefinitions,
+  ...targets: FormControl[]
+): BoundForm | null {
   const all = (root: Document | ShadowRoot): Element[] =>
     Array.from(root.querySelectorAll("*")).flatMap((element) => [
       element,
@@ -314,25 +327,70 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
       .join(" ");
   const label = (input: FormControl) => {
     const root = input.getRootNode() as Document | ShadowRoot;
-    const labelledBy = (input.getAttribute("aria-labelledby") || "")
-      .split(/\s+/)
-      .map((id) => labelText(root.getElementById(id)))
-      .join(" ")
-      .trim();
-    return (
-      labelledBy ||
-      input.getAttribute("aria-label") ||
-      Array.from(input.labels || [])
-        .map(labelText)
+    const explicit = (control: FormControl) => {
+      const labelledBy = (control.getAttribute("aria-labelledby") || "")
+        .split(/\s+/)
+        .map((id) => labelText(root.getElementById(id)))
         .join(" ")
-        .trim() ||
-      input.getAttribute("placeholder") ||
-      input.name ||
-      input.id ||
-      ""
-    )
-      .replace(/\s+/g, " ")
-      .trim();
+        .trim();
+      // Some forms put for= on a span instead of a label. Use that visible
+      // association for display without treating it as an accessibility identity.
+      const associated = control.id
+        ? Array.from(root.querySelectorAll("[for]"))
+            .filter(
+              (element) =>
+                element.getAttribute("for") === control.id &&
+                element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }),
+            )
+            .map(labelText)
+            .join(" ")
+            .trim()
+        : "";
+      return (
+        labelledBy ||
+        control.getAttribute("aria-label") ||
+        Array.from(control.labels || [])
+          .map(labelText)
+          .join(" ")
+          .trim() ||
+        associated ||
+        control.getAttribute("placeholder") ||
+        control.getAttribute("title") ||
+        ""
+      )
+        .replace(/\s+/g, " ")
+        .trim();
+    };
+    let text = explicit(input);
+    if (input instanceof HTMLSelectElement) {
+      // A placeholder option labels an individual part of a compound control,
+      // such as Month / Day / Year under a shared Date of Birth label.
+      const prompt = input.options[0]?.label
+        .trim()
+        .match(
+          /^[-–—\s]*(?:please\s+)?(?:select|choose)\s+(?:(?:an?|your)\s+)?(.+?)\s*[-–—]*$/i,
+        )?.[1]
+        ?.trim();
+      if (prompt) {
+        const compoundPart = /^(?:month|day|year|hour|minute|second)$/i.test(prompt);
+        const compoundLabel = (text: string) =>
+          /\b(?:date|birth|dob|time|expiry|expiration)\b/i.test(text);
+        if (!text && compoundPart) {
+          let previous = input.previousElementSibling;
+          while (previous instanceof HTMLSelectElement && previous.form === input.form) {
+            const candidate = explicit(previous);
+            if (candidate) {
+              if (compoundLabel(candidate)) text = candidate;
+              break;
+            }
+            previous = previous.previousElementSibling;
+          }
+        }
+        const base = text.replace(/:\s*$/, "");
+        return base && compoundPart && compoundLabel(base) ? `${base}: ${prompt}` : text || prompt;
+      }
+    }
+    return text || input.name || input.id || "";
   };
   const otpWords = new RegExp(
     definitions.find((field) => field.purpose === "one-time-code")!.pattern!,
@@ -367,6 +425,7 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
   }
   const matches: BoundForm[] = [];
   for (const [scope, group] of groups) {
+    if (targets.length && !targets.some((target) => group.includes(target))) continue;
     const context = [
       scope.textContent || "",
       ...Array.from(
@@ -603,10 +662,17 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
         input.required &&
         !fields.some((field) => field.inputs.includes(input)),
     );
+    if (targets.length) {
+      const selected = fields.filter((field) =>
+        field.inputs.some((input) => targets.includes(input)),
+      );
+      fields.splice(0, fields.length, ...selected);
+    }
     const controls = fields.flatMap((field) =>
       field.inputs.map((input) => ({
         input,
         form: input.form,
+        label: label(input),
         attributes: JSON.stringify(
           [
             "type",
@@ -638,7 +704,7 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
       })),
     );
     const kind =
-      login && !unsupportedRequired && new Set(purposes).size === purposes.length
+      !targets.length && login && !unsupportedRequired && new Set(purposes).size === purposes.length
         ? "login"
         : "details";
     if (kind === "login")
@@ -661,8 +727,15 @@ function inspectDocument(definitions: typeof secureFieldDefinitions): BoundForm 
         )
         ?.matches('main, [role="main"]'),
       fields,
+      labelFor: label,
       controls,
     });
+  }
+  if (targets.length) {
+    const matched = matches.filter((form) =>
+      targets.every((target) => form.fields.some((field) => field.inputs.includes(target))),
+    );
+    return matched.length === 1 ? matched[0] : null;
   }
   const focused = matches.filter((form) => form.focused);
   if (focused.length === 1) return focused[0];
@@ -682,8 +755,9 @@ async function releaseForm(cdpService: CDPService) {
 async function discoverBoundForm(
   cdpService: CDPService,
   scope: CredentialFormScope,
+  selection?: { page: Page; handles: SelectedFormHandles },
 ): Promise<CredentialFormDescription> {
-  const pages = await cdpService.getAllPages();
+  const pages = selection ? [selection.page] : await cdpService.getAllPages();
   for (const page of [...pages].reverse()) {
     const candidates: Array<{
       frame: Frame;
@@ -694,6 +768,7 @@ async function discoverBoundForm(
       fields: SecureFormField[];
     }> = [];
     for (const frame of page.frames()) {
+      if (selection && !selection.handles.has(frame)) continue;
       if (!httpOrigin(frame.url())) continue;
       if (frame.parentFrame()) {
         const owner = await frame.frameElement().catch(() => null);
@@ -711,7 +786,11 @@ async function discoverBoundForm(
         if (!visible) continue;
       }
       const handle = (await frame
-        .evaluateHandle(inspectDocument, secureFieldDefinitions)
+        .evaluateHandle(
+          inspectDocument,
+          secureFieldDefinitions,
+          ...(selection?.handles.get(frame) || []),
+        )
         .catch(() => undefined)) as JSHandle<BoundForm | null> | undefined;
       if (!handle) continue;
       const metadata = await handle
@@ -727,6 +806,68 @@ async function discoverBoundForm(
         .catch(() => undefined);
       if (metadata) candidates.push({ frame, handle: handle as JSHandle<BoundForm>, ...metadata });
       else await handle.dispose();
+    }
+    if (selection && candidates.length !== selection.handles.size) {
+      await Promise.all(candidates.map((candidate) => candidate.handle.dispose()));
+      throw new CredentialFormError(
+        "A selected field is unavailable or unsupported. Take a fresh browser snapshot.",
+        409,
+      );
+    }
+    if (selection) {
+      // Keep the actual form containing selected payment/provider frames even
+      // when none of that parent document's own controls is selected.
+      const containers = new Map<Frame, ElementHandle<HTMLIFrameElement>[]>();
+      try {
+        for (const frame of selection.handles.keys()) {
+          for (let child = frame; child.parentFrame(); child = child.parentFrame()!) {
+            const owner = await child.frameElement();
+            if (!owner) continue;
+            const parentFrame = child.parentFrame()!;
+            const owners = containers.get(parentFrame) || [];
+            owners.push(owner);
+            containers.set(parentFrame, owners);
+          }
+        }
+        for (const [frame, owners] of containers) {
+          if (candidates.some((candidate) => candidate.frame === frame)) continue;
+          const handle = (await frame.evaluateHandle(
+            (...owners): BoundForm | null => {
+              const scope = owners[0]?.closest("form");
+              if (
+                !scope ||
+                !scope.isConnected ||
+                !owners.every((owner) => owner.closest("form") === scope)
+              )
+                return null;
+              return {
+                kind: "details",
+                focused: false,
+                primary: false,
+                scope,
+                action: scope.action,
+                fields: [],
+                labelFor: () => "",
+                controls: [],
+              };
+            },
+            ...owners,
+          )) as JSHandle<BoundForm | null>;
+          const exists = await handle.evaluate((form) => !!form);
+          if (exists)
+            candidates.push({
+              frame,
+              handle: handle as JSHandle<BoundForm>,
+              kind: "details",
+              focused: false,
+              primary: false,
+              fields: [],
+            });
+          else await handle.dispose();
+        }
+      } finally {
+        await Promise.all([...containers.values()].flat().map((owner) => owner.dispose()));
+      }
     }
     // A payment provider can render each field in its own cross-origin frame.
     // Only frames physically contained by the same bound form belong together.
@@ -766,6 +907,11 @@ async function discoverBoundForm(
         : undefined;
     if (!root) {
       await Promise.all(candidates.map((candidate) => candidate.handle.dispose()));
+      if (selection)
+        throw new CredentialFormError(
+          "Selected fields must belong to one form. Take a fresh browser snapshot.",
+          409,
+        );
       if (candidates.length > 1) break;
       continue;
     }
@@ -773,6 +919,13 @@ async function discoverBoundForm(
       root,
       ...candidates.filter((candidate) => candidate !== root && rootOf(candidate) === root),
     ];
+    if (selection && selected.length !== candidates.length) {
+      await Promise.all(candidates.map((candidate) => candidate.handle.dispose()));
+      throw new CredentialFormError(
+        "Selected fields must belong to one form. Take a fresh browser snapshot.",
+        409,
+      );
+    }
     await Promise.all(
       candidates
         .filter((candidate) => !selected.includes(candidate))
@@ -834,6 +987,8 @@ async function discoverBoundForm(
     const kind = parts.length === 1 ? root.kind : "details";
     const previous = forms.get(cdpService);
     const same =
+      !selection &&
+      !previous?.prepared &&
       previous?.parts.length === parts.length &&
       (
         await Promise.all(
@@ -857,6 +1012,7 @@ async function discoverBoundForm(
                         control.input === prior.controls[i].input &&
                         control.form === prior.controls[i].form &&
                         control.attributes === prior.controls[i].attributes &&
+                        control.label === prior.controls[i].label &&
                         control.action === prior.controls[i].action &&
                         control.options === prior.controls[i].options,
                     ),
@@ -880,7 +1036,16 @@ async function discoverBoundForm(
       void releaseForm(cdpService);
     }, 5 * 60_000);
     timer.unref();
-    forms.set(cdpService, { description, parts, timer });
+    forms.set(cdpService, { description, parts, timer, prepared: !!selection });
+    if (selection) {
+      for (const part of parts)
+        await part.handle.evaluate((form) => {
+          // Snapshot readers use this marker to redact explicitly private controls,
+          // including generic fields whose names do not reveal their sensitivity.
+          for (const field of form.fields)
+            for (const input of field.inputs) input.setAttribute("data-steel-private", "true");
+        });
+    }
     return description;
   }
   await releaseForm(cdpService);
@@ -903,7 +1068,7 @@ function applyBoundValues(
     location.origin === target.origin &&
     form.scope.isConnected &&
     (form.scope instanceof HTMLFormElement ? form.scope.action : undefined) === form.action &&
-    form.controls.every(({ input, form, attributes, action, options }) => {
+    form.controls.every(({ input, form: owner, attributes, action, options, label }) => {
       const rect = input.getBoundingClientRect();
       return (
         input.isConnected &&
@@ -914,8 +1079,9 @@ function applyBoundValues(
         rect.height > 0 &&
         getComputedStyle(input).visibility === "visible" &&
         !input.closest('[inert], [aria-hidden="true"]') &&
-        input.form === form &&
+        input.form === owner &&
         input.form?.action === action &&
+        form.labelFor(input) === label &&
         JSON.stringify(
           [
             "type",
@@ -1239,4 +1405,64 @@ export async function discoverCredentialForm(
   } finally {
     filling.delete(cdpService);
   }
+}
+
+/** Prepare exactly one private entry round; selected fields never submit the page. */
+export async function prepareCredentialForm(
+  cdpService: CDPService,
+  selection: SelectedFormRequest,
+): Promise<CredentialFormDescription> {
+  if (filling.has(cdpService))
+    throw new CredentialFormError("A secure form operation is already in progress.", 409);
+  filling.add(cdpService);
+  let handles: SelectedFormHandles | undefined;
+  try {
+    const page = (await cdpService.getAllPages()).find((page) => pageId(page) === selection.pageId);
+    if (!page)
+      throw new CredentialFormError(
+        "The selected page is unavailable. Take a fresh browser snapshot.",
+        409,
+      );
+    try {
+      handles = await resolveSelectedFields(page, selection);
+    } catch (error) {
+      throw new CredentialFormError(
+        error instanceof Error ? error.message : "The selected fields changed.",
+        409,
+      );
+    }
+    const result = await discoverBoundForm(cdpService, "all", { page, handles });
+    recordBrowserForm(cdpService, result.formId);
+    return result;
+  } finally {
+    if (handles) await disposeSelectedFields(handles);
+    filling.delete(cdpService);
+  }
+}
+
+export async function getPreparedCredentialForm(
+  cdpService: CDPService,
+  formId: string,
+): Promise<CredentialFormDescription> {
+  const located = forms.get(cdpService);
+  if (
+    filling.has(cdpService) ||
+    !located?.prepared ||
+    located.description.formId !== formId ||
+    !(await attachedParts(located.parts)) ||
+    !(
+      await Promise.all(
+        located.parts.map((part) =>
+          part.handle
+            .evaluate(applyBoundValues, { frameUrl: part.frameUrl, origin: part.origin }, {}, false)
+            .catch(() => false),
+        ),
+      )
+    ).every(Boolean)
+  )
+    throw new CredentialFormError(
+      "The selected form changed or expired. Request a fresh handoff.",
+      409,
+    );
+  return located.description;
 }

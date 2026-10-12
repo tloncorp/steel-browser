@@ -9,6 +9,7 @@ import {
   handleGetSessionLiveDetails,
   handleDiscoverCredentialForm,
   handleFillCredentialForm,
+  handlePrepareCredentialForm,
   handleGetCredentialContinuation,
   handleGetBrowserMonitorStatus,
 } from "./sessions.controller.js";
@@ -23,6 +24,7 @@ import {
   SessionsPDFRequest,
 } from "./sessions.schema.js";
 import { BrowserEventType, EmitEvent } from "../../types/enums.js";
+import type { SelectedFormRequest } from "../../services/selected-form.service.js";
 
 async function routes(server: FastifyInstance) {
   const getRequestedCDPService = (request: FastifyRequest) => {
@@ -130,6 +132,7 @@ async function routes(server: FastifyInstance) {
           type: "object",
           properties: {
             scope: { type: "string", enum: ["sensitive", "all"], default: "sensitive" },
+            formId: { type: "string", minLength: 1, maxLength: 256 },
           },
           additionalProperties: false,
         },
@@ -138,10 +141,63 @@ async function routes(server: FastifyInstance) {
     async (
       request: FastifyRequest<{
         Params: { sessionId: string };
-        Querystring: { scope?: "sensitive" | "all" };
+        Querystring: { scope?: "sensitive" | "all"; formId?: string };
       }>,
       reply: FastifyReply,
     ) => handleDiscoverCredentialForm(server, request, reply),
+  );
+
+  server.post(
+    "/sessions/:sessionId/credential-handoff",
+    {
+      schema: {
+        operationId: "prepare_session_credential_form",
+        summary: "Bind selected controls for private entry",
+        tags: ["Sessions"],
+        body: {
+          type: "object",
+          additionalProperties: false,
+          required: ["pageId", "fields"],
+          properties: {
+            pageId: { type: "string", minLength: 1, maxLength: 256 },
+            fields: {
+              type: "array",
+              minItems: 1,
+              maxItems: 40,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: [
+                  "backendNodeId",
+                  "frameId",
+                  "loaderId",
+                  "tagName",
+                  "type",
+                  "name",
+                  "id",
+                  "label",
+                ],
+                properties: {
+                  backendNodeId: { type: "integer", minimum: 1 },
+                  frameId: { type: "string", minLength: 1, maxLength: 256 },
+                  loaderId: { type: "string", minLength: 1, maxLength: 256 },
+                  tagName: { type: "string", enum: ["INPUT", "SELECT", "TEXTAREA"] },
+                  type: { type: "string", minLength: 1, maxLength: 64 },
+                  name: { type: "string", maxLength: 512 },
+                  id: { type: "string", maxLength: 512 },
+                  label: { type: "string", maxLength: 1024 },
+                  formBackendNodeId: { type: "integer", minimum: 1 },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (
+      request: FastifyRequest<{ Params: { sessionId: string }; Body: SelectedFormRequest }>,
+      reply,
+    ) => handlePrepareCredentialForm(server, request, reply),
   );
 
   server.get(
