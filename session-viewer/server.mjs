@@ -480,6 +480,7 @@ export function createGateway(config) {
           )}/credential-form`,
           upstreamOrigin,
         );
+        target.searchParams.set("scope", "all");
         const discovered = await upstreamJson(target);
         // Discovery can overlap a fill. Do not publish a new handle after that
         // fill starts, even if the upstream lookup was already in flight.
