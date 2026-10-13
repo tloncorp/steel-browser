@@ -252,6 +252,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       }, change);
       await expect(prepareCredentialForm(service, target)).rejects.toMatchObject({
         statusCode: 409,
+        code: "stale_ref",
       });
       expect(
         await page.$$eval("input", (inputs) => inputs.every((input) => input.value === "")),
@@ -263,7 +264,10 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     await load('<form><input name="member"></form>');
     const target = await selection(["input"]);
     await page.reload();
-    await expect(prepareCredentialForm(service, target)).rejects.toMatchObject({ statusCode: 409 });
+    await expect(prepareCredentialForm(service, target)).rejects.toMatchObject({
+      statusCode: 409,
+      code: "stale_ref",
+    });
   });
 
   it("binds selected controls inside a frame and rejects a frame reload", async () => {
@@ -273,7 +277,10 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     const target = await selection(["input"], frame);
     expect((await prepareCredentialForm(service, target)).fields[0].label).toBe("Member");
     await frame.goto(`${origin}/member`);
-    await expect(prepareCredentialForm(service, target)).rejects.toMatchObject({ statusCode: 409 });
+    await expect(prepareCredentialForm(service, target)).rejects.toMatchObject({
+      statusCode: 409,
+      code: "stale_ref",
+    });
   });
 
   it("binds selected sibling-frame controls through their containing form", async () => {

@@ -33,6 +33,7 @@ export class CredentialFormError extends Error {
   constructor(
     message: string,
     public readonly statusCode: number,
+    public readonly code?: "stale_ref" | "session_busy",
   ) {
     super(message);
   }
@@ -812,6 +813,7 @@ async function discoverBoundForm(
       throw new CredentialFormError(
         "A selected field is unavailable or unsupported. Take a fresh browser snapshot.",
         409,
+        "stale_ref",
       );
     }
     if (selection) {
@@ -911,6 +913,7 @@ async function discoverBoundForm(
         throw new CredentialFormError(
           "Selected fields must belong to one form. Take a fresh browser snapshot.",
           409,
+          "stale_ref",
         );
       if (candidates.length > 1) break;
       continue;
@@ -924,6 +927,7 @@ async function discoverBoundForm(
       throw new CredentialFormError(
         "Selected fields must belong to one form. Take a fresh browser snapshot.",
         409,
+        "stale_ref",
       );
     }
     await Promise.all(
@@ -1053,7 +1057,8 @@ async function discoverBoundForm(
     scope === "sensitive"
       ? "No supported payment or authentication fields were found. Continue in the browser."
       : "No unambiguous supported form was found. Open the browser to continue.",
-    404,
+    selection ? 409 : 404,
+    selection ? "stale_ref" : undefined,
   );
 }
 
@@ -1377,7 +1382,7 @@ export async function fillCredentialForm(
   request: CredentialFormValues,
 ): Promise<{ submitted: boolean }> {
   if (filling.has(cdpService))
-    throw new CredentialFormError("A secure form is already being filled.", 409);
+    throw new CredentialFormError("A secure form is already being filled.", 409, "session_busy");
   filling.add(cdpService);
   try {
     const result = await fillBoundForm(cdpService, target, request);
@@ -1396,7 +1401,11 @@ export async function discoverCredentialForm(
   scope: CredentialFormScope = "sensitive",
 ): Promise<CredentialFormDescription> {
   if (filling.has(cdpService))
-    throw new CredentialFormError("A secure form operation is already in progress.", 409);
+    throw new CredentialFormError(
+      "A secure form operation is already in progress.",
+      409,
+      "session_busy",
+    );
   filling.add(cdpService);
   try {
     const result = await discoverBoundForm(cdpService, scope);
@@ -1413,7 +1422,11 @@ export async function prepareCredentialForm(
   selection: SelectedFormRequest,
 ): Promise<CredentialFormDescription> {
   if (filling.has(cdpService))
-    throw new CredentialFormError("A secure form operation is already in progress.", 409);
+    throw new CredentialFormError(
+      "A secure form operation is already in progress.",
+      409,
+      "session_busy",
+    );
   filling.add(cdpService);
   let handles: SelectedFormHandles | undefined;
   try {
@@ -1422,6 +1435,7 @@ export async function prepareCredentialForm(
       throw new CredentialFormError(
         "The selected page is unavailable. Take a fresh browser snapshot.",
         409,
+        "stale_ref",
       );
     try {
       handles = await resolveSelectedFields(page, selection);
@@ -1429,6 +1443,7 @@ export async function prepareCredentialForm(
       throw new CredentialFormError(
         error instanceof Error ? error.message : "The selected fields changed.",
         409,
+        "stale_ref",
       );
     }
     const result = await discoverBoundForm(cdpService, "all", { page, handles });

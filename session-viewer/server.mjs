@@ -454,6 +454,7 @@ export function createGateway(config) {
         if (!prepared.response.ok)
           return sendCredentialJson(response, prepared.response.status, {
             error: prepared.body?.error ?? "Form preparation failed.",
+            code: prepared.body?.code,
           });
         const { formId, expiresAt: formExpiresAt } = prepared.body ?? {};
         if (!SESSION_ID.test(formId ?? "") || !Number.isFinite(formExpiresAt))

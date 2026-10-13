@@ -902,3 +902,36 @@ for (const submit of [true, false]) {
     assert.equal(gateway.posted.length, 2);
   });
 }
+
+for (const code of ["stale_ref", "session_busy"]) {
+  test(`preparation preserves ${code} through the viewer gateway`, async (context) => {
+    const upstream = http.createServer((request, response) => {
+      response.setHeader("content-type", "application/json");
+      if (request.method === "POST") {
+        response.writeHead(409);
+        response.end(
+          JSON.stringify({ error: "Form preparation rejected.", code }),
+        );
+      } else response.end(JSON.stringify({ id: sessionId, status: "live" }));
+    });
+    const upstreamPort = await listen(upstream);
+    const { internal } = createGateway({
+      secret,
+      publicOrigin: "https://viewer.test",
+      upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
+      maximumTtlMs: 900_000,
+    });
+    const port = await listen(internal);
+    context.after(() => Promise.all([close(internal), close(upstream)]));
+    const response = await fetch(
+      `http://127.0.0.1:${port}/v1/sessions/${sessionId}/credential-handoff`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ pageId: "page", fields: [] }),
+      },
+    );
+    assert.equal(response.status, 409);
+    assert.equal((await response.json()).code, code);
+  });
+}
