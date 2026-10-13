@@ -40,9 +40,11 @@ function signPayload(encodedPayload, secret) {
     .digest("base64url");
 }
 
-export function mintCapability({ sessionId, expiresAt }, secret) {
+export function mintCapability({ sessionId, expiresAt, formId }, secret) {
   if (!SESSION_ID.test(sessionId))
     throw new Error("Cannot mint a capability for an invalid session ID.");
+  if (formId !== undefined && !SESSION_ID.test(formId))
+    throw new Error("Cannot mint a capability for an invalid form ID.");
   const payload = base64url(
     JSON.stringify({
       v: 1,
@@ -50,6 +52,7 @@ export function mintCapability({ sessionId, expiresAt }, secret) {
       sid: sessionId,
       nonce: randomBytes(16).toString("base64url"),
       exp: Math.floor(expiresAt / 1000),
+      ...(formId === undefined ? {} : { form: formId }),
     }),
   );
   return `${payload}.${signPayload(payload, secret)}`;
@@ -75,12 +78,17 @@ export function verifyCapability(token, secret, now = Date.now()) {
     payload?.v !== 1 ||
     payload?.aud !== "session-viewer" ||
     !SESSION_ID.test(payload?.sid ?? "") ||
+    (payload.form !== undefined && !SESSION_ID.test(payload.form)) ||
     !Number.isSafeInteger(payload?.exp) ||
     payload.exp <= Math.floor(now / 1000)
   ) {
     return undefined;
   }
-  return { sessionId: payload.sid, expiresAt: payload.exp * 1000 };
+  return {
+    sessionId: payload.sid,
+    expiresAt: payload.exp * 1000,
+    ...(payload.form === undefined ? {} : { formId: payload.form }),
+  };
 }
 
 function cookieName(sessionId) {
@@ -322,12 +330,12 @@ function sendCredentialJson(response, status, body) {
   response.end(JSON.stringify(body));
 }
 
-async function readCredentialBody(request) {
+async function readCredentialBody(request, maximumBytes = 16 * 1024) {
   const chunks = [];
   let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > 16 * 1024) throw new Error("too_large");
+    if (size > maximumBytes) throw new Error("too_large");
     chunks.push(chunk);
   }
   try {
@@ -419,8 +427,66 @@ export function createGateway(config) {
     }
   };
 
-  const internal = http.createServer((request, response) => {
+  const internal = http.createServer(async (request, response) => {
     const target = new URL(request.url ?? "/", upstreamOrigin);
+    const prepare = /^\/v1\/sessions\/([0-9a-f-]+)\/credential-handoff$/.exec(
+      target.pathname,
+    );
+    if (request.method === "POST" && prepare && SESSION_ID.test(prepare[1])) {
+      try {
+        const body = await readCredentialBody(request, 64 * 1024);
+        const session = await upstreamJson(
+          new URL(`/v1/sessions/${prepare[1]}`, upstreamOrigin),
+        );
+        if (
+          !session.response.ok ||
+          session.body?.id !== prepare[1] ||
+          session.body?.status !== "live"
+        )
+          return sendCredentialJson(response, 404, {
+            error: "Session not found.",
+          });
+        const prepared = await upstreamJson(target, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!prepared.response.ok)
+          return sendCredentialJson(response, prepared.response.status, {
+            error: prepared.body?.error ?? "Form preparation failed.",
+            code: prepared.body?.code,
+          });
+        const { formId, expiresAt: formExpiresAt } = prepared.body ?? {};
+        if (!SESSION_ID.test(formId ?? "") || !Number.isFinite(formExpiresAt))
+          return sendCredentialJson(response, 502, {
+            error: "Browser returned an invalid selected form.",
+          });
+        const expiresAt = Math.min(
+          formExpiresAt,
+          sessionExpiry(session.body, Date.now(), config.maximumTtlMs),
+        );
+        const capability = mintCapability(
+          { sessionId: prepare[1], formId, expiresAt },
+          config.secret,
+        );
+        const viewerUrl = new URL(`/s/${capability}`, publicOrigin);
+        viewerUrl.searchParams.set("clipboardBridge", "true");
+        return sendCredentialJson(response, 200, {
+          viewer_url: viewerUrl.toString(),
+          expires_at: expiresAt,
+        });
+      } catch (error) {
+        const status =
+          error?.message === "too_large"
+            ? 413
+            : error?.message === "invalid_json"
+            ? 400
+            : 502;
+        return sendCredentialJson(response, status, {
+          error: "Could not prepare the selected form.",
+        });
+      }
+    }
     const transformJson = isSessionResponse(request)
       ? (body) => rewriteSession(body, config)
       : undefined;
@@ -480,7 +546,9 @@ export function createGateway(config) {
           )}/credential-form`,
           upstreamOrigin,
         );
-        target.searchParams.set("scope", "all");
+        if (capability.formId)
+          target.searchParams.set("formId", capability.formId);
+        else target.searchParams.set("scope", "all");
         const discovered = await upstreamJson(target);
         // Discovery can overlap a fill. Do not publish a new handle after that
         // fill starts, even if the upstream lookup was already in flight.
@@ -501,6 +569,8 @@ export function createGateway(config) {
           typeof frameUrl !== "string" ||
           typeof origin !== "string" ||
           (kind !== "login" && kind !== "details") ||
+          (capability.formId &&
+            (formId !== capability.formId || kind !== "details")) ||
           !fields
         ) {
           return sendCredentialJson(response, 502, {

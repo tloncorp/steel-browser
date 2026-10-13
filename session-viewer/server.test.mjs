@@ -82,6 +82,32 @@ test("capabilities authenticate one session until their expiration", () => {
   );
 });
 
+test("a selected-form capability binds its form ID into the signature", () => {
+  const formId = "223e4567-e89b-42d3-a456-426614174000";
+  const token = mintCapability(
+    { sessionId, formId, expiresAt: 20_000 },
+    secret,
+  );
+  assert.deepEqual(verifyCapability(token, secret, 10_000), {
+    sessionId,
+    formId,
+    expiresAt: 20_000,
+  });
+  const [encoded, signature] = token.split(".");
+  const payload = JSON.parse(Buffer.from(encoded, "base64url"));
+  delete payload.form;
+  assert.equal(
+    verifyCapability(
+      `${Buffer.from(JSON.stringify(payload)).toString(
+        "base64url",
+      )}.${signature}`,
+      secret,
+      10_000,
+    ),
+    undefined,
+  );
+});
+
 test("live session responses receive neutral capability and scoped CDP URLs", () => {
   const rewritten = rewriteSession(
     {
@@ -295,7 +321,7 @@ async function secureGateway(
     timeout: 60_000,
   };
   const metadata = {
-    formId: "bound-form",
+    formId: hooks.formId ?? "bound-form",
     pageId: "page-1",
     frameUrl: "https://account.example/form",
     origin: "https://account.example",
@@ -313,9 +339,15 @@ async function secureGateway(
         .writeHead(200, { "content-type": "text/html" })
         .end("Live browser");
     }
-    if (request.url !== `/v1/sessions/${sessionId}/credential-form`)
+    const target = new URL(request.url, "http://upstream.test");
+    if (target.pathname !== `/v1/sessions/${sessionId}/credential-form`)
       return response.writeHead(404).end();
     if (request.method === "GET") {
+      assert.equal(
+        target.searchParams.get("scope"),
+        hooks.formId ? null : "all",
+      );
+      assert.equal(target.searchParams.get("formId"), hooks.formId ?? null);
       discovered.push(metadata.formId);
       const status = (await hooks.discover?.()) ?? 200;
       response
@@ -323,6 +355,7 @@ async function secureGateway(
         .end(JSON.stringify(metadata));
       return;
     }
+    assert.equal(target.search, "");
     const chunks = [];
     request.on("data", (chunk) => chunks.push(chunk));
     request.on("end", async () => {
@@ -425,6 +458,26 @@ test("secure handoffs expose metadata and a one-use endpoint, never values or se
   const { fields: _fields, ...target } = gateway.metadata;
   assert.deepEqual(gateway.posted, [{ target, ...input }]);
   assert.equal((await gateway.fill(handoff.handoffId, input)).status, 401);
+});
+
+test("selected-form links refuse a different discovered form and never broaden to automatic discovery", async (context) => {
+  const formId = "223e4567-e89b-42d3-a456-426614174000";
+  const gateway = await secureGateway(
+    context,
+    [secureField("field")],
+    "details",
+    200,
+    { formId },
+  );
+  const capability = mintCapability(
+    { sessionId, formId, expiresAt: Date.now() + 60_000 },
+    secret,
+  );
+  const handoff = await (await gateway.discover(capability)).json();
+  assert.equal(handoff.formId, formId);
+  gateway.metadata.formId = "323e4567-e89b-42d3-a456-426614174000";
+  assert.equal((await gateway.discover(capability)).status, 502);
+  assert.equal(gateway.posted.length, 0);
 });
 
 test("field contracts reject wrong keys and enforce verification-code length", async (context) => {
@@ -847,5 +900,38 @@ for (const submit of [true, false]) {
     );
     assert.deepEqual(gateway.posted.at(-1).values, { f0: "corrected" });
     assert.equal(gateway.posted.length, 2);
+  });
+}
+
+for (const code of ["stale_ref", "session_busy"]) {
+  test(`preparation preserves ${code} through the viewer gateway`, async (context) => {
+    const upstream = http.createServer((request, response) => {
+      response.setHeader("content-type", "application/json");
+      if (request.method === "POST") {
+        response.writeHead(409);
+        response.end(
+          JSON.stringify({ error: "Form preparation rejected.", code }),
+        );
+      } else response.end(JSON.stringify({ id: sessionId, status: "live" }));
+    });
+    const upstreamPort = await listen(upstream);
+    const { internal } = createGateway({
+      secret,
+      publicOrigin: "https://viewer.test",
+      upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
+      maximumTtlMs: 900_000,
+    });
+    const port = await listen(internal);
+    context.after(() => Promise.all([close(internal), close(upstream)]));
+    const response = await fetch(
+      `http://127.0.0.1:${port}/v1/sessions/${sessionId}/credential-handoff`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ pageId: "page", fields: [] }),
+      },
+    );
+    assert.equal(response.status, 409);
+    assert.equal((await response.json()).code, code);
   });
 }
