@@ -110,7 +110,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
 
   it("fills saved HTTPS logins and marks both fields sensitive before any input events", async () => {
     await loadSecure(`<form onsubmit="event.preventDefault()">${fields}<button>Sign in</button></form>
-      <script>window.leaked=false; document.addEventListener('input',e=>{if(e.target.dataset.tlonSensitive!=='true')window.leaked=true})</script>`);
+      <script>window.leaked=false; document.addEventListener('input',e=>{if(e.target.dataset.steelPrivate!=='true')window.leaked=true})</script>`);
     const target = await discoverCredentialForm(service);
     expect(target.vaultEligible).toBe(true);
     const result = await fillCredentialForm(service, target, {
@@ -123,7 +123,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       await page.evaluate(() =>
         Array.from(document.querySelectorAll("input")).map((input) => [
           input.value,
-          input.dataset.tlonSensitive,
+          input.dataset.steelPrivate,
         ]),
       ),
     ).toEqual([

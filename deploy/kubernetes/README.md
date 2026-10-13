@@ -147,7 +147,8 @@ Ship headers are routing hints until verification succeeds. A signed conversatio
 grants no owner authority; the app exchanges it for an owner-authenticated viewer capability.
 Public raw CDP is disabled, and credential-enabled MCP refuses screenshots, PDFs, recording replay,
 and diagnostic artifacts. Known filled values are redacted from text and automation-model input.
-Keep browser egress isolated from internal control services. A malicious destination that
+Chrome retains its debugger Origin checks and routes loopback page requests through the
+configured egress proxy. Keep that proxy isolated from internal control services. A malicious destination that
 transforms and discloses its own password is outside the redaction guarantee.
 
 Pioneer stores only encrypted records in the **parent planet's** `%settings` bucket

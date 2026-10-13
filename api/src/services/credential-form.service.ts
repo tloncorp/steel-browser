@@ -745,7 +745,7 @@ async function fillBoundForm(
             // Event handlers can replace another field synchronously. Stop before
             // delivering any value to a replacement or a different destination.
             if (!valid()) return null;
-            input.setAttribute("data-tlon-sensitive", "true");
+            input.setAttribute("data-steel-private", "true");
             input.focus();
             if (!valid()) return null;
             if (input instanceof HTMLSelectElement) {
