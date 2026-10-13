@@ -142,7 +142,8 @@ MCP derives each AES-256-GCM key from the static server key and a domain-separat
 of the owner planet's code. Each ship-stored record retains its encryption factor so code changes
 do not invalidate saved passwords. The key context binds the planet, bot moon, and credential ID.
 Pioneer verifies the moon's current browser key before retrieval. The raw code stays in Pioneer.
-Owner requests use a distinct code-derived proof checked against the planet's current code.
+Owner requests use a domain-separated HMAC proof with a ten-minute expiry, checked against
+the planet's current code and server time.
 Ship headers are routing hints until verification succeeds. A signed conversation viewer link
 grants no owner authority; the app exchanges it for an owner-authenticated viewer capability.
 Public raw CDP is disabled, and credential-enabled MCP refuses screenshots, PDFs, recording replay,
