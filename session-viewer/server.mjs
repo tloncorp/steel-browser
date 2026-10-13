@@ -40,13 +40,13 @@ function signPayload(encodedPayload, secret) {
     .digest("base64url");
 }
 
-export function mintCapability({ sessionId, expiresAt }, secret) {
+export function mintCapability({ sessionId, expiresAt, owner = false }, secret) {
   if (!SESSION_ID.test(sessionId))
     throw new Error("Cannot mint a capability for an invalid session ID.");
   const payload = base64url(
     JSON.stringify({
       v: 1,
-      aud: "session-viewer",
+      aud: owner ? "owner-viewer" : "session-viewer",
       sid: sessionId,
       exp: Math.floor(expiresAt / 1000),
     }),
@@ -72,14 +72,14 @@ export function verifyCapability(token, secret, now = Date.now()) {
   }
   if (
     payload?.v !== 1 ||
-    payload?.aud !== "session-viewer" ||
+    !["session-viewer", "owner-viewer"].includes(payload?.aud) ||
     !SESSION_ID.test(payload?.sid ?? "") ||
     !Number.isSafeInteger(payload?.exp) ||
     payload.exp <= Math.floor(now / 1000)
   ) {
     return undefined;
   }
-  return { sessionId: payload.sid, expiresAt: payload.exp * 1000 };
+  return { sessionId: payload.sid, expiresAt: payload.exp * 1000, ...(payload.aud === "owner-viewer" ? { owner: true } : {}) };
 }
 
 function cookieName(sessionId) {
@@ -127,17 +127,13 @@ export function rewriteSession(record, config, now = Date.now()) {
   const entryUrl = new URL(`/s/${capability}`, config.publicOrigin);
   entryUrl.searchParams.set("clipboardBridge", "true");
   const entry = entryUrl.toString();
-  const cdp = new URL("/cdp", config.publicOrigin);
-  cdp.protocol = cdp.protocol === "https:" ? "wss:" : "ws:";
-  cdp.searchParams.set("sessionId", record.id);
-  cdp.searchParams.set("cap", capability);
 
   return {
     ...record,
     sessionViewerUrl: entry,
     debugUrl: entry,
     debuggerUrl: entry,
-    websocketUrl: cdp.toString(),
+    websocketUrl: "",
   };
 }
 
@@ -444,7 +440,7 @@ export function createGateway(config) {
       (url.pathname.startsWith("/credentials/") ||
         url.pathname.startsWith("/credential-fills/") ||
         url.pathname.startsWith("/credential-vault/") ||
-        url.pathname.startsWith("/vault/"))
+        url.pathname.startsWith("/vault/") || url.pathname === "/viewer-authorize")
     ) {
       response.writeHead(
         204,
@@ -458,7 +454,22 @@ export function createGateway(config) {
       return;
     }
 
-    const ownerOperation = /^\/vault\/(list|delete)$/.exec(url.pathname);
+    if (request.method === "POST" && url.pathname === "/viewer-authorize") {
+      try {
+        const body = await readCredentialBody(request);
+        const capability = verifyCapability(body.capability, config.secret);
+        if (!capability) return sendCredentialJson(response, 401, { error: "Invalid browser session." });
+        if (config.vault) {
+          const result = await vaultRequest("authorize-viewer", { sessionId: capability.sessionId,
+            planet: body.planet, ownerToken: body.ownerToken });
+          if (!result.response.ok) return sendCredentialJson(response, 403, { error: "Owner authorization is required." });
+        }
+        const token = mintCapability({ ...capability, owner: true }, config.secret);
+        return sendCredentialJson(response, 200, { viewerUrl: new URL(`/s/${token}?clipboardBridge=true`, publicOrigin).toString() });
+      } catch { return sendCredentialJson(response, 503, { error: "Viewer authorization is unavailable." }); }
+    }
+
+    const ownerOperation = /^\/vault\/(list|delete|permission)$/.exec(url.pathname);
     const vaultHandoff = /^\/credential-vault\/([A-Za-z0-9_-]{40,64})$/.exec(
       url.pathname,
     );
@@ -650,7 +661,7 @@ export function createGateway(config) {
       if (
         (body.submit !== undefined && typeof body.submit !== "boolean") ||
         Object.keys(body).some(
-          (key) => !["values", "submit", "grant", "save", "use"].includes(key),
+          (key) => !["values", "submit", "grant", "save", "use", "allowAutomatic"].includes(key),
         ) ||
         (body.use
           ? body.values !== undefined
@@ -732,7 +743,7 @@ export function createGateway(config) {
     const entry = /^\/s\/([^/]+)$/.exec(url.pathname);
     if (request.method === "GET" && entry) {
       const capability = verifyCapability(entry[1], config.secret);
-      if (!capability)
+      if (!capability || (config.vault && !capability.owner))
         return sendPublicError(
           response,
           401,
@@ -767,7 +778,7 @@ export function createGateway(config) {
         tokenForSession(request, url, sessionId),
         config.secret,
       );
-      if (!capability || capability.sessionId !== sessionId) {
+      if (!capability || capability.sessionId !== sessionId || (config.vault && !capability.owner)) {
         return sendPublicError(
           response,
           401,
@@ -797,13 +808,11 @@ export function createGateway(config) {
       tokenForSession(request, url, sessionId),
       config.secret,
     );
-    if (!capability || capability.sessionId !== sessionId)
+    if (!capability || capability.sessionId !== sessionId || (config.vault && !capability.owner))
       return writeUpgradeError(socket, 401, "Unauthorized");
 
     let forwardedPath;
-    if (url.pathname === "/cdp") {
-      forwardedPath = `/?sessionId=${encodeURIComponent(sessionId)}`;
-    } else if (url.pathname === "/v1/sessions/cast") {
+    if (url.pathname === "/v1/sessions/cast") {
       const query = new URLSearchParams({ sessionId });
       for (const name of ["pageId", "pageIndex", "tabInfo"]) {
         const value = url.searchParams.get(name);

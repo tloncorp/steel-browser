@@ -82,7 +82,7 @@ test("capabilities authenticate one session until their expiration", () => {
   );
 });
 
-test("live session responses receive neutral capability and scoped CDP URLs", () => {
+test("live session responses expose a viewer without a raw CDP capability", () => {
   const rewritten = rewriteSession(
     {
       id: sessionId,
@@ -112,16 +112,7 @@ test("live session responses receive neutral capability and scoped CDP URLs", ()
   );
   assert.equal(rewritten.debugUrl, rewritten.sessionViewerUrl);
   assert.equal(rewritten.debuggerUrl, rewritten.sessionViewerUrl);
-  const websocket = new URL(rewritten.websocketUrl);
-  assert.equal(websocket.protocol, "wss:");
-  assert.equal(websocket.pathname, "/cdp");
-  assert.equal(websocket.searchParams.get("sessionId"), sessionId);
-  const verified = verifyCapability(
-    websocket.searchParams.get("cap"),
-    secret,
-    20_000,
-  );
-  assert.deepEqual(verified, { sessionId, expiresAt: 70_000 });
+  assert.equal(rewritten.websocketUrl, "");
 });
 
 test("released sessions are not given viewer capabilities", () => {
@@ -233,7 +224,7 @@ test("the public listener exposes only a capability-scoped viewer", async (conte
     new URL(created.sessionViewerUrl).searchParams.get("clipboardBridge"),
     "true",
   );
-  assert.match(created.websocketUrl, /^wss:\/\/viewer\.example\/cdp\?/);
+  assert.equal(created.websocketUrl, "");
 
   const publicBase = `http://127.0.0.1:${publicPort}`;
   const denied = await fetch(`${publicBase}/v1/sessions`);
@@ -693,4 +684,46 @@ test("manual entry discards pending save consent and unavailable vaults do not b
     ).status,
     200,
   );
+});
+
+test("viewer access requires a separate owner proof and never grants raw CDP", async (context) => {
+  let authorizedSession;
+  const vault = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+    assert.equal(request.url, "/internal/vault/authorize-viewer");
+    assert.equal(request.headers["x-browser-vault-service"], secret);
+    authorizedSession = body.sessionId;
+    response.writeHead(body.ownerToken === "owner-proof" ? 200 : 403, { "content-type": "application/json" }).end(JSON.stringify({ ok: true }));
+  });
+  const port = await listen(vault);
+  context.after(() => close(vault));
+  const gateway = await secureGateway(context, [secureField("username")], "login", 200,
+    { origin: `http://127.0.0.1:${port}`, token: secret });
+  const capability = mintCapability({ sessionId, expiresAt: Date.now() + 60_000 }, secret);
+  assert.equal((await fetch(`${gateway.base}/s/${capability}`)).status, 401);
+  assert.equal((await fetch(`${gateway.base}/viewer?sessionId=${sessionId}&cap=${capability}`)).status, 401);
+  const authorize = ownerToken => fetch(`${gateway.base}/viewer-authorize`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ capability, planet: "sampel-palnet", ownerToken }) });
+  assert.equal((await authorize("browser-key")).status, 403);
+  const response = await authorize("owner-proof");
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  const token = new URL(body.viewerUrl).pathname.split("/s/")[1];
+  assert.equal(verifyCapability(token, secret).owner, true);
+  assert.equal(authorizedSession, sessionId);
+  assert.equal(verifyCapability(capability, secret).owner, undefined);
+  for (const [path, expected] of [["/v1/sessions/cast", 401], ["/cdp", 404]]) {
+    const tokenForPath = path === "/cdp" ? token : capability;
+    const status = await new Promise((resolve, reject) => {
+      const req = http.request(`${gateway.base}${path}?sessionId=${sessionId}&cap=${tokenForPath}`, {
+        headers: { connection: "Upgrade", upgrade: "websocket", "sec-websocket-version": "13", "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==" }
+      });
+      req.on("response", res => { res.resume(); resolve(res.statusCode); });
+      req.on("upgrade", (_res, socket) => { socket.destroy(); reject(new Error("Unexpected upgrade")); });
+      req.on("error", reject);
+      req.end();
+    });
+    assert.equal(status, expected);
+  }
 });

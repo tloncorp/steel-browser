@@ -116,9 +116,9 @@ that network. Requests without a supported credential are rejected before a tena
 
 `BROWSER_VAULT_ENABLED=true` on both the MCP and viewer containers enables saved logins.
 The manifests leave it disabled until the service and secrets are configured. Native secure
-forms offer an unchecked save option and an owner-only account chooser. Bot settings lists and
-deletes saved logins. `browser_login` fills through the private browser API and returns only a
-status; it never exposes an account list or password to the model. OTPs, new-password fields,
+forms offer an unchecked save option and an owner-only account chooser. Bot settings lists, deletes, and changes automatic-sign-in permission for saved logins.
+`browser_login` can list account metadata and privately fill credentials marked `allow`;
+credentials marked `ask` require owner approval. Passwords never appear in tool results. OTPs, new-password fields,
 cards, cross-origin frames/actions, and HTTP origins are excluded.
 
 Provision `browser-vault-secrets` in each Steel deployment with these keys:
@@ -138,23 +138,30 @@ plaintext fallback. Changing the encryption key requires a deliberate authentica
 migration of stored records; replacing or losing it makes those records unreadable. Rotating a
 moon's login code or the planet owner token does not require re-encryption.
 
-MCP derives an AES-256-GCM key for each `(planet, moon)` pair using HKDF-SHA256. Pioneer verifies
-the moon's current browser key, derived locally from its login code, before any browser retrieval.
-The code stays in Pioneer. The configured `X-Tlon-Parent-Ship` and `X-Tlon-Ship` upstream headers
-are routing hints until this verification succeeds. Native owner requests additionally prove the
-planet's authenticated `%genuine` token before listing, saving, choosing, or deleting a login.
-A signed viewer link alone grants no durable-vault authority.
+MCP derives each AES-256-GCM key from the static server key and a domain-separated derivative
+of the owner planet's code. Each ship-stored record retains its encryption factor so code changes
+do not invalidate saved passwords. The key context binds the planet, bot moon, and credential ID.
+Pioneer verifies the moon's current browser key before retrieval. The raw code stays in Pioneer.
+Owner requests use a distinct code-derived proof checked against the planet's current code.
+Ship headers are routing hints until verification succeeds. A signed conversation viewer link
+grants no owner authority; the app exchanges it for an owner-authenticated viewer capability.
+Public raw CDP is disabled, and credential-enabled MCP refuses screenshots, PDFs, recording replay,
+and diagnostic artifacts. Known filled values are redacted from text and automation-model input.
+Keep browser egress isolated from internal control services. A malicious destination that
+transforms and discloses its own password is outside the redaction guarantee.
 
 Pioneer stores only encrypted records in the **parent planet's** `%settings` bucket
 `%moltbot/%browser-logins`. Each entry is scoped to one bot moon and exact HTTPS origin, with
-version, record ID, revision, timestamps, and key ID authenticated by the cipher. Sibling bots do
+authenticated identity, origin, label, factor, creation time, and key ID. Current revisions and
+permissions are enforced by Pioneer without decrypting. Sibling bots do
 not share entries. Updates and deletes check the record revision under the planet's writer lock.
 Save acknowledgement waits until the planet's scry observes the write; successful form filling
 and successful saving are reported separately. Neither result proves sign-in.
 
 Deploy Pioneer with the vault endpoint, then the matching MCP/browser/viewer images, then enable
 both feature flags. Start with synthetic accounts for two bot moons: verify isolation, owner
-selection, username/password steps, deletion, rejected retries, expired/replayed handoffs, and
+selection, ask/allow/revocation, username/password steps, metadata-only Solaris listing/deletion,
+rejected retries, expired/replayed handoffs, and
 browser-key/owner-token rotation. The viewer-to-MCP route and browser REST API remain private;
 Pioneer routing uses the fixed operator-controlled HTTPS origin template. Owner tokens and
 credential payloads are excluded from request logs. Secure fills redact known values from browser
