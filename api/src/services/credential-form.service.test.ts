@@ -189,6 +189,60 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     return { sessionId, secret, publicServer, internal, upstream };
   }
 
+  it("preserves login semantics when selecting the complete username/password form", async () => {
+    await page.setRequestInterception(true);
+    page.on(
+      "request",
+      (request) =>
+        void request.respond({
+          contentType: "text/html",
+          body: `<b>Login</b><form action="/login"><input name="acct"><input name="pw" type="password"><input type="submit" value="login"></form>
+        <b>Create Account</b><form action="/register"><input name="acct"><input name="pw" type="password"><input type="submit" value="create account"></form>`,
+        }),
+    );
+    await page.goto("https://login.example.test/login");
+    const form = await prepareCredentialForm(
+      service,
+      await selection([
+        'form[action="/login"] input[name="acct"]',
+        'form[action="/login"] input[name="pw"]',
+      ]),
+    );
+    expect(form).toMatchObject({ kind: "login", vaultEligible: true });
+    expect(form.fields.map(({ purpose, required }) => ({ purpose, required }))).toEqual([
+      { purpose: "username", required: true },
+      { purpose: "current-password", required: true },
+    ]);
+    expect(await getBoundCredentialForm(service, form.formId)).toEqual(form);
+  });
+
+  it.each([
+    [
+      "partial login",
+      '<form><input name="user"><input type="password"><button>Login</button></form>',
+      ['input[type="password"]'],
+    ],
+    [
+      "account creation",
+      '<form><input name="user"><input type="password"><button>Create account</button></form>',
+      ['input[name="user"]', 'input[type="password"]'],
+    ],
+    [
+      "new password",
+      '<form><input name="user"><input type="password" autocomplete="new-password"><button>Login</button></form>',
+      ['input[name="user"]', 'input[type="password"]'],
+    ],
+    [
+      "mixed checkout",
+      '<form><input name="user"><input type="password"><input autocomplete="cc-number"><button>Pay</button></form>',
+      ['input[name="user"]', 'input[type="password"]'],
+    ],
+  ])("keeps selected %s fields as private details", async (_name, body, selectors) => {
+    await load(body as string);
+    const form = await prepareCredentialForm(service, await selection(selectors as string[]));
+    expect(form).toMatchObject({ kind: "details", vaultEligible: false });
+  });
+
   it("fills only selected fields, preserving unrelated required fields and dropdown values", async () => {
     await load(`<form action="/done"><label>Last name<input name="lastname" required></label>
       <label>SSN<input name="ssn_3" required></label><label>Month<select name="bm" required>
@@ -1443,60 +1497,67 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     },
   );
 
-  it("opens an automatic login handoff and submits its bound fields through the viewer", async () => {
-    await load(`<form onsubmit="event.preventDefault();document.body.dataset.submitted='yes'">
+  it.each(["automatic", "selected"])(
+    "opens a %s login handoff and submits its bound fields through the viewer",
+    async (mode) => {
+      await load(`<form onsubmit="event.preventDefault();document.body.dataset.submitted='yes'">
         <label>User<input name="user" autocomplete="username" required></label>
         <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
         <button>Login</button></form>`);
-    const { sessionId, secret, publicServer, internal, upstream } = await formGateway();
-    try {
-      await new Promise<void>((resolve) => publicServer.listen(0, "127.0.0.1", resolve));
-      await new Promise<void>((resolve) => internal.listen(0, "127.0.0.1", resolve));
-      const base = `http://127.0.0.1:${publicServer.address().port}`;
-      const prepared = await fetch(
-        `http://127.0.0.1:${internal.address().port}/v1/sessions/${sessionId}/credential-handoff`,
-        {
+      const { sessionId, secret, publicServer, internal, upstream } = await formGateway();
+      try {
+        await new Promise<void>((resolve) => publicServer.listen(0, "127.0.0.1", resolve));
+        await new Promise<void>((resolve) => internal.listen(0, "127.0.0.1", resolve));
+        const base = `http://127.0.0.1:${publicServer.address().port}`;
+        const prepared = await fetch(
+          `http://127.0.0.1:${internal.address().port}/v1/sessions/${sessionId}/credential-handoff`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(
+              mode === "selected"
+                ? await selection(['input[name="user"]', 'input[name="password"]'])
+                : { discover: true },
+            ),
+          },
+        );
+        expect(prepared.status).toBe(200);
+        const token = new URL((await prepared.json()).viewer_url).pathname.slice(3);
+        const opened = await fetch(`${base}/credentials/${token}`);
+        expect(opened.status).toBe(200);
+        const handoff = await opened.json();
+        expect(handoff.kind).toBe("login");
+        expect(handoff.fields.map((field) => field.purpose)).toEqual([
+          "username",
+          "current-password",
+        ]);
+        const values = { f0: "synthetic-user", f1: "synthetic-password" };
+        const filled = await fetch(`${base}/credential-fills/${handoff.handoffId}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ discover: true }),
-        },
-      );
-      expect(prepared.status).toBe(200);
-      const token = new URL((await prepared.json()).viewer_url).pathname.slice(3);
-      const opened = await fetch(`${base}/credentials/${token}`);
-      expect(opened.status).toBe(200);
-      const handoff = await opened.json();
-      expect(handoff.kind).toBe("login");
-      expect(handoff.fields.map((field) => field.purpose)).toEqual([
-        "username",
-        "current-password",
-      ]);
-      const values = { f0: "synthetic-user", f1: "synthetic-password" };
-      const filled = await fetch(`${base}/credential-fills/${handoff.handoffId}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ values, submit: true }),
-      });
-      expect(filled.status).toBe(200);
-      expect(await filled.json()).toEqual({ ok: true, submitted: true });
-      expect(await page.$$eval("input", (inputs) => inputs.map((input) => input.value))).toEqual(
-        Object.values(values),
-      );
-      expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
-      // A form-bound link cannot select a replacement form after navigation.
-      await load('<form><input type="password" name="password"><button>Login</button></form>');
-      expect((await fetch(`${base}/credentials/${token}`)).ok).toBe(false);
-    } finally {
-      publicServer.closeAllConnections();
-      internal.closeAllConnections();
-      upstream.closeAllConnections();
-      await Promise.all([
-        new Promise<void>((resolve) => publicServer.close(resolve)),
-        new Promise<void>((resolve) => internal.close(resolve)),
-        new Promise<void>((resolve) => upstream.close(() => resolve())),
-      ]);
-    }
-  });
+          body: JSON.stringify({ values, submit: true }),
+        });
+        expect(filled.status).toBe(200);
+        expect(await filled.json()).toEqual({ ok: true, submitted: true });
+        expect(await page.$$eval("input", (inputs) => inputs.map((input) => input.value))).toEqual(
+          Object.values(values),
+        );
+        expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+        // A form-bound link cannot select a replacement form after navigation.
+        await load('<form><input type="password" name="password"><button>Login</button></form>');
+        expect((await fetch(`${base}/credentials/${token}`)).ok).toBe(false);
+      } finally {
+        publicServer.closeAllConnections();
+        internal.closeAllConnections();
+        upstream.closeAllConnections();
+        await Promise.all([
+          new Promise<void>((resolve) => publicServer.close(resolve)),
+          new Promise<void>((resolve) => internal.close(resolve)),
+          new Promise<void>((resolve) => upstream.close(() => resolve())),
+        ]);
+      }
+    },
+  );
 
   it("fills checkbox, radio, and multiple-select choices through field events", async () => {
     await load(`<form>

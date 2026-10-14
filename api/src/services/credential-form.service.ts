@@ -665,6 +665,13 @@ function inspectDocument(
         input.required &&
         !fields.some((field) => field.inputs.includes(input)),
     );
+    // A selection retains login semantics only when it includes the complete
+    // login step. Optional checkboxes do not prevent saving username/password.
+    const completeLogin = fields.every(
+      (field) =>
+        (field.choice === "checkbox" && !field.descriptor.required) ||
+        field.inputs.every((input) => targets.includes(input)),
+    );
     if (targets.length) {
       const selected = fields.filter((field) =>
         field.inputs.some((input) => targets.includes(input)),
@@ -707,7 +714,10 @@ function inspectDocument(
       })),
     );
     const kind =
-      !targets.length && login && !unsupportedRequired && new Set(purposes).size === purposes.length
+      (!targets.length || completeLogin) &&
+      login &&
+      !unsupportedRequired &&
+      new Set(purposes).size === purposes.length
         ? "login"
         : "details";
     if (kind === "login")
@@ -1475,7 +1485,7 @@ export async function discoverCredentialForm(
   }
 }
 
-/** Prepare exactly one private entry round; selected fields never submit the page. */
+/** Bind selected controls; a complete login retains login submission and vault eligibility. */
 export async function prepareCredentialForm(
   cdpService: CDPService,
   selection: SelectedFormRequest,
