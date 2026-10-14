@@ -1331,6 +1331,142 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     ).toBe("secret");
   });
 
+  async function loadComponentLogin(secure = false) {
+    await (secure ? loadSecure : load)(`<login-dialog>
+      <h1>Sign in</h1>
+      <login-field id="identity" purpose="username"><span slot="label">Email or username</span></login-field>
+      <login-field id="password" purpose="current-password"><span slot="label">Password</span><button slot="trailing" type="button">Show password</button></login-field>
+      <login-button></login-button>
+    </login-dialog>
+    <script>
+      customElements.define('login-dialog', class extends HTMLElement {
+        connectedCallback() { this.attachShadow({mode:'open'}).innerHTML='<div role="dialog"><slot></slot></div>'; }
+      });
+      customElements.define('login-field', class extends HTMLElement {
+        connectedCallback() {
+          const purpose=this.getAttribute('purpose');
+          this.attachShadow({mode:'open'}).innerHTML='<label><span id="caption"><slot name="label"></slot><span aria-hidden="true">*</span></span><input aria-labelledby="caption" required autocomplete="'+purpose+'" type="'+(purpose==='current-password'?'password':'text')+'"><slot name="trailing"></slot></label>';
+        }
+      });
+      customElements.define('login-button', class extends HTMLElement {
+        connectedCallback() { this.attachShadow({mode:'open'}).innerHTML='<button disabled>Sign in</button>'; }
+      });
+      document.querySelector('login-dialog').addEventListener('input', () => {
+        document.querySelector('login-button').shadowRoot.querySelector('button').disabled =
+          !Array.from(document.querySelectorAll('login-field')).every(el => el.shadowRoot.querySelector('input').value);
+      });
+      document.querySelector('login-button').shadowRoot.querySelector('button').onclick=()=>{document.body.dataset.submitted='yes'};
+    </script>`);
+  }
+
+  it.each(["identity", "password", null])(
+    "groups slotted component inputs independently of focus on %s",
+    async (focused) => {
+      await loadComponentLogin();
+      if (focused) await page.focus(`#${focused} >>> input`);
+      const target = await discoverCredentialForm(service, "all");
+      expect(target.kind).toBe("login");
+      expect(target.fields.map(({ purpose, label }) => ({ purpose, label }))).toEqual([
+        { purpose: "username", label: "Email or username" },
+        { purpose: "current-password", label: "Password" },
+      ]);
+      await page.evaluate(
+        () => (document.activeElement?.shadowRoot?.activeElement as HTMLElement | null)?.blur(),
+      );
+      expect((await discoverCredentialForm(service, "all")).formId).toBe(target.formId);
+      await expect(getBoundCredentialForm(service, target.formId)).resolves.toEqual(target);
+      expect(
+        await fillCredentialForm(service, target, {
+          values: { f0: "fixture-user", f1: "fixture-password" },
+          submit: true,
+        }),
+      ).toEqual({ submitted: true });
+      expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+    },
+  );
+
+  it("prepares both selected component fields using their accessible names", async () => {
+    await loadComponentLogin();
+    const target = await prepareCredentialForm(
+      service,
+      await selection(["#identity >>> input", "#password >>> input"]),
+    );
+    expect(target.fields.map((field) => field.label)).toEqual(["Email or username", "Password"]);
+    expect(target.kind).toBe("login");
+    expect(
+      await fillCredentialForm(service, target, {
+        values: { f0: "fixture-user", f1: "fixture-password" },
+        submit: true,
+      }),
+    ).toEqual({ submitted: true });
+    expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+  });
+
+  it("rejects changed slotted labels before filling a component input", async () => {
+    await loadComponentLogin();
+    const target = await discoverCredentialForm(service, "all");
+    await page.$eval('#identity [slot="label"]', (label) => {
+      label.textContent = "Different destination";
+    });
+    await expect(
+      fillCredentialForm(service, target, {
+        values: { f0: "fixture-user", f1: "fixture-password" },
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      await page.$eval("#identity >>> input", (input) => (input as HTMLInputElement).value),
+    ).toBe("");
+  });
+
+  it("rejects a component moved to a different form before entry", async () => {
+    await loadComponentLogin();
+    const target = await discoverCredentialForm(service, "all");
+    await page.evaluate(() => {
+      const other = document.createElement("form");
+      document.querySelector("login-dialog")!.append(other);
+      other.append(document.querySelector("#password")!);
+    });
+    await expect(
+      fillCredentialForm(service, target, {
+        values: { f0: "fixture-user", f1: "fixture-password" },
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      await page.$eval("#identity >>> input", (input) => (input as HTMLInputElement).value),
+    ).toBe("");
+  });
+
+  it.each([false, true])(
+    "checks a component login's enclosing form destination (cross-origin: %s)",
+    async (crossOrigin) => {
+      await loadComponentLogin(true);
+      await page.evaluate((crossOrigin) => {
+        const container = document.querySelector("login-dialog")!;
+        const form = document.createElement("form");
+        form.action = crossOrigin ? "https://different.example/receive" : "/signin";
+        form.append(...Array.from(container.children));
+        container.append(form);
+      }, crossOrigin);
+      const target = await discoverCredentialForm(service);
+      expect(target.fields.map((field) => field.purpose)).toEqual(["username", "current-password"]);
+      expect(target.vaultEligible).toBe(!crossOrigin);
+      const filled = fillCredentialForm(service, target, {
+        vault: true,
+        values: { f0: "fixture-user", f1: "fixture-password" },
+        submit: true,
+      });
+      if (crossOrigin) {
+        await expect(filled).rejects.toThrow("destination changed");
+        expect(
+          await page.$eval("#identity >>> input", (input) => (input as HTMLInputElement).value),
+        ).toBe("");
+      } else {
+        await expect(filled).resolves.toEqual({ submitted: true });
+        expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+      }
+    },
+  );
+
   it("fills native text controls using page labels without exposing existing values", async () => {
     await load(`<form onsubmit="event.preventDefault();document.body.dataset.sent='yes'">
       <label>Subject<input name="subject" required value="private-subject"></label>
