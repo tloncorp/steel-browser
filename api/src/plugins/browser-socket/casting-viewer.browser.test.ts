@@ -266,6 +266,33 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     await cdp.detach();
   }
 
+  it("returns from a script-opened viewer tab without closing the remote page", async () => {
+    const parent = await viewer(1200, 800);
+    expect(await parent.$eval("#return-to-app", (button) => button.hidden)).toBe(true);
+    await parent.goto(`${origin}/fixture`);
+    await parent.evaluate(() => {
+      document.body.dataset.approval = "pending";
+    });
+    const remoteUrl = target.url();
+    const popupReady = new Promise<Page>((resolve) =>
+      parent.once("popup", (popup) => resolve(popup!)),
+    );
+    await parent.evaluate((url) => {
+      const popup = window.open("about:blank", "_blank")!;
+      popup.opener = null;
+      popup.location.replace(url);
+    }, `${viewerEntry}?returnToApp=true`);
+    const popup = await popupReady;
+    await popup.waitForSelector("#return-to-app", { visible: true });
+    const closed = new Promise<void>((resolve) => popup.once("close", resolve));
+    await popup.click("#return-to-app");
+    await closed;
+    expect(parent.isClosed()).toBe(false);
+    expect(await parent.$eval("body", (body) => body.dataset.approval)).toBe("pending");
+    expect(target.isClosed()).toBe(false);
+    expect(target.url()).toBe(remoteUrl);
+  });
+
   it("uses the controlling viewer user agent and reloads only when it changes", async () => {
     const phoneAgent =
       "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1";
