@@ -156,7 +156,7 @@ spec:
             - name: CDP_DOMAIN
               value: browser-session-ovh1.tlon.network
             - name: CHROME_HEADLESS
-              value: "true"
+              value: "false"
             - name: DISABLE_CHROME_SANDBOX
               value: "true"
             - name: LOG_STORAGE_ENABLED
