@@ -115,8 +115,9 @@ that network. Requests without a supported credential are rejected before a tena
 ## Planet-backed saved logins
 
 `BROWSER_VAULT_ENABLED=true` on both the MCP and viewer containers enables saved logins.
-The manifests leave it disabled until the service and secrets are configured. Native secure
-forms offer an unchecked save option and an owner-only account chooser. Bot settings lists, deletes, and changes automatic-sign-in permission for saved logins.
+The manifests leave it disabled until the service, secrets, and client integration are configured.
+Owner-authenticated endpoints support saving, account selection, deletion, and automatic-sign-in
+permission changes. Saved-login controls require a separate client UI integration.
 `browser_login` can list account metadata and privately fill credentials marked `allow`;
 credentials marked `ask` require owner approval. Passwords never appear in tool results. OTPs, new-password fields,
 cards, cross-origin frames/actions, and HTTP origins are excluded.
