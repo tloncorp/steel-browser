@@ -128,10 +128,15 @@ Provision `browser-vault-secrets` in each Steel deployment with these keys:
 - `key-id`: the identifier for that encryption key, such as `primary`.
 - `service-token`: a secret of at least 32 characters, shared by the viewer and Steel MCP for
   their private API.
+- `pioneer-token`: a secret of at least 32 characters, shared only by Steel MCP and
+  Pioneer as `PIONEER_BROWSER_VAULT_TOKEN` for `/v1/browser-vault` requests.
 
-Steel MCP also reads `PIONEER_SIDECAR_TOKEN` from the existing `voyager-env-secrets` Kubernetes
-Secret. It uses Pioneer's `Authorization: Basic` protocol. Pioneer uses its existing sidecar
-token; vault access requires no additional Pioneer environment secret.
+Provision `PIONEER_BROWSER_VAULT_TOKEN` in each Pioneer container. Provision a different
+`PIONEER_BROWSER_VAULT_MANAGEMENT_TOKEN` only in Pioneer and Solaris for account-owner
+metadata listing and deletion. Both must differ from `PIONEER_SIDECAR_TOKEN`; Pioneer
+rejects missing, short, or reused credentials. Never mount the general Pioneer token or
+Solaris management token into Steel. Solaris reads its management token from
+`solaris-env-secrets`; configure both scoped tokens in the Pioneer container environment.
 
 Use the same encryption key and key ID across browser clusters in one environment, and keep a
 secure backup. Test and production use separate keys. There is no generated startup key or

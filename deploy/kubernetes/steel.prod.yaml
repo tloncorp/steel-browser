@@ -259,11 +259,11 @@ spec:
                   optional: true
             - name: BROWSER_VAULT_PIONEER_ORIGIN
               value: https://{planet}-feds.internal.tlon.network
-            - name: PIONEER_SIDECAR_TOKEN
+            - name: PIONEER_BROWSER_VAULT_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: voyager-env-secrets
-                  key: PIONEER_SIDECAR_TOKEN
+                  name: browser-vault-secrets
+                  key: pioneer-token
                   optional: true
             - name: STEEL_LOCAL
               value: "true"
