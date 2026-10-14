@@ -711,8 +711,7 @@ export function createGateway(config) {
           typeof frameUrl !== "string" ||
           typeof origin !== "string" ||
           (kind !== "login" && kind !== "details") ||
-          (capability.formId &&
-            (formId !== capability.formId || kind !== "details")) ||
+          (capability.formId && formId !== capability.formId) ||
           !fields
         ) {
           return sendCredentialJson(response, 502, {

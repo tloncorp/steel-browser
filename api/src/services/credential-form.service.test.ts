@@ -11,7 +11,8 @@ import {
   fillCredentialForm,
   getCredentialContinuation,
   prepareCredentialForm,
-  getPreparedCredentialForm,
+  getBoundCredentialForm,
+  CredentialFormError,
 } from "./credential-form.service.js";
 import type { SelectedFormControl, SelectedFormRequest } from "./selected-form.service.js";
 
@@ -131,6 +132,63 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     }
   }
 
+  async function formGateway() {
+    const sessionId = "123e4567-e89b-42d3-a456-426614174000";
+    const secret = "synthetic-test-secret-at-least-thirty-two-bytes";
+    const upstream = createServer(async (request, response) => {
+      const url = new URL(request.url!, "http://upstream.test");
+      try {
+        let result;
+        if (url.pathname === `/v1/sessions/${sessionId}`) {
+          result = {
+            id: sessionId,
+            status: "live",
+            createdAt: new Date().toISOString(),
+            timeout: 60_000,
+          };
+        } else if (url.pathname.endsWith("/credential-handoff")) {
+          const chunks: Buffer[] = [];
+          for await (const chunk of request) chunks.push(chunk);
+          result = {
+            ...(await prepareCredentialForm(service, JSON.parse(Buffer.concat(chunks).toString()))),
+            expiresAt: Date.now() + 300_000,
+          };
+        } else if (url.pathname !== `/v1/sessions/${sessionId}/credential-form`) {
+          return void response.writeHead(404).end();
+        } else if (request.method === "GET") {
+          result = url.searchParams.has("formId")
+            ? await getBoundCredentialForm(service, url.searchParams.get("formId")!)
+            : await discoverCredentialForm(
+                service,
+                url.searchParams.get("scope") === "all" ? "all" : "sensitive",
+              );
+        } else {
+          const chunks: Buffer[] = [];
+          for await (const chunk of request) chunks.push(chunk);
+          const { target, ...values } = JSON.parse(Buffer.concat(chunks).toString());
+          result = { ok: true, ...(await fillCredentialForm(service, target, values)) };
+        }
+        response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(result));
+      } catch (error) {
+        response
+          .writeHead(error instanceof CredentialFormError ? error.statusCode : 500, {
+            "content-type": "application/json",
+          })
+          .end(JSON.stringify({ error: String(error) }));
+      }
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    const address = upstream.address();
+    if (!address || typeof address === "string") throw new Error("No upstream listener");
+    const { publicServer, internal } = createGateway({
+      secret,
+      publicOrigin: "https://viewer.example.test",
+      upstreamOrigin: `http://127.0.0.1:${address.port}`,
+      maximumTtlMs: 60_000,
+    });
+    return { sessionId, secret, publicServer, internal, upstream };
+  }
+
   it("fills only selected fields, preserving unrelated required fields and dropdown values", async () => {
     await load(`<form action="/done"><label>Last name<input name="lastname" required></label>
       <label>SSN<input name="ssn_3" required></label><label>Month<select name="bm" required>
@@ -146,7 +204,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       { value: "1", label: "January" },
       { value: "2", label: "February" },
     ]);
-    expect(await getPreparedCredentialForm(service, form.formId)).toEqual(form);
+    expect(await getBoundCredentialForm(service, form.formId)).toEqual(form);
     expect(
       await fillCredentialForm(service, form, { values: { f0: "123", f1: "2" }, submit: true }),
     ).toMatchObject({ submitted: false });
@@ -231,7 +289,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     await page.$eval("span", (label) => {
       label.textContent = "Government identifier";
     });
-    await expect(getPreparedCredentialForm(service, form.formId)).rejects.toMatchObject({
+    await expect(getBoundCredentialForm(service, form.formId)).rejects.toMatchObject({
       statusCode: 409,
     });
     await expect(
@@ -323,7 +381,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     await page.$eval("option", (option) => {
       option.value = "other-value";
     });
-    await expect(getPreparedCredentialForm(service, form.formId)).rejects.toMatchObject({
+    await expect(getBoundCredentialForm(service, form.formId)).rejects.toMatchObject({
       statusCode: 409,
     });
     await expect(fillCredentialForm(service, form, { values: { f0: "0" } })).rejects.toMatchObject({
@@ -331,7 +389,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     });
     const next = await prepareCredentialForm(service, await selection(["select"]));
     expect(next.formId).not.toBe(form.formId);
-    await expect(getPreparedCredentialForm(service, form.formId)).rejects.toMatchObject({
+    await expect(getBoundCredentialForm(service, form.formId)).rejects.toMatchObject({
       statusCode: 409,
     });
   });
@@ -1270,9 +1328,10 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     expect(await page.evaluate(() => document.body.dataset.sent)).toBeUndefined();
   });
 
-  it.each([false, true])(
-    "passes generic date dropdowns through the viewer and dispatches their field events (selected=%s)",
-    async (selected) => {
+  it.each(["viewer", "automatic", "selected"])(
+    "passes generic date dropdowns through the viewer and dispatches their field events (%s)",
+    async (mode) => {
+      const selected = mode === "selected";
       await load(`<form onsubmit="event.preventDefault();document.body.dataset.submitted='yes'">
       <label>Reference<input name="reference" required></label>
       <label>Month<select name="month" required>
@@ -1289,68 +1348,13 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
         });
       }</script>`);
       await expect(discoverCredentialForm(service)).rejects.toMatchObject({ statusCode: 404 });
-      const sessionId = "123e4567-e89b-42d3-a456-426614174000";
-      const secret = "synthetic-test-secret-at-least-thirty-two-bytes";
-      const upstream = createServer(async (request, response) => {
-        const url = new URL(request.url!, "http://upstream.test");
-        try {
-          let result;
-          if (url.pathname === `/v1/sessions/${sessionId}`) {
-            result = {
-              id: sessionId,
-              status: "live",
-              createdAt: new Date().toISOString(),
-              timeout: 60_000,
-            };
-          } else if (url.pathname.endsWith("/credential-handoff")) {
-            const chunks: Buffer[] = [];
-            for await (const chunk of request) chunks.push(chunk);
-            result = {
-              ...(await prepareCredentialForm(
-                service,
-                JSON.parse(Buffer.concat(chunks).toString()),
-              )),
-              expiresAt: Date.now() + 300_000,
-            };
-          } else if (url.pathname !== `/v1/sessions/${sessionId}/credential-form`) {
-            return void response.writeHead(404).end();
-          } else if (request.method === "GET") {
-            result = url.searchParams.has("formId")
-              ? await getPreparedCredentialForm(service, url.searchParams.get("formId")!)
-              : await discoverCredentialForm(
-                  service,
-                  url.searchParams.get("scope") === "all" ? "all" : "sensitive",
-                );
-          } else {
-            const chunks: Buffer[] = [];
-            for await (const chunk of request) chunks.push(chunk);
-            const { target, ...values } = JSON.parse(Buffer.concat(chunks).toString());
-            result = { ok: true, ...(await fillCredentialForm(service, target, values)) };
-          }
-          response
-            .writeHead(200, { "content-type": "application/json" })
-            .end(JSON.stringify(result));
-        } catch (error) {
-          response
-            .writeHead(404, { "content-type": "application/json" })
-            .end(JSON.stringify({ error: String(error) }));
-        }
-      });
-      await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
-      const address = upstream.address();
-      if (!address || typeof address === "string") throw new Error("No upstream listener");
-      const { publicServer, internal } = createGateway({
-        secret,
-        publicOrigin: "https://viewer.example.test",
-        upstreamOrigin: `http://127.0.0.1:${address.port}`,
-        maximumTtlMs: 60_000,
-      });
+      const { sessionId, secret, publicServer, internal, upstream } = await formGateway();
       try {
         await new Promise<void>((resolve) => publicServer.listen(0, "127.0.0.1", resolve));
         await new Promise<void>((resolve) => internal.listen(0, "127.0.0.1", resolve));
         const base = `http://127.0.0.1:${publicServer.address().port}`;
         let token = mintCapability({ sessionId, expiresAt: Date.now() + 60_000 }, secret);
-        if (selected) {
+        if (mode !== "viewer") {
           const prepared = await fetch(
             `http://127.0.0.1:${
               internal.address().port
@@ -1359,7 +1363,9 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
               method: "POST",
               headers: { "content-type": "application/json" },
               body: JSON.stringify(
-                await selection(['[name="month"]', '[name="day"]', '[name="year"]']),
+                selected
+                  ? await selection(['[name="month"]', '[name="day"]', '[name="year"]'])
+                  : { discover: true },
               ),
             },
           );
@@ -1436,6 +1442,61 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       }
     },
   );
+
+  it("opens an automatic login handoff and submits its bound fields through the viewer", async () => {
+    await load(`<form onsubmit="event.preventDefault();document.body.dataset.submitted='yes'">
+        <label>User<input name="user" autocomplete="username" required></label>
+        <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+        <button>Login</button></form>`);
+    const { sessionId, secret, publicServer, internal, upstream } = await formGateway();
+    try {
+      await new Promise<void>((resolve) => publicServer.listen(0, "127.0.0.1", resolve));
+      await new Promise<void>((resolve) => internal.listen(0, "127.0.0.1", resolve));
+      const base = `http://127.0.0.1:${publicServer.address().port}`;
+      const prepared = await fetch(
+        `http://127.0.0.1:${internal.address().port}/v1/sessions/${sessionId}/credential-handoff`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ discover: true }),
+        },
+      );
+      expect(prepared.status).toBe(200);
+      const token = new URL((await prepared.json()).viewer_url).pathname.slice(3);
+      const opened = await fetch(`${base}/credentials/${token}`);
+      expect(opened.status).toBe(200);
+      const handoff = await opened.json();
+      expect(handoff.kind).toBe("login");
+      expect(handoff.fields.map((field) => field.purpose)).toEqual([
+        "username",
+        "current-password",
+      ]);
+      const values = { f0: "synthetic-user", f1: "synthetic-password" };
+      const filled = await fetch(`${base}/credential-fills/${handoff.handoffId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ values, submit: true }),
+      });
+      expect(filled.status).toBe(200);
+      expect(await filled.json()).toEqual({ ok: true, submitted: true });
+      expect(await page.$$eval("input", (inputs) => inputs.map((input) => input.value))).toEqual(
+        Object.values(values),
+      );
+      expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+      // A form-bound link cannot select a replacement form after navigation.
+      await load('<form><input type="password" name="password"><button>Login</button></form>');
+      expect((await fetch(`${base}/credentials/${token}`)).ok).toBe(false);
+    } finally {
+      publicServer.closeAllConnections();
+      internal.closeAllConnections();
+      upstream.closeAllConnections();
+      await Promise.all([
+        new Promise<void>((resolve) => publicServer.close(resolve)),
+        new Promise<void>((resolve) => internal.close(resolve)),
+        new Promise<void>((resolve) => upstream.close(() => resolve())),
+      ]);
+    }
+  });
 
   it("fills checkbox, radio, and multiple-select choices through field events", async () => {
     await load(`<form>

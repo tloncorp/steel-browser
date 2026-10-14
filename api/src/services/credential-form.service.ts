@@ -278,7 +278,7 @@ type BoundFormPart = {
 type LocatedCredentialForm = {
   description: CredentialFormDescription;
   parts: BoundFormPart[];
-  prepared: boolean;
+  selected: boolean;
   timer: ReturnType<typeof setTimeout>;
 };
 const forms = new WeakMap<CDPService, LocatedCredentialForm>();
@@ -1001,7 +1001,7 @@ async function discoverBoundForm(
     const previous = forms.get(cdpService);
     const same =
       !selection &&
-      !previous?.prepared &&
+      !previous?.selected &&
       previous?.parts.length === parts.length &&
       (
         await Promise.all(
@@ -1063,7 +1063,7 @@ async function discoverBoundForm(
       void releaseForm(cdpService);
     }, 5 * 60_000);
     timer.unref();
-    forms.set(cdpService, { description, parts, timer, prepared: !!selection });
+    forms.set(cdpService, { description, parts, timer, selected: !!selection });
     if (selection) {
       for (const part of parts)
         await part.handle.evaluate((form) => {
@@ -1514,14 +1514,14 @@ export async function prepareCredentialForm(
   }
 }
 
-export async function getPreparedCredentialForm(
+export async function getBoundCredentialForm(
   cdpService: CDPService,
   formId: string,
 ): Promise<CredentialFormDescription> {
   const located = forms.get(cdpService);
   if (
     filling.has(cdpService) ||
-    !located?.prepared ||
+    !located ||
     located.description.formId !== formId ||
     !(await attachedParts(located.parts)) ||
     !(
@@ -1535,7 +1535,7 @@ export async function getPreparedCredentialForm(
     ).every(Boolean)
   )
     throw new CredentialFormError(
-      "The selected form changed or expired. Request a fresh handoff.",
+      "The secure form changed or expired. Request a fresh handoff.",
       409,
     );
   return located.description;

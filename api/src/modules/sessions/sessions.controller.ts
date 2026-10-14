@@ -9,7 +9,7 @@ import {
   fillCredentialForm,
   getCredentialContinuation,
   prepareCredentialForm,
-  getPreparedCredentialForm,
+  getBoundCredentialForm,
 } from "../../services/credential-form.service.js";
 import type { SelectedFormRequest } from "../../services/selected-form.service.js";
 import { CreateSessionRequest, SessionDetails, SessionStreamRequest } from "./sessions.schema.js";
@@ -288,7 +288,7 @@ export const handleDiscoverCredentialForm = async (
     }
     const service = server.sessionService.getCDPService(request.params.sessionId);
     const description = request.query.formId
-      ? await getPreparedCredentialForm(service, request.query.formId)
+      ? await getBoundCredentialForm(service, request.query.formId)
       : await discoverCredentialForm(service, request.query.scope ?? "sensitive");
     return reply.send(description);
   } catch (error) {

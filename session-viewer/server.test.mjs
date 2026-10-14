@@ -456,25 +456,27 @@ test("secure handoffs expose metadata and a one-use endpoint, never values or se
   assert.equal((await gateway.fill(handoff.handoffId, input)).status, 401);
 });
 
-test("selected-form links refuse a different discovered form and never broaden to automatic discovery", async (context) => {
-  const formId = "223e4567-e89b-42d3-a456-426614174000";
-  const gateway = await secureGateway(
-    context,
-    [secureField("field")],
-    "details",
-    200,
-    { formId },
-  );
-  const capability = mintCapability(
-    { sessionId, formId, expiresAt: Date.now() + 60_000 },
-    secret,
-  );
-  const handoff = await (await gateway.discover(capability)).json();
-  assert.equal(handoff.formId, formId);
-  gateway.metadata.formId = "323e4567-e89b-42d3-a456-426614174000";
-  assert.equal((await gateway.discover(capability)).status, 502);
-  assert.equal(gateway.posted.length, 0);
-});
+for (const kind of ["login", "details"]) {
+  test(`${kind} form-bound links refuse a different form and never broaden to automatic discovery`, async (context) => {
+    const formId = "223e4567-e89b-42d3-a456-426614174000";
+    const gateway = await secureGateway(
+      context,
+      [secureField("field")],
+      kind,
+      200,
+      { formId },
+    );
+    const capability = mintCapability(
+      { sessionId, formId, expiresAt: Date.now() + 60_000 },
+      secret,
+    );
+    const handoff = await (await gateway.discover(capability)).json();
+    assert.equal(handoff.formId, formId);
+    gateway.metadata.formId = "323e4567-e89b-42d3-a456-426614174000";
+    assert.equal((await gateway.discover(capability)).status, 502);
+    assert.equal(gateway.posted.length, 0);
+  });
+}
 
 test("field contracts reject wrong keys and enforce verification-code length", async (context) => {
   const gateway = await secureGateway(context, [
