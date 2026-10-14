@@ -154,10 +154,12 @@ async function activateCredentialControl(bound: JSHandle<BoundForm>): Promise<bo
       };
       const isLogin = (element: HTMLElement) =>
         /^(?:log\s*in|sign\s*in|continue|next|verify|submit)(?:\s|$)/i.test(
-          element.getAttribute("aria-label") ||
+          (
+            element.getAttribute("aria-label") ||
             dom.text(element) ||
             (element as HTMLInputElement).value ||
-            "",
+            ""
+          ).trim(),
         ) && !/\b(?:with|google|apple|facebook|register|sign\s*up)\b/i.test(dom.text(element));
       const form = scope instanceof HTMLFormElement ? scope : null;
       let candidates: HTMLElement[];

@@ -1385,6 +1385,30 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     },
   );
 
+  it.each(["text", "aria-label"])(
+    "submits a component button with whitespace in its %s",
+    async (labelSource) => {
+      await loadComponentLogin();
+      await page.$eval(
+        "login-button >>> button",
+        (button, labelSource) => {
+          const label = "\n  \t Log In \n  ";
+          if (labelSource === "aria-label") button.setAttribute("aria-label", label);
+          else button.textContent = label;
+        },
+        labelSource,
+      );
+      const target = await discoverCredentialForm(service, "all");
+      expect(
+        await fillCredentialForm(service, target, {
+          values: { f0: "fixture-user", f1: "fixture-password" },
+          submit: true,
+        }),
+      ).toEqual({ submitted: true });
+      expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+    },
+  );
+
   it("prepares both selected component fields using their accessible names", async () => {
     await loadComponentLogin();
     const target = await prepareCredentialForm(
