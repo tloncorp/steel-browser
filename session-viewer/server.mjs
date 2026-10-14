@@ -451,6 +451,14 @@ export function createGateway(config) {
     if (request.method === "POST" && prepare && SESSION_ID.test(prepare[1])) {
       try {
         const body = await readCredentialBody(request, 64 * 1024);
+        const discover = body?.discover === true;
+        if (
+          Object.hasOwn(body ?? {}, "discover") &&
+          (!discover || Object.keys(body).length !== 1)
+        )
+          return sendCredentialJson(response, 400, {
+            error: "Choose automatic discovery or selected fields.",
+          });
         const session = await upstreamJson(
           new URL(`/v1/sessions/${prepare[1]}`, upstreamOrigin),
         );
@@ -462,17 +470,27 @@ export function createGateway(config) {
           return sendCredentialJson(response, 404, {
             error: "Session not found.",
           });
-        const prepared = await upstreamJson(target, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(body),
-        });
+        const prepared = discover
+          ? await upstreamJson(
+              new URL(
+                `/v1/sessions/${prepare[1]}/credential-form?scope=all`,
+                upstreamOrigin,
+              ),
+            )
+          : await upstreamJson(target, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(body),
+            });
         if (!prepared.response.ok)
           return sendCredentialJson(response, prepared.response.status, {
             error: prepared.body?.error ?? "Form preparation failed.",
             code: prepared.body?.code,
           });
-        const { formId, expiresAt: formExpiresAt } = prepared.body ?? {};
+        const { formId } = prepared.body ?? {};
+        const formExpiresAt = discover
+          ? Date.now() + 5 * 60_000
+          : prepared.body?.expiresAt;
         if (!SESSION_ID.test(formId ?? "") || !Number.isFinite(formExpiresAt))
           return sendCredentialJson(response, 502, {
             error: "Browser returned an invalid selected form.",

@@ -1218,3 +1218,66 @@ for (const code of ["stale_ref", "session_busy"]) {
     assert.equal((await response.json()).code, code);
   });
 }
+
+test("automatic preparation issues a capability bound to the discovered form", async (context) => {
+  const formId = "223e4567-e89b-42d3-a456-426614174000";
+  const requests = [];
+  const upstream = http.createServer((request, response) => {
+    requests.push([request.method, request.url]);
+    response.setHeader("content-type", "application/json");
+    if (request.url === `/v1/sessions/${sessionId}`)
+      return response.end(
+        JSON.stringify({
+          id: sessionId,
+          status: "live",
+          createdAt: new Date().toISOString(),
+          timeout: 60_000,
+        }),
+      );
+    if (
+      request.method === "GET" &&
+      request.url === `/v1/sessions/${sessionId}/credential-form?scope=all`
+    )
+      return response.end(
+        JSON.stringify({ formId, fields: [{ purpose: "username" }] }),
+      );
+    response.writeHead(400).end("{}");
+  });
+  const upstreamPort = await listen(upstream);
+  const { internal } = createGateway({
+    secret,
+    publicOrigin: "https://viewer.test",
+    upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
+    maximumTtlMs: 900_000,
+  });
+  const port = await listen(internal);
+  context.after(() => Promise.all([close(internal), close(upstream)]));
+  const response = await fetch(
+    `http://127.0.0.1:${port}/v1/sessions/${sessionId}/credential-handoff`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ discover: true }),
+    },
+  );
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  const capability = verifyCapability(
+    new URL(body.viewer_url).pathname.slice(3),
+    secret,
+  );
+  assert.equal(capability.sessionId, sessionId);
+  assert.equal(capability.formId, formId);
+  assert.ok(body.expires_at <= Date.now() + 60_000);
+  assert.equal(requests.length, 2);
+  const ambiguous = await fetch(
+    `http://127.0.0.1:${port}/v1/sessions/${sessionId}/credential-handoff`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ discover: true, fields: [] }),
+    },
+  );
+  assert.equal(ambiguous.status, 400);
+  assert.equal(requests.length, 2);
+});
