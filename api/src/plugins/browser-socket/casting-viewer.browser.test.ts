@@ -293,47 +293,52 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     expect(target.url()).toBe(remoteUrl);
   });
 
-  it("uses the controlling viewer user agent and reloads only when it changes", async () => {
-    const phoneAgent =
-      "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1";
+  it("preserves the page identity and filled form when viewers take control or reconnect", async () => {
+    const firstAgent = "FirstDesktopViewer/1.0";
     const secondAgent = "ViewerDesktop/1.0";
+    const agent = await target.evaluate(() => navigator.userAgent);
     await target.setExtraHTTPHeaders({
       "user-agent": "SessionAgent/1.0",
       "x-viewer-test": "preserved",
     });
     await target.goto(`${origin}/fixture`);
+    await target.$eval("#draft", (el) => {
+      (el as HTMLInputElement).value = "Filled before handoff";
+    });
+    await target.evaluate(() => {
+      document.body.dataset.challenge = "pending";
+    });
     const loads = Number(await target.evaluate(() => sessionStorage.loads));
-    const phone = await viewer(390, 844, "/native", phoneAgent);
-    await ready(phone);
-    expect(upgradeAgents.at(-1)).toBe(phoneAgent);
-    await expect.poll(() => target.evaluate(() => navigator.userAgent)).toBe(phoneAgent);
-    expect(Number(await target.evaluate(() => sessionStorage.loads))).toBe(loads + 1);
-    expect(documentAgents.at(-1)).toBe(phoneAgent);
-    expect(await target.$eval("#draft", (el) => (el as HTMLInputElement).value)).toBe(
-      "Unsent login text",
-    );
     const outgoing = () =>
       target.evaluate(async () => (await fetch("/request-info", { method: "POST" })).json());
-    expect(await outgoing()).toEqual({ userAgent: phoneAgent, marker: "preserved" });
-
+    const assertPreserved = async () => {
+      expect(await target.evaluate(() => navigator.userAgent)).toBe(agent);
+      expect(Number(await target.evaluate(() => sessionStorage.loads))).toBe(loads);
+      expect(documentAgents.at(-1)).toBe("SessionAgent/1.0");
+      expect(await target.$eval("#draft", (el) => (el as HTMLInputElement).value)).toBe(
+        "Filled before handoff",
+      );
+      expect(await target.$eval("body", (body) => body.dataset.challenge)).toBe("pending");
+      expect(await outgoing()).toEqual({ userAgent: "SessionAgent/1.0", marker: "preserved" });
+    };
+    const phone = await viewer(390, 844, "/native", firstAgent);
+    await ready(phone);
+    expect(upgradeAgents.at(-1)).toBe(firstAgent);
+    await assertPreserved();
     const watching = await viewer(800, 900, "/native", secondAgent);
     await watching.waitForFunction(
       () => document.querySelector("#control")?.textContent === "Take control",
     );
-    expect(await outgoing()).toEqual({ userAgent: phoneAgent, marker: "preserved" });
+    await assertPreserved();
     await phone.close();
     await ready(watching);
-    expect(await outgoing()).toEqual({ userAgent: secondAgent, marker: "preserved" });
-    expect(Number(await target.evaluate(() => sessionStorage.loads))).toBe(loads + 2);
+    await assertPreserved();
     await watching.close();
     const reconnected = await viewer(800, 900, "/native", secondAgent);
     await ready(reconnected);
-    expect(Number(await target.evaluate(() => sessionStorage.loads))).toBe(loads + 2);
+    await assertPreserved();
     await reconnected.close();
-    // The tab keeps the adopted identity when the bot resumes it.
-    expect(await outgoing()).toEqual({ userAgent: secondAgent, marker: "preserved" });
     await target.setExtraHTTPHeaders({});
-    await target.setUserAgent(await browser.userAgent());
   });
 
   it("keeps the live agent viewport, zooms locally, bridges native input and restores Agent View", async () => {
@@ -1178,7 +1183,10 @@ describe.skipIf(!hasChrome)("adaptive streamed viewer in Chrome", () => {
     await freshTarget(1920, 1080);
     blockDocumentLoad = true;
     try {
-      const phone = await viewer(390, 844, "/native", "SlowViewer/1.0");
+      const phone = await viewer(390, 844, "/", "SlowViewer/1.0");
+      await ready(phone);
+      await phone.click("#menu-toggle");
+      await phone.click("#refresh");
       await expect.poll(() => pendingScripts.length).toBeGreaterThan(0);
       await ready(phone);
       expect(await target.evaluate(() => document.readyState)).toBe("loading");
