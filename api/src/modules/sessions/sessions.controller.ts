@@ -8,7 +8,10 @@ import {
   discoverCredentialForm,
   fillCredentialForm,
   getCredentialContinuation,
+  prepareCredentialForm,
+  getPreparedCredentialForm,
 } from "../../services/credential-form.service.js";
+import type { SelectedFormRequest } from "../../services/selected-form.service.js";
 import { CreateSessionRequest, SessionDetails, SessionStreamRequest } from "./sessions.schema.js";
 
 const sessionUrl = (url: string, sessionId: string): string => {
@@ -269,10 +272,13 @@ export const handleGetSessionLiveDetails = async (
 
 export const handleDiscoverCredentialForm = async (
   server: FastifyInstance,
-  request: FastifyRequest<{ Params: { sessionId: string } }>,
+  request: FastifyRequest<{
+    Params: { sessionId: string };
+    Querystring: { scope?: "sensitive" | "all"; formId?: string };
+  }>,
   reply: FastifyReply,
 ) => {
-  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.ip)) {
+  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress ?? "")) {
     return reply.code(404).send({ error: "Not found." });
   }
   try {
@@ -280,9 +286,10 @@ export const handleDiscoverCredentialForm = async (
     if (!session || session.status !== "live") {
       return reply.code(404).send({ error: "Session not found." });
     }
-    const description = await discoverCredentialForm(
-      server.sessionService.getCDPService(request.params.sessionId),
-    );
+    const service = server.sessionService.getCDPService(request.params.sessionId);
+    const description = request.query.formId
+      ? await getPreparedCredentialForm(service, request.query.formId)
+      : await discoverCredentialForm(service, request.query.scope ?? "sensitive");
     return reply.send(description);
   } catch (error) {
     const status = error instanceof CredentialFormError ? error.statusCode : 500;
@@ -292,18 +299,46 @@ export const handleDiscoverCredentialForm = async (
   }
 };
 
+export const handlePrepareCredentialForm = async (
+  server: FastifyInstance,
+  request: FastifyRequest<{ Params: { sessionId: string }; Body: SelectedFormRequest }>,
+  reply: FastifyReply,
+) => {
+  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress ?? ""))
+    return reply.code(404).send({ error: "Not found." });
+  try {
+    const session = server.sessionService.getSession(request.params.sessionId);
+    if (!session || session.status !== "live")
+      return reply.code(404).send({ error: "Session not found." });
+    const form = await prepareCredentialForm(
+      server.sessionService.getCDPService(request.params.sessionId),
+      request.body,
+    );
+    return reply.send({ ...form, expiresAt: Date.now() + 5 * 60_000 });
+  } catch (error) {
+    return reply.code(error instanceof CredentialFormError ? error.statusCode : 500).send({
+      code: error instanceof CredentialFormError ? error.code : undefined,
+      error:
+        error instanceof CredentialFormError ? error.message : "Secure form preparation failed.",
+    });
+  }
+};
+
 export const handleGetBrowserMonitorStatus = async (
   server: FastifyInstance,
   request: FastifyRequest<{ Params: { sessionId: string } }>,
   reply: FastifyReply,
 ) => {
-  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.ip)) {
+  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress ?? "")) {
     return reply.code(404).send({ error: "Not found." });
   }
   const session = server.sessionService.getSession(request.params.sessionId);
-  if (!session || session.status !== "live") return reply.code(404).send({ error: "Session not found." });
+  if (!session || session.status !== "live")
+    return reply.code(404).send({ error: "Session not found." });
   reply.header("Cache-Control", "no-store");
-  return reply.send(browserMonitorStatus(server.sessionService.getCDPService(request.params.sessionId)));
+  return reply.send(
+    browserMonitorStatus(server.sessionService.getCDPService(request.params.sessionId)),
+  );
 };
 
 export const handleGetCredentialContinuation = async (
@@ -311,7 +346,7 @@ export const handleGetCredentialContinuation = async (
   request: FastifyRequest<{ Params: { sessionId: string } }>,
   reply: FastifyReply,
 ) => {
-  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.ip)) {
+  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress ?? "")) {
     return reply.code(404).send({ error: "Not found." });
   }
   const session = server.sessionService.getSession(request.params.sessionId);
@@ -343,7 +378,7 @@ export const handleFillCredentialForm = async (
   }>,
   reply: FastifyReply,
 ) => {
-  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.ip)) {
+  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress ?? "")) {
     return reply.code(404).send({ error: "Not found." });
   }
   try {

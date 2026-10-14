@@ -40,15 +40,19 @@ function signPayload(encodedPayload, secret) {
     .digest("base64url");
 }
 
-export function mintCapability({ sessionId, expiresAt }, secret) {
+export function mintCapability({ sessionId, expiresAt, formId }, secret) {
   if (!SESSION_ID.test(sessionId))
     throw new Error("Cannot mint a capability for an invalid session ID.");
+  if (formId !== undefined && !SESSION_ID.test(formId))
+    throw new Error("Cannot mint a capability for an invalid form ID.");
   const payload = base64url(
     JSON.stringify({
       v: 1,
       aud: "session-viewer",
       sid: sessionId,
+      nonce: randomBytes(16).toString("base64url"),
       exp: Math.floor(expiresAt / 1000),
+      ...(formId === undefined ? {} : { form: formId }),
     }),
   );
   return `${payload}.${signPayload(payload, secret)}`;
@@ -74,12 +78,17 @@ export function verifyCapability(token, secret, now = Date.now()) {
     payload?.v !== 1 ||
     payload?.aud !== "session-viewer" ||
     !SESSION_ID.test(payload?.sid ?? "") ||
+    (payload.form !== undefined && !SESSION_ID.test(payload.form)) ||
     !Number.isSafeInteger(payload?.exp) ||
     payload.exp <= Math.floor(now / 1000)
   ) {
     return undefined;
   }
-  return { sessionId: payload.sid, expiresAt: payload.exp * 1000 };
+  return {
+    sessionId: payload.sid,
+    expiresAt: payload.exp * 1000,
+    ...(payload.form === undefined ? {} : { formId: payload.form }),
+  };
 }
 
 function cookieName(sessionId) {
@@ -321,12 +330,12 @@ function sendCredentialJson(response, status, body) {
   response.end(JSON.stringify(body));
 }
 
-async function readCredentialBody(request) {
+async function readCredentialBody(request, maximumBytes = 16 * 1024) {
   const chunks = [];
   let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > 16 * 1024) throw new Error("too_large");
+    if (size > maximumBytes) throw new Error("too_large");
     chunks.push(chunk);
   }
   try {
@@ -364,7 +373,7 @@ function writeUpgradeError(socket, status, message) {
   );
 }
 
-function proxyUpgrade(request, socket, head, target, forwardedPath) {
+function proxyUpgrade(request, socket, head, target, forwardedPath, expiresAt) {
   const upstream = net.connect(Number(target.port), target.hostname);
   upstream.once("connect", () => {
     const lines = [
@@ -374,6 +383,7 @@ function proxyUpgrade(request, socket, head, target, forwardedPath) {
       const lower = name.toLowerCase();
       if (
         lower === "host" ||
+        lower === "x-viewer-expires-at" ||
         lower === "cookie" ||
         lower.startsWith("x-forwarded-")
       )
@@ -384,7 +394,13 @@ function proxyUpgrade(request, socket, head, target, forwardedPath) {
         lines.push(`${name}: ${value}`);
       }
     }
-    lines.push(`host: ${target.host}`, "x-forwarded-proto: https", "", "");
+    lines.push(
+      `host: ${target.host}`,
+      "x-forwarded-proto: https",
+      `x-viewer-expires-at: ${expiresAt}`,
+      "",
+      "",
+    );
     upstream.write(lines.join("\r\n"));
     if (head.length) upstream.write(head);
     socket.pipe(upstream).pipe(socket);
@@ -397,15 +413,80 @@ export function createGateway(config) {
   const upstreamOrigin = new URL(config.upstreamOrigin);
   const publicOrigin = new URL(config.publicOrigin);
   const credentialHandoffs = new Map();
+  // Login steps share a viewer capability, but every fill handle is single-use.
+  // Keep each round object until expiry to fence discovery that overlaps a fill,
+  // including discovery that returns after the next login step becomes available.
+  const credentialRounds = new Map();
 
   const removeExpiredHandoffs = (now = Date.now()) => {
     for (const [id, handoff] of credentialHandoffs) {
       if (handoff.expiresAt <= now) credentialHandoffs.delete(id);
     }
+    for (const [token, round] of credentialRounds) {
+      if (round.expiresAt <= now) credentialRounds.delete(token);
+    }
   };
 
-  const internal = http.createServer((request, response) => {
+  const internal = http.createServer(async (request, response) => {
     const target = new URL(request.url ?? "/", upstreamOrigin);
+    const prepare = /^\/v1\/sessions\/([0-9a-f-]+)\/credential-handoff$/.exec(
+      target.pathname,
+    );
+    if (request.method === "POST" && prepare && SESSION_ID.test(prepare[1])) {
+      try {
+        const body = await readCredentialBody(request, 64 * 1024);
+        const session = await upstreamJson(
+          new URL(`/v1/sessions/${prepare[1]}`, upstreamOrigin),
+        );
+        if (
+          !session.response.ok ||
+          session.body?.id !== prepare[1] ||
+          session.body?.status !== "live"
+        )
+          return sendCredentialJson(response, 404, {
+            error: "Session not found.",
+          });
+        const prepared = await upstreamJson(target, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!prepared.response.ok)
+          return sendCredentialJson(response, prepared.response.status, {
+            error: prepared.body?.error ?? "Form preparation failed.",
+            code: prepared.body?.code,
+          });
+        const { formId, expiresAt: formExpiresAt } = prepared.body ?? {};
+        if (!SESSION_ID.test(formId ?? "") || !Number.isFinite(formExpiresAt))
+          return sendCredentialJson(response, 502, {
+            error: "Browser returned an invalid selected form.",
+          });
+        const expiresAt = Math.min(
+          formExpiresAt,
+          sessionExpiry(session.body, Date.now(), config.maximumTtlMs),
+        );
+        const capability = mintCapability(
+          { sessionId: prepare[1], formId, expiresAt },
+          config.secret,
+        );
+        const viewerUrl = new URL(`/s/${capability}`, publicOrigin);
+        viewerUrl.searchParams.set("clipboardBridge", "true");
+        return sendCredentialJson(response, 200, {
+          viewer_url: viewerUrl.toString(),
+          expires_at: expiresAt,
+        });
+      } catch (error) {
+        const status =
+          error?.message === "too_large"
+            ? 413
+            : error?.message === "invalid_json"
+            ? 400
+            : 502;
+        return sendCredentialJson(response, status, {
+          error: "Could not prepare the selected form.",
+        });
+      }
+    }
     const transformJson = isSessionResponse(request)
       ? (body) => rewriteSession(body, config)
       : undefined;
@@ -442,11 +523,21 @@ export function createGateway(config) {
 
     const credentialEntry = /^\/credentials\/([^/]+)$/.exec(url.pathname);
     if (request.method === "GET" && credentialEntry) {
-      const capability = verifyCapability(credentialEntry[1], config.secret);
+      const token = credentialEntry[1];
+      const capability = verifyCapability(token, config.secret);
       if (!capability)
         return sendCredentialJson(response, 401, {
           error: "Credential handoff is invalid or expired.",
         });
+
+      removeExpiredHandoffs();
+      const endRound = () =>
+        sendCredentialJson(response, 404, {
+          error:
+            "This form handoff is complete. Request a fresh handoff for another step.",
+        });
+      const round = credentialRounds.get(token);
+      if (round && round.status !== "ready") return endRound();
 
       try {
         const target = new URL(
@@ -455,11 +546,16 @@ export function createGateway(config) {
           )}/credential-form`,
           upstreamOrigin,
         );
+        if (capability.formId)
+          target.searchParams.set("formId", capability.formId);
+        else target.searchParams.set("scope", "all");
         const discovered = await upstreamJson(target);
+        // Discovery can overlap a fill. Do not publish a new handle after that
+        // fill starts, even if the upstream lookup was already in flight.
+        if (credentialRounds.get(token) !== round) return endRound();
         if (!discovered.response.ok) {
           return sendCredentialJson(response, discovered.response.status, {
-            error:
-              discovered.body?.error ?? "No live credential form is available.",
+            error: discovered.body?.error ?? "No live form is available.",
           });
         }
         const { formId, pageId, frameUrl, origin, kind } =
@@ -473,6 +569,8 @@ export function createGateway(config) {
           typeof frameUrl !== "string" ||
           typeof origin !== "string" ||
           (kind !== "login" && kind !== "details") ||
+          (capability.formId &&
+            (formId !== capability.formId || kind !== "details")) ||
           !fields
         ) {
           return sendCredentialJson(response, 502, {
@@ -501,6 +599,8 @@ export function createGateway(config) {
           Date.now() + 5 * 60_000,
         );
         credentialHandoffs.set(handoffId, {
+          token,
+          capabilityExpiresAt: capability.expiresAt,
           sessionId: capability.sessionId,
           target: { formId, pageId, frameUrl, origin, kind },
           fields,
@@ -557,14 +657,20 @@ export function createGateway(config) {
       }
 
       if (
+        handoff.expiresAt <= Date.now() ||
         handoff.status !== "ready" ||
         credentialHandoffs.get(credentialFill[1]) !== handoff
       ) {
         return sendCredentialJson(response, 401, {
-          error: "Secure form is already used or replaced.",
+          error: "Secure form is expired, already used, or replaced.",
         });
       }
       handoff.status = "submitting";
+      const round = {
+        expiresAt: handoff.capabilityExpiresAt,
+        status: "submitting",
+      };
+      credentialRounds.set(handoff.token, round);
       try {
         const target = new URL(
           `/v1/sessions/${encodeURIComponent(
@@ -582,6 +688,7 @@ export function createGateway(config) {
           }),
         });
         if (!filled.response.ok) {
+          round.status = "ready";
           credentialHandoffs.delete(credentialFill[1]);
           return sendCredentialJson(response, filled.response.status, {
             error:
@@ -589,11 +696,13 @@ export function createGateway(config) {
           });
         }
         credentialHandoffs.delete(credentialFill[1]);
+        round.status = handoff.target.kind === "login" ? "ready" : "closed";
         return sendCredentialJson(response, 200, {
           ok: true,
           submitted: filled.body?.submitted === true,
         });
       } catch {
+        round.status = "ready";
         credentialHandoffs.delete(credentialFill[1]);
         return sendCredentialJson(response, 502, {
           error: "Browser unavailable.",
@@ -685,7 +794,14 @@ export function createGateway(config) {
     } else {
       return writeUpgradeError(socket, 404, "Not Found");
     }
-    proxyUpgrade(request, socket, head, upstreamOrigin, forwardedPath);
+    proxyUpgrade(
+      request,
+      socket,
+      head,
+      upstreamOrigin,
+      forwardedPath,
+      capability.expiresAt,
+    );
   });
 
   return { internal, publicServer };
