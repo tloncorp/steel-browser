@@ -27,6 +27,26 @@ describe("casting viewport", () => {
     expect(getPageViewport(second, "page", initial)).not.toBe(viewport);
   });
 
+  it("does not mutate Agent View and recovers if reading its current viewport fails", async () => {
+    const { client, apply, notify } = setup();
+    await client.resize(request({ mode: "agent" }), apply, async () => {
+      throw new Error("closed page");
+    });
+    expect(notify).toHaveBeenCalledWith({
+      type: "viewportError",
+      message: "Could not read the agent viewport.",
+    });
+    const read = async () => ({ width: 1600, height: 1000, mobile: false });
+    await client.resize(request({ mode: "agent" }), apply, read);
+    expect(apply).not.toHaveBeenCalled();
+    await client.resize(request({ mode: "mobile", reload: true }), apply, read);
+    await client.resize(request({ mode: "agent", reload: true }), apply, read);
+    expect(apply).toHaveBeenLastCalledWith(
+      { mode: "agent", width: 1600, height: 1000, mobile: false },
+      true,
+    );
+  });
+
   it("uses exact phone dimensions for a mobile session without a reload", async () => {
     const viewport = new PageViewport({ width: 508, height: 1074, mobile: true });
     const apply = vi.fn(async () => {});
@@ -47,7 +67,7 @@ describe("casting viewport", () => {
   it("reasserts the viewport when a same-sized viewer takes control", async () => {
     const { viewport, client, apply } = setup();
     await client.resize(request(), apply);
-    client.close();
+    await client.close();
     await viewport.attach(vi.fn()).resize(request(), apply);
     expect(apply).toHaveBeenCalledTimes(2);
   });
@@ -55,7 +75,7 @@ describe("casting viewport", () => {
   it("remembers mobile mode between viewer connections", async () => {
     const { viewport, client, apply } = setup();
     await client.resize(request({ mode: "mobile", reload: true }), apply);
-    client.close();
+    await client.close();
     const notify = vi.fn();
     viewport.attach(notify).ready();
     expect(notify).toHaveBeenLastCalledWith(
@@ -120,7 +140,7 @@ describe("casting viewport", () => {
     await other.resize(request({ width: 1200 }), apply);
     expect(apply).toHaveBeenCalledTimes(1);
     expect(other.canControl()).toBe(false);
-    client.close();
+    await client.close();
     expect(notifyOther).toHaveBeenLastCalledWith(expect.objectContaining({ available: true }));
     await other.resize(request({ width: 1200 }), apply);
     expect(other.canControl()).toBe(true);
@@ -140,14 +160,38 @@ describe("casting viewport", () => {
     await Promise.resolve();
     expect(client.canControl()).toBe(false);
     const stale = client.resize(request({ width: 500 }), applying);
-    client.close();
+    const closing = client.close();
     const nextApply = vi.fn(async () => {});
     const next = viewport.attach(vi.fn()).resize(request({ width: 800 }), nextApply);
     expect(nextApply).not.toHaveBeenCalled();
     finish();
-    await Promise.all([first, stale, next]);
+    await Promise.all([first, stale, closing, next]);
     expect(applying).toHaveBeenCalledTimes(1);
     expect(nextApply).toHaveBeenCalledTimes(1);
+  });
+
+  it("finishes page preparation before granting control and serializes disconnects", async () => {
+    const { viewport, client } = setup();
+    let finish!: () => void;
+    const first = client.acquire(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const rejected = expect(first).rejects.toThrow("control_lost");
+    await Promise.resolve();
+    expect(client.canControl()).toBe(false);
+    const closing = client.close();
+    const other = viewport.attach(vi.fn());
+    const prepareOther = vi.fn(async () => {});
+    const next = other.acquire(prepareOther);
+    expect(prepareOther).not.toHaveBeenCalled();
+    finish();
+    await Promise.all([rejected, closing, next]);
+    expect(prepareOther).toHaveBeenCalledOnce();
+    expect(client.canControl()).toBe(false);
+    expect(other.canControl()).toBe(true);
   });
 
   it("keeps the queue usable after a failed browser update", async () => {
@@ -161,5 +205,31 @@ describe("casting viewport", () => {
     });
     await client.resize(request(), apply);
     expect(apply).toHaveBeenCalledTimes(1);
+  });
+  it("revokes stale input immediately and finishes cancellation before another viewer takes control", async () => {
+    const viewport = new PageViewport({ width: 1920, height: 1080, mobile: false });
+    let finish!: () => void;
+    const reset = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const first = viewport.attach(vi.fn(), reset);
+    const second = viewport.attach(vi.fn());
+    const before = await first.acquire();
+    first.assertControl(before.generation);
+    const closing = first.close();
+    expect(() => first.assertControl(before.generation)).toThrow("control_lost");
+    const acquiring = second.acquire();
+    await Promise.resolve();
+    expect(reset).toHaveBeenCalledTimes(1);
+    expect(second.canControl()).toBe(false);
+    finish();
+    await closing;
+    const after = await acquiring;
+    expect(after.generation).toBeGreaterThan(before.generation);
+    expect(second.canControl()).toBe(true);
+    expect(() => second.assertControl(before.generation)).toThrow("control_lost");
   });
 });
