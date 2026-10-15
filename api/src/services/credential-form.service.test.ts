@@ -189,6 +189,62 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     return { sessionId, secret, publicServer, internal, upstream };
   }
 
+  it("reports a completed fill while an optional passkey prompt awaits a browser action", async () => {
+    await load(`<form onsubmit="event.preventDefault();this.remove();document.getElementById('passkey').hidden=false">
+      <label>Username<input name="user" autocomplete="username" required></label>
+      <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+      <button>Sign in</button></form>
+      <section id="passkey" hidden><h1>Set up a passkey?</h1>
+      <button id="not-now" onclick="document.body.innerHTML='<h1>Account home</h1>'">Not now</button></section>`);
+    const { sessionId, publicServer, internal, upstream } = await formGateway();
+    try {
+      await new Promise<void>((resolve) => publicServer.listen(0, "127.0.0.1", resolve));
+      await new Promise<void>((resolve) => internal.listen(0, "127.0.0.1", resolve));
+      const base = `http://127.0.0.1:${publicServer.address().port}`;
+      const prepared = await fetch(
+        `http://127.0.0.1:${internal.address().port}/v1/sessions/${sessionId}/credential-handoff`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ discover: true }),
+        },
+      );
+      expect(prepared.status).toBe(200);
+      const token = new URL((await prepared.json()).viewer_url).pathname.slice(3);
+      const handoff = await (await fetch(`${base}/credentials/${token}`)).json();
+      const filled = await fetch(`${base}/credential-fills/${handoff.handoffId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          values: { f0: "fixture-user", f1: "fixture-password" },
+          submit: true,
+        }),
+      });
+      expect(filled.status).toBe(200);
+      expect(await (await fetch(`${base}/credential-result/${token}`)).json()).toEqual({
+        status: "filled",
+        submitted: true,
+      });
+      await expect(discoverCredentialForm(service)).rejects.toMatchObject({ statusCode: 404 });
+      expect(await page.$eval("#passkey", (element) => element.hidden)).toBe(false);
+      await page.click("#not-now");
+      expect(await page.$eval("h1", (element) => element.textContent)).toBe("Account home");
+      expect(await (await fetch(`${base}/credential-result/${token}`)).json()).toEqual({
+        status: "filled",
+        submitted: true,
+      });
+    } finally {
+      publicServer.closeAllConnections();
+      internal.closeAllConnections();
+      upstream.closeAllConnections();
+      await Promise.all([
+        new Promise<void>((resolve) => publicServer.close(resolve)),
+        new Promise<void>((resolve) => internal.close(resolve)),
+        new Promise<void>((resolve) => upstream.close(() => resolve())),
+      ]);
+    }
+  });
+
   it("preserves login semantics when selecting the complete username/password form", async () => {
     await page.setRequestInterception(true);
     page.on(

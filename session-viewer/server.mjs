@@ -429,10 +429,14 @@ export function createGateway(config) {
       },
     );
   };
-  // Login steps share a viewer capability, but every fill handle is single-use.
-  // Keep each round object until expiry to fence discovery that overlaps a fill,
-  // including discovery that returns after the next login step becomes available.
+  // A capability owns one secure-entry result, retained until its expiry.
+  // The round also fences discovery that overlaps a fill or cancellation.
   const credentialRounds = new Map();
+  const preparingSessions = new Set();
+  const finishRound = (round, result) => {
+    round.status = "closed";
+    round.result = result;
+  };
 
   const removeExpiredHandoffs = (now = Date.now()) => {
     for (const [id, handoff] of credentialHandoffs) {
@@ -449,6 +453,19 @@ export function createGateway(config) {
       target.pathname,
     );
     if (request.method === "POST" && prepare && SESSION_ID.test(prepare[1])) {
+      removeExpiredHandoffs();
+      if (
+        preparingSessions.has(prepare[1]) ||
+        [...credentialRounds.values()].some(
+          (round) =>
+            round.sessionId === prepare[1] && round.status !== "closed",
+        )
+      )
+        return sendCredentialJson(response, 409, {
+          error: "Secure entry is already pending.",
+          code: "session_busy",
+        });
+      preparingSessions.add(prepare[1]);
       try {
         const body = await readCredentialBody(request, 64 * 1024);
         const discover = body?.discover === true;
@@ -503,6 +520,12 @@ export function createGateway(config) {
           { sessionId: prepare[1], formId, expiresAt },
           config.secret,
         );
+        removeExpiredHandoffs();
+        credentialRounds.set(capability, {
+          sessionId: prepare[1],
+          expiresAt,
+          status: "ready",
+        });
         const viewerUrl = new URL(`/s/${capability}`, publicOrigin);
         viewerUrl.searchParams.set("clipboardBridge", "true");
         return sendCredentialJson(response, 200, {
@@ -519,6 +542,8 @@ export function createGateway(config) {
         return sendCredentialJson(response, status, {
           error: "Could not prepare the selected form.",
         });
+      } finally {
+        preparingSessions.delete(prepare[1]);
       }
     }
     const transformJson = isSessionResponse(request)
@@ -639,6 +664,28 @@ export function createGateway(config) {
       }
     }
 
+    const credentialResult = /^\/credential-result\/([^/]+)$/.exec(
+      url.pathname,
+    );
+    if (request.method === "GET" && credentialResult) {
+      const capability = verifyCapability(credentialResult[1], config.secret);
+      if (!capability || capability.owner)
+        return sendCredentialJson(response, 401, {
+          error: "Invalid secure entry.",
+        });
+      removeExpiredHandoffs();
+      const round = credentialRounds.get(credentialResult[1]);
+      if (!round)
+        return sendCredentialJson(response, 404, {
+          error: "Secure entry is unavailable.",
+        });
+      return sendCredentialJson(
+        response,
+        200,
+        round.result ?? { status: "pending" },
+      );
+    }
+
     const credentialEntry = /^\/credentials\/([^/]+)$/.exec(url.pathname);
     if (request.method === "DELETE" && credentialEntry) {
       const capability = verifyCapability(credentialEntry[1], config.secret);
@@ -646,22 +693,40 @@ export function createGateway(config) {
         return sendCredentialJson(response, 401, {
           error: "Credential handoff is invalid or expired.",
         });
+      const token = credentialEntry[1];
+      const round = credentialRounds.get(token);
+      if (round?.status === "submitting" || round?.status === "cancelling")
+        return sendCredentialJson(response, 409, {
+          error: "Secure entry is being filled.",
+        });
+      if (round?.result) return sendCredentialJson(response, 200, { ok: true });
+      const cancelled = {
+        sessionId: capability.sessionId,
+        expiresAt: capability.expiresAt,
+        status: "cancelling",
+      };
+      credentialRounds.set(token, cancelled);
+      let ownsVaultHandoff = false;
       for (const [id, handoff] of credentialHandoffs) {
-        if (handoff.sessionId === capability.sessionId)
+        if (handoff.token === token) {
+          ownsVaultHandoff ||= !!handoff.vault;
           credentialHandoffs.delete(id);
+        }
       }
-      if (config.vault) {
+      if (config.vault && ownsVaultHandoff) {
         try {
           const result = await vaultRequest("cancel", {
             sessionId: capability.sessionId,
           });
           if (!result.response.ok) throw new Error();
         } catch {
+          finishRound(cancelled, { status: "cancelled" });
           return sendCredentialJson(response, 503, {
             error: "The secure form could not be closed.",
           });
         }
       }
+      finishRound(cancelled, { status: "cancelled" });
       return sendCredentialJson(response, 200, { ok: true });
     }
     if (request.method === "GET" && credentialEntry) {
@@ -678,8 +743,16 @@ export function createGateway(config) {
           error:
             "This form handoff is complete. Request a fresh handoff for another step.",
         });
-      const round = credentialRounds.get(token);
+      let round = credentialRounds.get(token);
       if (round && round.status !== "ready") return endRound();
+      if (!round) {
+        round = {
+          sessionId: capability.sessionId,
+          expiresAt: capability.expiresAt,
+          status: "ready",
+        };
+        credentialRounds.set(token, round);
+      }
 
       try {
         const target = new URL(
@@ -694,7 +767,8 @@ export function createGateway(config) {
         const discovered = await upstreamJson(target);
         // Discovery can overlap a fill. Do not publish a new handle after that
         // fill starts, even if the upstream lookup was already in flight.
-        if (credentialRounds.get(token) !== round) return endRound();
+        if (credentialRounds.get(token) !== round || round.status !== "ready")
+          return endRound();
         if (!discovered.response.ok) {
           return sendCredentialJson(response, discovered.response.status, {
             error: discovered.body?.error ?? "No live form is available.",
@@ -838,6 +912,7 @@ export function createGateway(config) {
       handoff.status = "submitting";
       credentialHandoffs.delete(credentialFill[1]);
       const round = {
+        sessionId: handoff.sessionId,
         expiresAt: handoff.capabilityExpiresAt,
         status: "submitting",
       };
@@ -849,10 +924,20 @@ export function createGateway(config) {
             handoffId: credentialFill[1],
             submit: body.submit === true,
           });
-          round.status =
-            filled.response.ok && handoff.target.kind !== "login"
-              ? "closed"
-              : "ready";
+          finishRound(
+            round,
+            filled.response.ok && filled.body?.ok === true
+              ? {
+                  status: "filled",
+                  submitted: filled.body.submitted === true,
+                  ...(["saved", "pending", "failed"].includes(
+                    filled.body.saveStatus,
+                  )
+                    ? { saveStatus: filled.body.saveStatus }
+                    : {}),
+                }
+              : { status: "failed" },
+          );
           return sendCredentialJson(
             response,
             filled.response.status,
@@ -883,22 +968,29 @@ export function createGateway(config) {
             submit: handoff.target.kind === "login" && body.submit === true,
           }),
         });
-        if (!filled.response.ok) {
-          round.status = "ready";
+        if (!filled.response.ok || filled.body?.ok !== true) {
+          finishRound(round, { status: "failed" });
           credentialHandoffs.delete(credentialFill[1]);
-          return sendCredentialJson(response, filled.response.status, {
-            error:
-              "The form could not be filled. Reconnect before trying again.",
-          });
+          return sendCredentialJson(
+            response,
+            filled.response.ok ? 502 : filled.response.status,
+            {
+              error:
+                "The form could not be filled. Reconnect before trying again.",
+            },
+          );
         }
         credentialHandoffs.delete(credentialFill[1]);
-        round.status = handoff.target.kind === "login" ? "ready" : "closed";
+        finishRound(round, {
+          status: "filled",
+          submitted: filled.body?.submitted === true,
+        });
         return sendCredentialJson(response, 200, {
           ok: true,
           submitted: filled.body?.submitted === true,
         });
       } catch {
-        round.status = "ready";
+        finishRound(round, { status: "failed" });
         credentialHandoffs.delete(credentialFill[1]);
         return sendCredentialJson(response, 502, {
           error: "Browser unavailable.",

@@ -396,8 +396,8 @@ async function secureGateway(
     assert.equal(response.status, 200);
     return new URL((await response.json()).sessionViewerUrl).pathname.slice(3);
   };
-  const cancel = () =>
-    fetch(`${base}/credentials/${capability}`, { method: "DELETE" });
+  const cancel = (token = capability) =>
+    fetch(`${base}/credentials/${token}`, { method: "DELETE" });
   const fill = (id, body) =>
     fetch(`${base}/credential-fills/${id}`, {
       method: "POST",
@@ -743,11 +743,12 @@ test("saved-login requests require the private service and a one-use prepared ha
     404,
   );
   assert.equal(JSON.stringify(handoff).includes("owner-private"), false);
-  const nextStep = await gateway.discover();
+  const nextToken = await gateway.freshCapability();
+  const nextStep = await gateway.discover(nextToken);
   assert.equal(nextStep.status, 200);
   const abandoned = await nextStep.json();
   assert.notEqual(abandoned.handoffId, handoff.handoffId);
-  assert.equal((await gateway.cancel()).status, 200);
+  assert.equal((await gateway.cancel(nextToken)).status, 200);
   assert.deepEqual(calls.at(-1), {
     path: "/internal/vault/cancel",
     body: { sessionId },
@@ -820,7 +821,9 @@ test("manual entry discards pending save consent and unavailable vaults do not b
   ]);
   assert.equal(gateway.posted.length, 1);
   available = false;
-  const withoutVault = await (await gateway.discover()).json();
+  const withoutVault = await (
+    await gateway.discover(await gateway.freshCapability())
+  ).json();
   assert.equal(withoutVault.vault, undefined);
   assert.equal(
     (
@@ -979,7 +982,7 @@ test("session reads mint distinct capabilities with the same session deadline", 
   );
 });
 
-test("login identifier, password, and code steps share one link with single-use fill handles", async (context) => {
+test("login identifier, password, and code steps each require a fresh handoff", async (context) => {
   let discoveryStatus = 200;
   const gateway = await secureGateway(
     context,
@@ -996,7 +999,9 @@ test("login identifier, password, and code steps share one link with single-use 
   ].entries()) {
     gateway.metadata.formId = `form-${index}`;
     gateway.metadata.fields = [secureField(purpose)];
-    const response = await gateway.discover();
+    const token =
+      index === 0 ? gateway.capability : await gateway.freshCapability();
+    const response = await gateway.discover(token);
     assert.equal(response.status, 200);
     const handoff = await response.json();
     assert.equal(handoff.formId, `form-${index}`);
@@ -1013,8 +1018,9 @@ test("login identifier, password, and code steps share one link with single-use 
     assert.equal(gateway.posted.at(-1).target.formId, handoff.formId);
     assert.deepEqual(gateway.posted.at(-1).values, input.values);
     assert.equal((await gateway.fill(handoff.handoffId, input)).status, 401);
+    assert.equal((await gateway.discover(token)).status, 404);
   }
-  // Propagate the absence of a supported form so the app can return to the bot.
+  // A completed request stays closed regardless of the current page.
   discoveryStatus = 404;
   assert.equal((await gateway.discover()).status, 404);
   assert.equal(gateway.posted.length, 3);
@@ -1053,7 +1059,7 @@ test("details fills end discovery on that link and a fresh bot handoff opens the
   assert.equal(gateway.posted.length, 1);
 });
 
-test("a failed fill allows fresh discovery on the same link without replaying values", async (context) => {
+test("a failed fill closes its request and requires a fresh handoff", async (context) => {
   const gateway = await secureGateway(
     context,
     [secureField("username")],
@@ -1065,7 +1071,8 @@ test("a failed fill allows fresh discovery on the same link without replaying va
     (await gateway.fill(first.handoffId, { values: { f0: "private" } })).status,
     500,
   );
-  const retry = await gateway.discover();
+  assert.equal((await gateway.discover()).status, 404);
+  const retry = await gateway.discover(await gateway.freshCapability());
   assert.equal(retry.status, 200);
   assert.notEqual((await retry.json()).handoffId, first.handoffId);
   assert.equal(gateway.posted.length, 1);
@@ -1126,9 +1133,10 @@ for (const kind of ["login", "details"]) {
       }
       releaseFill.resolve();
       assert.equal((await pendingFill).status, 200);
-      const response = await gateway.discover();
-      assert.equal(response.status, kind === "login" ? 200 : 404);
-      if (kind === "login") next = await response.json();
+      assert.equal((await gateway.discover()).status, 404);
+      const response = await gateway.discover(await gateway.freshCapability());
+      assert.equal(response.status, 200);
+      next = await response.json();
       if (!discoveryFinishesFirst) {
         releaseDiscovery.resolve();
         assert.equal((await pendingDiscovery).status, 404);
@@ -1151,7 +1159,7 @@ for (const kind of ["login", "details"]) {
 }
 
 for (const submit of [true, false]) {
-  test(`a login form that remains allows fresh input without replay (submit=${submit})`, async (context) => {
+  test(`a login form that remains requires a fresh request without replay (submit=${submit})`, async (context) => {
     const gateway = await secureGateway(context, [secureField("username")]);
     const handoff = await (await gateway.discover()).json();
     const filled = await gateway.fill(handoff.handoffId, {
@@ -1159,7 +1167,8 @@ for (const submit of [true, false]) {
       submit,
     });
     assert.deepEqual(await filled.json(), { ok: true, submitted: submit });
-    const response = await gateway.discover();
+    assert.equal((await gateway.discover()).status, 404);
+    const response = await gateway.discover(await gateway.freshCapability());
     assert.equal(response.status, 200);
     const next = await response.json();
     assert.equal(next.formId, handoff.formId);
@@ -1246,14 +1255,17 @@ test("automatic preparation issues a capability bound to the discovered form", a
     response.writeHead(400).end("{}");
   });
   const upstreamPort = await listen(upstream);
-  const { internal } = createGateway({
+  const { internal, publicServer } = createGateway({
     secret,
     publicOrigin: "https://viewer.test",
     upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
     maximumTtlMs: 900_000,
   });
   const port = await listen(internal);
-  context.after(() => Promise.all([close(internal), close(upstream)]));
+  const publicPort = await listen(publicServer);
+  context.after(() =>
+    Promise.all([close(internal), close(publicServer), close(upstream)]),
+  );
   const response = await fetch(
     `http://127.0.0.1:${port}/v1/sessions/${sessionId}/credential-handoff`,
     {
@@ -1280,6 +1292,158 @@ test("automatic preparation issues a capability bound to the discovered form", a
       body: JSON.stringify({ discover: true, fields: [] }),
     },
   );
-  assert.equal(ambiguous.status, 400);
+  assert.equal(ambiguous.status, 409);
   assert.equal(requests.length, 2);
+  const token = new URL(body.viewer_url).pathname.slice(3);
+  const resultUrl = `http://127.0.0.1:${publicPort}/credential-result/${token}`;
+  assert.deepEqual(await (await fetch(resultUrl)).json(), {
+    status: "pending",
+  });
+  await fetch(`http://127.0.0.1:${publicPort}/credentials/${token}`, {
+    method: "DELETE",
+  });
+  assert.deepEqual(await (await fetch(resultUrl)).json(), {
+    status: "cancelled",
+  });
+});
+
+test("a filled handoff reports its result without discovering the next page", async (context) => {
+  let scans = 0;
+  const gateway = await secureGateway(
+    context,
+    [secureField("username")],
+    "login",
+    200,
+    {
+      discover: () => (++scans === 1 ? 200 : 500),
+    },
+  );
+  const handoff = await (await gateway.discover()).json();
+  const resultUrl = `${gateway.base}/credential-result/${gateway.capability}`;
+  assert.deepEqual(await (await fetch(resultUrl)).json(), {
+    status: "pending",
+  });
+  await gateway.fill(handoff.handoffId, {
+    values: { f0: "private" },
+    submit: true,
+  });
+  const expected = { status: "filled", submitted: true };
+  assert.deepEqual(await (await fetch(resultUrl)).json(), expected);
+  assert.equal((await gateway.discover()).status, 404);
+  assert.equal(scans, 1);
+  await gateway.cancel();
+  assert.deepEqual(await (await fetch(resultUrl)).json(), expected);
+});
+
+test("cancellation and fill failure report fixed results without input or upstream errors", async (context) => {
+  const canceled = await secureGateway(context, [secureField("username")]);
+  const first = await (await canceled.discover()).json();
+  await canceled.cancel();
+  assert.deepEqual(
+    await (
+      await fetch(`${canceled.base}/credential-result/${canceled.capability}`)
+    ).json(),
+    { status: "cancelled" },
+  );
+  assert.equal(
+    (await canceled.fill(first.handoffId, { values: { f0: "private" } }))
+      .status,
+    401,
+  );
+  const failed = await secureGateway(
+    context,
+    [secureField("username")],
+    "login",
+    500,
+  );
+  const second = await (await failed.discover()).json();
+  await failed.fill(second.handoffId, { values: { f0: "private" } });
+  assert.deepEqual(
+    await (
+      await fetch(`${failed.base}/credential-result/${failed.capability}`)
+    ).json(),
+    { status: "failed" },
+  );
+  assert.equal((await failed.discover()).status, 404);
+});
+
+test("a disconnected app does not interrupt result delivery", async (context) => {
+  let finish;
+  let started;
+  const entered = new Promise((resolve) => {
+    started = resolve;
+  });
+  const gateway = await secureGateway(
+    context,
+    [secureField("username")],
+    "login",
+    200,
+    {
+      fill: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+          started();
+        }),
+    },
+  );
+  const handoff = await (await gateway.discover()).json();
+  const controller = new AbortController();
+  const filling = fetch(
+    `${gateway.base}/credential-fills/${handoff.handoffId}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ values: { f0: "private" }, submit: true }),
+      signal: controller.signal,
+    },
+  ).catch((error) => error);
+  await entered;
+  controller.abort();
+  assert.equal((await filling).name, "AbortError");
+  finish();
+  let result;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    result = await (
+      await fetch(`${gateway.base}/credential-result/${gateway.capability}`)
+    ).json();
+    if (result.status !== "pending") break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.deepEqual(result, { status: "filled", submitted: true });
+  assert.equal(gateway.posted.length, 1);
+});
+
+test("cancel cannot overwrite an in-flight fill result", async (context) => {
+  let finish;
+  let started;
+  const entered = new Promise((resolve) => {
+    started = resolve;
+  });
+  const gateway = await secureGateway(
+    context,
+    [secureField("username")],
+    "login",
+    200,
+    {
+      fill: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+          started();
+        }),
+    },
+  );
+  const handoff = await (await gateway.discover()).json();
+  const filling = gateway.fill(handoff.handoffId, {
+    values: { f0: "private" },
+  });
+  await entered;
+  assert.equal((await gateway.cancel()).status, 409);
+  finish();
+  assert.equal((await filling).status, 200);
+  assert.deepEqual(
+    await (
+      await fetch(`${gateway.base}/credential-result/${gateway.capability}`)
+    ).json(),
+    { status: "filled", submitted: false },
+  );
 });
