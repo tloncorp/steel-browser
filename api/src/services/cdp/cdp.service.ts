@@ -961,7 +961,7 @@ export class CDPService extends EventEmitter {
           defaultViewport: null,
           args: launchArgs,
           executablePath: this.chromeExecPath,
-          ignoreDefaultArgs: ["--enable-automation"],
+          ignoreDefaultArgs: uniq(["--enable-automation", ...env.FILTER_CHROME_ARGS]),
           timeout: 0,
           env: {
             HOME: os.userInfo().homedir,

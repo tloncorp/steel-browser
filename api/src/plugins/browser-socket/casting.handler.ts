@@ -1,7 +1,6 @@
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import type { Browser, CDPSession, Page } from "puppeteer-core";
-import type { CdpFrame } from "puppeteer-core/internal/cdp/Frame.js";
 import WebSocket, { type Server } from "ws";
 import { z } from "zod";
 import type { SessionService } from "../../services/session.service.js";
@@ -76,7 +75,6 @@ export async function handleCastSession(
     let viewport: ReturnType<PageViewport["attach"]> | undefined;
     let viewportGeneration = 0;
     let frameReady = false;
-    let reloadForViewer = false;
     let awaitingNavigation = false;
     let bounds = { width: 0, height: 0 };
     let expected = { width: 0, height: 0 };
@@ -210,31 +208,7 @@ export async function handleCastSession(
       const message = envelope.parse(data);
       if (message.type === "control") {
         if (data.action === "acquire") {
-          await viewport?.acquire(async () => {
-            const userAgent = request.headers["user-agent"];
-            if (
-              !page ||
-              closed ||
-              typeof userAgent !== "string" ||
-              !userAgent.trim() ||
-              userAgent.length > 2048
-            )
-              return;
-            // A fingerprint can pin an HTTP User-Agent independently of the CDP
-            // override. Puppeteer's CDP network manager holds those extra headers.
-            const headers = {
-              ...(
-                page.mainFrame() as unknown as CdpFrame
-              )._frameManager.networkManager.extraHTTPHeaders(),
-            };
-            const previousAgent =
-              headers["user-agent"] ?? (await page.evaluate(() => navigator.userAgent));
-            if (closed) return;
-            delete headers["user-agent"];
-            await page.setExtraHTTPHeaders(headers);
-            await page.setUserAgent(userAgent);
-            reloadForViewer = previousAgent !== userAgent;
-          });
+          await viewport?.acquire();
           if (closed) await viewport?.close();
         } else if (data.action === "release") {
           viewport?.assertControl(message.generation);
@@ -251,7 +225,7 @@ export async function handleCastSession(
         return;
       }
       if (message.type === "viewport") {
-        let reloadPage = reloadForViewer;
+        let reloadPage = false;
         frameReady = false;
         viewportGeneration++;
         frames.clear();
@@ -281,11 +255,10 @@ export async function handleCastSession(
           readAgent,
         );
         if (reloadPage) {
-          // Apply identity and layout together. Navigation completion must not
-          // block control; a frame from the committed document enables input.
+          // Navigation completion must not block control; a frame from the
+          // committed document enables input.
           awaitingNavigation = true;
           await client.send("Page.reload");
-          reloadForViewer = false;
         }
         await client.send("Page.stopScreencast");
         await client.send("Page.startScreencast", {

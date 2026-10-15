@@ -107,7 +107,24 @@ main() {
     
     # Set required environment variables
     export CDP_REDIRECT_PORT=9223
-    export DISPLAY=:10
+    export DISPLAY=${DISPLAY:-:10}
+    case "${CHROME_HEADLESS:-true}" in
+        true|1) ;;
+        *)
+            log "Starting virtual display $DISPLAY..."
+            Xvfb "$DISPLAY" -screen 0 1920x1080x24 -nolisten tcp &
+            display_pid=$!
+            display_attempt=0
+            until xset -display "$DISPLAY" q >/dev/null 2>&1; do
+                display_attempt=$((display_attempt + 1))
+                if ! kill -0 "$display_pid" 2>/dev/null || [ "$display_attempt" -ge 10 ]; then
+                    echo "ERROR: Virtual display $DISPLAY failed to start" >&2
+                    exit 1
+                fi
+                sleep 1
+            done
+            ;;
+    esac
     
     # Log environment state
     log "Environment configuration:"
