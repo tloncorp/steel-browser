@@ -40,7 +40,10 @@ function signPayload(encodedPayload, secret) {
     .digest("base64url");
 }
 
-export function mintCapability({ sessionId, expiresAt, formId }, secret) {
+export function mintCapability(
+  { sessionId, expiresAt, formId, owner = false },
+  secret,
+) {
   if (!SESSION_ID.test(sessionId))
     throw new Error("Cannot mint a capability for an invalid session ID.");
   if (formId !== undefined && !SESSION_ID.test(formId))
@@ -48,7 +51,7 @@ export function mintCapability({ sessionId, expiresAt, formId }, secret) {
   const payload = base64url(
     JSON.stringify({
       v: 1,
-      aud: "session-viewer",
+      aud: owner ? "owner-viewer" : "session-viewer",
       sid: sessionId,
       nonce: randomBytes(16).toString("base64url"),
       exp: Math.floor(expiresAt / 1000),
@@ -76,7 +79,7 @@ export function verifyCapability(token, secret, now = Date.now()) {
   }
   if (
     payload?.v !== 1 ||
-    payload?.aud !== "session-viewer" ||
+    !["session-viewer", "owner-viewer"].includes(payload?.aud) ||
     !SESSION_ID.test(payload?.sid ?? "") ||
     (payload.form !== undefined && !SESSION_ID.test(payload.form)) ||
     !Number.isSafeInteger(payload?.exp) ||
@@ -85,6 +88,7 @@ export function verifyCapability(token, secret, now = Date.now()) {
     return undefined;
   }
   return {
+    ...(payload.aud === "owner-viewer" ? { owner: true } : {}),
     sessionId: payload.sid,
     expiresAt: payload.exp * 1000,
     ...(payload.form === undefined ? {} : { formId: payload.form }),
@@ -136,17 +140,13 @@ export function rewriteSession(record, config, now = Date.now()) {
   const entryUrl = new URL(`/s/${capability}`, config.publicOrigin);
   entryUrl.searchParams.set("clipboardBridge", "true");
   const entry = entryUrl.toString();
-  const cdp = new URL("/cdp", config.publicOrigin);
-  cdp.protocol = cdp.protocol === "https:" ? "wss:" : "ws:";
-  cdp.searchParams.set("sessionId", record.id);
-  cdp.searchParams.set("cap", capability);
 
   return {
     ...record,
     sessionViewerUrl: entry,
     debugUrl: entry,
     debuggerUrl: entry,
-    websocketUrl: cdp.toString(),
+    websocketUrl: "",
   };
 }
 
@@ -330,7 +330,7 @@ function sendCredentialJson(response, status, body) {
   response.end(JSON.stringify(body));
 }
 
-async function readCredentialBody(request, maximumBytes = 16 * 1024) {
+async function readCredentialBody(request, maximumBytes = 64 * 1024) {
   const chunks = [];
   let size = 0;
   for await (const chunk of request) {
@@ -413,10 +413,30 @@ export function createGateway(config) {
   const upstreamOrigin = new URL(config.upstreamOrigin);
   const publicOrigin = new URL(config.publicOrigin);
   const credentialHandoffs = new Map();
-  // Login steps share a viewer capability, but every fill handle is single-use.
-  // Keep each round object until expiry to fence discovery that overlaps a fill,
-  // including discovery that returns after the next login step becomes available.
+  const vaultRequest = async (operation, body) => {
+    if (!config.vault) throw new Error("Vault unavailable.");
+    return upstreamJson(
+      new URL(`/internal/vault/${operation}`, config.vault.origin),
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-browser-vault-service": config.vault.token,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(20_000),
+        redirect: "error",
+      },
+    );
+  };
+  // A capability owns one secure-entry result, retained until its expiry.
+  // The round also fences discovery that overlaps a fill or cancellation.
   const credentialRounds = new Map();
+  const preparingSessions = new Set();
+  const finishRound = (round, result) => {
+    round.status = "closed";
+    round.result = result;
+  };
 
   const removeExpiredHandoffs = (now = Date.now()) => {
     for (const [id, handoff] of credentialHandoffs) {
@@ -433,8 +453,29 @@ export function createGateway(config) {
       target.pathname,
     );
     if (request.method === "POST" && prepare && SESSION_ID.test(prepare[1])) {
+      removeExpiredHandoffs();
+      if (
+        preparingSessions.has(prepare[1]) ||
+        [...credentialRounds.values()].some(
+          (round) =>
+            round.sessionId === prepare[1] && round.status !== "closed",
+        )
+      )
+        return sendCredentialJson(response, 409, {
+          error: "Secure entry is already pending.",
+          code: "session_busy",
+        });
+      preparingSessions.add(prepare[1]);
       try {
         const body = await readCredentialBody(request, 64 * 1024);
+        const discover = body?.discover === true;
+        if (
+          Object.hasOwn(body ?? {}, "discover") &&
+          (!discover || Object.keys(body).length !== 1)
+        )
+          return sendCredentialJson(response, 400, {
+            error: "Choose automatic discovery or selected fields.",
+          });
         const session = await upstreamJson(
           new URL(`/v1/sessions/${prepare[1]}`, upstreamOrigin),
         );
@@ -446,17 +487,27 @@ export function createGateway(config) {
           return sendCredentialJson(response, 404, {
             error: "Session not found.",
           });
-        const prepared = await upstreamJson(target, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(body),
-        });
+        const prepared = discover
+          ? await upstreamJson(
+              new URL(
+                `/v1/sessions/${prepare[1]}/credential-form?scope=all`,
+                upstreamOrigin,
+              ),
+            )
+          : await upstreamJson(target, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(body),
+            });
         if (!prepared.response.ok)
           return sendCredentialJson(response, prepared.response.status, {
             error: prepared.body?.error ?? "Form preparation failed.",
             code: prepared.body?.code,
           });
-        const { formId, expiresAt: formExpiresAt } = prepared.body ?? {};
+        const { formId } = prepared.body ?? {};
+        const formExpiresAt = discover
+          ? Date.now() + 5 * 60_000
+          : prepared.body?.expiresAt;
         if (!SESSION_ID.test(formId ?? "") || !Number.isFinite(formExpiresAt))
           return sendCredentialJson(response, 502, {
             error: "Browser returned an invalid selected form.",
@@ -469,6 +520,12 @@ export function createGateway(config) {
           { sessionId: prepare[1], formId, expiresAt },
           config.secret,
         );
+        removeExpiredHandoffs();
+        credentialRounds.set(capability, {
+          sessionId: prepare[1],
+          expiresAt,
+          status: "ready",
+        });
         const viewerUrl = new URL(`/s/${capability}`, publicOrigin);
         viewerUrl.searchParams.set("clipboardBridge", "true");
         return sendCredentialJson(response, 200, {
@@ -485,6 +542,8 @@ export function createGateway(config) {
         return sendCredentialJson(response, status, {
           error: "Could not prepare the selected form.",
         });
+      } finally {
+        preparingSessions.delete(prepare[1]);
       }
     }
     const transformJson = isSessionResponse(request)
@@ -507,13 +566,16 @@ export function createGateway(config) {
     if (
       request.method === "OPTIONS" &&
       (url.pathname.startsWith("/credentials/") ||
-        url.pathname.startsWith("/credential-fills/"))
+        url.pathname.startsWith("/credential-fills/") ||
+        url.pathname.startsWith("/credential-vault/") ||
+        url.pathname.startsWith("/vault/") ||
+        url.pathname === "/viewer-authorize")
     ) {
       response.writeHead(
         204,
         credentialApiHeaders({
           "access-control-allow-headers": "content-type",
-          "access-control-allow-methods": "GET, POST, OPTIONS",
+          "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
           "access-control-max-age": "600",
         }),
       );
@@ -521,7 +583,152 @@ export function createGateway(config) {
       return;
     }
 
+    if (request.method === "POST" && url.pathname === "/viewer-authorize") {
+      try {
+        const body = await readCredentialBody(request);
+        const capability = verifyCapability(body.capability, config.secret);
+        if (!capability)
+          return sendCredentialJson(response, 401, {
+            error: "Invalid browser session.",
+          });
+        if (config.vault) {
+          const result = await vaultRequest("authorize-viewer", {
+            sessionId: capability.sessionId,
+            planet: body.planet,
+            ownerToken: body.ownerToken,
+          });
+          if (!result.response.ok)
+            return sendCredentialJson(response, 403, {
+              error: "Owner authorization is required.",
+            });
+        }
+        const token = mintCapability(
+          { ...capability, owner: true },
+          config.secret,
+        );
+        return sendCredentialJson(response, 200, {
+          viewerUrl: new URL(
+            `/s/${token}?clipboardBridge=true`,
+            publicOrigin,
+          ).toString(),
+        });
+      } catch {
+        return sendCredentialJson(response, 503, {
+          error: "Viewer authorization is unavailable.",
+        });
+      }
+    }
+
+    const ownerOperation = /^\/vault\/(list|delete|permission)$/.exec(
+      url.pathname,
+    );
+    const vaultHandoff = /^\/credential-vault\/([A-Za-z0-9_-]{40,64})$/.exec(
+      url.pathname,
+    );
+    if (request.method === "POST" && (ownerOperation || vaultHandoff)) {
+      removeExpiredHandoffs();
+      const handoff = vaultHandoff && credentialHandoffs.get(vaultHandoff[1]);
+      if (
+        !config.vault ||
+        (vaultHandoff && (!handoff?.vault || handoff.status !== "ready"))
+      )
+        return sendCredentialJson(response, 404, {
+          error: "Saved logins are unavailable.",
+        });
+      try {
+        const body = await readCredentialBody(request);
+        const result = await vaultRequest(
+          ownerOperation?.[1] ?? "authorize",
+          vaultHandoff
+            ? {
+                planet: body.planet,
+                ownerToken: body.ownerToken,
+                handoffId: vaultHandoff[1],
+              }
+            : body,
+        );
+        return sendCredentialJson(
+          response,
+          result.response.status,
+          result.response.ok
+            ? result.body
+            : {
+                error:
+                  "Saved logins could not be accessed. Reconnect and try again.",
+              },
+        );
+      } catch {
+        return sendCredentialJson(response, 503, {
+          error: "Saved logins are unavailable.",
+        });
+      }
+    }
+
+    const credentialResult = /^\/credential-result\/([^/]+)$/.exec(
+      url.pathname,
+    );
+    if (request.method === "GET" && credentialResult) {
+      const capability = verifyCapability(credentialResult[1], config.secret);
+      if (!capability || capability.owner)
+        return sendCredentialJson(response, 401, {
+          error: "Invalid secure entry.",
+        });
+      removeExpiredHandoffs();
+      const round = credentialRounds.get(credentialResult[1]);
+      if (!round)
+        return sendCredentialJson(response, 404, {
+          error: "Secure entry is unavailable.",
+        });
+      return sendCredentialJson(
+        response,
+        200,
+        round.result ?? { status: "pending" },
+      );
+    }
+
     const credentialEntry = /^\/credentials\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "DELETE" && credentialEntry) {
+      const capability = verifyCapability(credentialEntry[1], config.secret);
+      if (!capability)
+        return sendCredentialJson(response, 401, {
+          error: "Credential handoff is invalid or expired.",
+        });
+      const token = credentialEntry[1];
+      const round = credentialRounds.get(token);
+      if (round?.status === "submitting" || round?.status === "cancelling")
+        return sendCredentialJson(response, 409, {
+          error: "Secure entry is being filled.",
+        });
+      if (round?.result) return sendCredentialJson(response, 200, { ok: true });
+      const cancelled = {
+        sessionId: capability.sessionId,
+        expiresAt: capability.expiresAt,
+        status: "cancelling",
+      };
+      credentialRounds.set(token, cancelled);
+      let ownsVaultHandoff = false;
+      for (const [id, handoff] of credentialHandoffs) {
+        if (handoff.token === token) {
+          ownsVaultHandoff ||= !!handoff.vault;
+          credentialHandoffs.delete(id);
+        }
+      }
+      if (config.vault && ownsVaultHandoff) {
+        try {
+          const result = await vaultRequest("cancel", {
+            sessionId: capability.sessionId,
+          });
+          if (!result.response.ok) throw new Error();
+        } catch {
+          finishRound(cancelled, { status: "cancelled" });
+          return sendCredentialJson(response, 503, {
+            error: "The secure form could not be closed.",
+          });
+        }
+      }
+      finishRound(cancelled, { status: "cancelled" });
+      return sendCredentialJson(response, 200, { ok: true });
+    }
     if (request.method === "GET" && credentialEntry) {
       const token = credentialEntry[1];
       const capability = verifyCapability(token, config.secret);
@@ -536,8 +743,16 @@ export function createGateway(config) {
           error:
             "This form handoff is complete. Request a fresh handoff for another step.",
         });
-      const round = credentialRounds.get(token);
+      let round = credentialRounds.get(token);
       if (round && round.status !== "ready") return endRound();
+      if (!round) {
+        round = {
+          sessionId: capability.sessionId,
+          expiresAt: capability.expiresAt,
+          status: "ready",
+        };
+        credentialRounds.set(token, round);
+      }
 
       try {
         const target = new URL(
@@ -552,7 +767,8 @@ export function createGateway(config) {
         const discovered = await upstreamJson(target);
         // Discovery can overlap a fill. Do not publish a new handle after that
         // fill starts, even if the upstream lookup was already in flight.
-        if (credentialRounds.get(token) !== round) return endRound();
+        if (credentialRounds.get(token) !== round || round.status !== "ready")
+          return endRound();
         if (!discovered.response.ok) {
           return sendCredentialJson(response, discovered.response.status, {
             error: discovered.body?.error ?? "No live form is available.",
@@ -569,8 +785,7 @@ export function createGateway(config) {
           typeof frameUrl !== "string" ||
           typeof origin !== "string" ||
           (kind !== "login" && kind !== "details") ||
-          (capability.formId &&
-            (formId !== capability.formId || kind !== "details")) ||
+          (capability.formId && formId !== capability.formId) ||
           !fields
         ) {
           return sendCredentialJson(response, 502, {
@@ -598,7 +813,7 @@ export function createGateway(config) {
           capability.expiresAt,
           Date.now() + 5 * 60_000,
         );
-        credentialHandoffs.set(handoffId, {
+        const handoff = {
           token,
           capabilityExpiresAt: capability.expiresAt,
           sessionId: capability.sessionId,
@@ -606,7 +821,22 @@ export function createGateway(config) {
           fields,
           expiresAt,
           status: "ready",
-        });
+        };
+        credentialHandoffs.set(handoffId, handoff);
+        if (config.vault && discovered.body.vaultEligible === true) {
+          try {
+            const prepared = await vaultRequest("prepare", {
+              sessionId: capability.sessionId,
+              handoffId,
+              target: handoff.target,
+              expiresAt,
+            });
+            if (prepared.response.ok && prepared.body?.available === true)
+              handoff.vault = prepared.body;
+          } catch {
+            /* Manual entry remains available when the vault is unreachable. */
+          }
+        }
         return sendCredentialJson(response, 200, {
           handoffId,
           origin,
@@ -614,6 +844,7 @@ export function createGateway(config) {
           formId,
           fields,
           expiresAt,
+          ...(handoff.vault ? { vault: handoff.vault } : {}),
         });
       } catch {
         return sendCredentialJson(response, 502, {
@@ -648,8 +879,21 @@ export function createGateway(config) {
       }
       if (
         (body.submit !== undefined && typeof body.submit !== "boolean") ||
-        Object.keys(body).some((key) => key !== "values" && key !== "submit") ||
-        !validValues(handoff.fields, body.values)
+        Object.keys(body).some(
+          (key) =>
+            ![
+              "values",
+              "submit",
+              "grant",
+              "save",
+              "use",
+              "allowAutomatic",
+            ].includes(key),
+        ) ||
+        (body.use
+          ? body.values !== undefined
+          : !validValues(handoff.fields, body.values)) ||
+        ((body.save || body.use || body.grant) && !handoff.vault)
       ) {
         return sendCredentialJson(response, 400, {
           error: "Secure form submission is invalid.",
@@ -666,12 +910,49 @@ export function createGateway(config) {
         });
       }
       handoff.status = "submitting";
+      credentialHandoffs.delete(credentialFill[1]);
       const round = {
+        sessionId: handoff.sessionId,
         expiresAt: handoff.capabilityExpiresAt,
         status: "submitting",
       };
       credentialRounds.set(handoff.token, round);
       try {
+        if (body.save || body.use || body.grant) {
+          const filled = await vaultRequest("fill", {
+            ...body,
+            handoffId: credentialFill[1],
+            submit: body.submit === true,
+          });
+          finishRound(
+            round,
+            filled.response.ok && filled.body?.ok === true
+              ? {
+                  status: "filled",
+                  submitted: filled.body.submitted === true,
+                  ...(["saved", "pending", "failed"].includes(
+                    filled.body.saveStatus,
+                  )
+                    ? { saveStatus: filled.body.saveStatus }
+                    : {}),
+                }
+              : { status: "failed" },
+          );
+          return sendCredentialJson(
+            response,
+            filled.response.status,
+            filled.response.ok
+              ? filled.body
+              : {
+                  error:
+                    "The form could not be filled. Reconnect before trying again.",
+                },
+          );
+        }
+        if (handoff.vault)
+          await vaultRequest("discard", { handoffId: credentialFill[1] }).catch(
+            () => {},
+          );
         const target = new URL(
           `/v1/sessions/${encodeURIComponent(
             handoff.sessionId,
@@ -687,22 +968,29 @@ export function createGateway(config) {
             submit: handoff.target.kind === "login" && body.submit === true,
           }),
         });
-        if (!filled.response.ok) {
-          round.status = "ready";
+        if (!filled.response.ok || filled.body?.ok !== true) {
+          finishRound(round, { status: "failed" });
           credentialHandoffs.delete(credentialFill[1]);
-          return sendCredentialJson(response, filled.response.status, {
-            error:
-              "The form could not be filled. Reconnect before trying again.",
-          });
+          return sendCredentialJson(
+            response,
+            filled.response.ok ? 502 : filled.response.status,
+            {
+              error:
+                "The form could not be filled. Reconnect before trying again.",
+            },
+          );
         }
         credentialHandoffs.delete(credentialFill[1]);
-        round.status = handoff.target.kind === "login" ? "ready" : "closed";
+        finishRound(round, {
+          status: "filled",
+          submitted: filled.body?.submitted === true,
+        });
         return sendCredentialJson(response, 200, {
           ok: true,
           submitted: filled.body?.submitted === true,
         });
       } catch {
-        round.status = "ready";
+        finishRound(round, { status: "failed" });
         credentialHandoffs.delete(credentialFill[1]);
         return sendCredentialJson(response, 502, {
           error: "Browser unavailable.",
@@ -713,7 +1001,7 @@ export function createGateway(config) {
     const entry = /^\/s\/([^/]+)$/.exec(url.pathname);
     if (request.method === "GET" && entry) {
       const capability = verifyCapability(entry[1], config.secret);
-      if (!capability)
+      if (!capability || (config.vault && !capability.owner))
         return sendPublicError(
           response,
           401,
@@ -748,7 +1036,11 @@ export function createGateway(config) {
         tokenForSession(request, url, sessionId),
         config.secret,
       );
-      if (!capability || capability.sessionId !== sessionId) {
+      if (
+        !capability ||
+        capability.sessionId !== sessionId ||
+        (config.vault && !capability.owner)
+      ) {
         return sendPublicError(
           response,
           401,
@@ -778,13 +1070,15 @@ export function createGateway(config) {
       tokenForSession(request, url, sessionId),
       config.secret,
     );
-    if (!capability || capability.sessionId !== sessionId)
+    if (
+      !capability ||
+      capability.sessionId !== sessionId ||
+      (config.vault && !capability.owner)
+    )
       return writeUpgradeError(socket, 401, "Unauthorized");
 
     let forwardedPath;
-    if (url.pathname === "/cdp") {
-      forwardedPath = `/?sessionId=${encodeURIComponent(sessionId)}`;
-    } else if (url.pathname === "/v1/sessions/cast") {
+    if (url.pathname === "/v1/sessions/cast") {
       const query = new URLSearchParams({ sessionId });
       for (const name of ["pageId", "pageIndex", "tabInfo"]) {
         const value = url.searchParams.get(name);
@@ -822,6 +1116,26 @@ function port(name, fallback) {
 }
 
 export function loadConfig() {
+  let vault;
+  if (process.env.BROWSER_VAULT_ENABLED === "true") {
+    const token = required("BROWSER_VAULT_SERVICE_TOKEN");
+    const origin = new URL(
+      process.env.BROWSER_VAULT_MCP_ORIGIN ?? "http://127.0.0.1:8000",
+    );
+    if (
+      Buffer.byteLength(token) < 32 ||
+      origin.protocol !== "http:" ||
+      origin.pathname !== "/" ||
+      origin.search ||
+      origin.hash ||
+      origin.username ||
+      origin.password
+    )
+      throw new Error(
+        "The vault requires a private HTTP origin and a service token of at least 32 bytes.",
+      );
+    vault = { token, origin: origin.toString() };
+  }
   const secret = required("SESSION_VIEWER_SIGNING_KEY");
   if (Buffer.byteLength(secret) < 32)
     throw new Error(
@@ -870,6 +1184,7 @@ export function loadConfig() {
     );
   }
   return {
+    vault,
     secret,
     publicOrigin: publicOrigin.toString(),
     upstreamOrigin: upstreamOrigin.toString(),

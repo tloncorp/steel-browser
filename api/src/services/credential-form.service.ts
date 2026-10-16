@@ -6,6 +6,7 @@ import {
 } from "./browser-monitor.service.js";
 import type { CDPSession, ElementHandle, Frame, JSHandle, Page } from "puppeteer-core";
 import type { CDPService } from "./cdp/cdp.service.js";
+import { createComposedDom, type ComposedDom } from "./composed-dom.js";
 import { secureFieldDefinitions, type SecureFormField } from "./secure-form-fields.js";
 import {
   disposeSelectedFields,
@@ -23,11 +24,13 @@ export interface CredentialFormTarget {
 }
 export interface CredentialFormDescription extends CredentialFormTarget {
   fields: SecureFormField[];
+  vaultEligible: boolean;
 }
 export type CredentialFormScope = "all" | "sensitive";
 export interface CredentialFormValues {
   values: Record<string, string>;
   submit?: boolean;
+  vault?: boolean;
 }
 export class CredentialFormError extends Error {
   constructor(
@@ -87,6 +90,7 @@ export async function getCredentialContinuation(
                 form.controls.every(
                   ({ input, form: owner, attributes, action, label }) =>
                     input.isConnected &&
+                    form.scopeFor(input) === form.scope &&
                     input.form === owner &&
                     input.form?.action === action &&
                     form.labelFor(input) === label &&
@@ -132,11 +136,11 @@ export async function getCredentialContinuation(
   return { ...state.receipt };
 }
 /** Click one unambiguous login control through the browser's input pipeline. */
-async function activateCredentialControl(anchor: ElementHandle<HTMLElement>): Promise<boolean> {
+async function activateCredentialControl(bound: JSHandle<BoundForm>): Promise<boolean> {
   const deadline = Date.now() + 2_000;
   do {
-    const handle = await anchor.evaluateHandle((input) => {
-      if (!input.isConnected) return null;
+    const handle = await bound.evaluateHandle(({ scope, dom }) => {
+      if (!scope.isConnected) return null;
       const visible = (element: HTMLElement) => {
         const style = getComputedStyle(element);
         const rect = element.getBoundingClientRect();
@@ -145,48 +149,57 @@ async function activateCredentialControl(anchor: ElementHandle<HTMLElement>): Pr
           rect.height > 0 &&
           style.display !== "none" &&
           style.visibility === "visible" &&
-          !element.closest('[inert], [aria-hidden="true"]')
+          !dom.closest(element, '[inert], [aria-hidden="true"]')
         );
       };
       const isLogin = (element: HTMLElement) =>
         /^(?:log\s*in|sign\s*in|continue|next|verify|submit)(?:\s|$)/i.test(
-          element.getAttribute("aria-label") ||
-            element.textContent ||
+          (
+            element.getAttribute("aria-label") ||
+            dom.text(element) ||
             (element as HTMLInputElement).value ||
-            "",
-        ) &&
-        !/\b(?:with|google|apple|facebook|register|sign\s*up)\b/i.test(element.textContent || "");
-      const form = input instanceof HTMLFormElement ? input : (input as FormControl).form;
+            ""
+          ).trim(),
+        ) && !/\b(?:with|google|apple|facebook|register|sign\s*up)\b/i.test(dom.text(element));
+      const form = scope instanceof HTMLFormElement ? scope : null;
       let candidates: HTMLElement[];
       if (form) {
-        candidates = Array.from(
-          document.querySelectorAll<HTMLButtonElement | HTMLInputElement>("button, input"),
-        ).filter(
-          (control) => control.form === form && control.type === "submit" && visible(control),
-        );
+        candidates = dom
+          .elements(document)
+          .filter(
+            (control): control is HTMLButtonElement | HTMLInputElement =>
+              (control instanceof HTMLButtonElement || control instanceof HTMLInputElement) &&
+              control.form === form &&
+              control.type === "submit" &&
+              visible(control),
+          );
         if (!candidates.length) {
-          candidates = Array.from(
-            form.querySelectorAll<HTMLElement>('button, [role="button"]'),
-          ).filter((control) => visible(control) && isLogin(control));
+          candidates = dom
+            .elements(form)
+            .filter(
+              (control): control is HTMLElement =>
+                control instanceof HTMLElement &&
+                control.matches('button, [role="button"]') &&
+                visible(control) &&
+                isLogin(control),
+            );
         }
       } else {
-        candidates = [];
-        for (
-          let group = input.parentElement;
-          group && group !== document.body;
-          group = group.parentElement
-        ) {
-          candidates = Array.from(
-            group.querySelectorAll<HTMLElement>('button, [role="button"], input[type="submit"]'),
-          ).filter((control) => visible(control) && isLogin(control));
-          if (candidates.length) break;
-        }
+        candidates = dom
+          .elements(scope)
+          .filter(
+            (control): control is HTMLElement =>
+              control instanceof HTMLElement &&
+              control.matches('button, [role="button"], input[type="submit"]') &&
+              visible(control) &&
+              isLogin(control),
+          );
       }
       if (candidates.length !== 1) return null;
       const control = candidates[0];
       const label =
         control.getAttribute("aria-label") ||
-        control.textContent ||
+        dom.text(control) ||
         (control as HTMLInputElement).value ||
         "";
       if (
@@ -254,9 +267,11 @@ type BoundForm = {
   focused: boolean;
   primary: boolean;
   scope: Element;
+  dom: ComposedDom;
   action?: string;
   fields: BoundField[];
   labelFor: (input: FormControl) => string;
+  scopeFor: (input: FormControl) => Element | null;
   controls: Array<{
     input: FormControl;
     form: HTMLFormElement | null;
@@ -276,7 +291,7 @@ type BoundFormPart = {
 type LocatedCredentialForm = {
   description: CredentialFormDescription;
   parts: BoundFormPart[];
-  prepared: boolean;
+  selected: boolean;
   timer: ReturnType<typeof setTimeout>;
 };
 const forms = new WeakMap<CDPService, LocatedCredentialForm>();
@@ -284,14 +299,10 @@ const forms = new WeakMap<CDPService, LocatedCredentialForm>();
 /** Runs in the document; nothing here reads or returns the controls' values. */
 function inspectDocument(
   definitions: typeof secureFieldDefinitions,
+  dom: ComposedDom,
   ...targets: FormControl[]
 ): BoundForm | null {
-  const all = (root: Document | ShadowRoot): Element[] =>
-    Array.from(root.querySelectorAll("*")).flatMap((element) => [
-      element,
-      ...(element.shadowRoot ? all(element.shadowRoot) : []),
-    ]);
-  const elements = all(document);
+  const elements = dom.elements(document);
   let active = document.activeElement;
   while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
   const visible = (input: FormControl) => {
@@ -305,24 +316,17 @@ function inspectDocument(
       style.display !== "none" &&
       rect.width > 0 &&
       rect.height > 0 &&
-      !input.closest('[inert], [aria-hidden="true"]')
+      !dom.closest(input, '[inert], [aria-hidden="true"]')
     );
   };
-  const labelText = (element: Element | null) => {
-    if (!element || element.matches("input, textarea, select, script, style")) return "";
-    const copy = element.cloneNode(true) as Element;
-    copy
-      .querySelectorAll("input, textarea, select, script, style")
-      .forEach((child) => child.remove());
-    return copy.textContent || "";
-  };
+  const labelText = dom.text;
   const text = (input: FormControl) =>
     [
       input.name,
       input.id,
       input.getAttribute("aria-label") || "",
       input.getAttribute("placeholder") || "",
-      ...Array.from(input.labels || []).map((label) => label.textContent || ""),
+      label(input),
     ]
       .map((value) => value.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_-]/g, " "))
       .join(" ");
@@ -407,18 +411,28 @@ function inspectDocument(
         element instanceof HTMLSelectElement,
     )
     .filter(visible);
+  const scopeFor = (input: FormControl): Element | null => {
+    let scope: Element | null =
+      input.form ||
+      dom.closest(input, "form") ||
+      dom.closest(input, '[role="form"], dialog, [role="dialog"]');
+    if (!scope) {
+      scope = dom.parent(input);
+      while (
+        scope &&
+        dom.parent(scope) &&
+        scope !== document.body &&
+        !dom
+          .elements(scope)
+          .some((element) => element.matches('button, [role="button"], input[type="submit"]'))
+      )
+        scope = dom.parent(scope);
+    }
+    return scope;
+  };
   const groups = new Map<Element, FormControl[]>();
   for (const input of inputs) {
-    let scope: Element | null = input.form;
-    if (!scope) {
-      scope = input.parentElement;
-      while (
-        scope?.parentElement &&
-        scope !== document.body &&
-        !scope.querySelector('button, [role="button"], input[type="submit"]')
-      )
-        scope = scope.parentElement;
-    }
+    const scope = scopeFor(input);
     if (!scope) continue;
     const group = groups.get(scope) || [];
     group.push(input);
@@ -428,24 +442,28 @@ function inspectDocument(
   for (const [scope, group] of groups) {
     if (targets.length && !targets.some((target) => group.includes(target))) continue;
     const context = [
-      scope.textContent || "",
-      ...Array.from(
-        scope.querySelectorAll('button, [role="button"], input[type="submit"], label, h1, h2'),
-      ).map((element) => element.textContent || element.getAttribute("value") || ""),
+      dom.text(scope),
+      ...dom
+        .elements(scope)
+        .filter((element) =>
+          element.matches('button, [role="button"], input[type="submit"], label, h1, h2'),
+        )
+        .map((element) => dom.text(element) || element.getAttribute("value") || ""),
     ].join(" ");
     const pageContext = `${document.title} ${elements
       .filter((el) => el.matches('h1,h2,[role="heading"]'))
-      .map((el) => el.textContent)
+      .map((el) => dom.text(el))
       .join(" ")} ${location.pathname}`;
-    const submitLabels = Array.from(
-      scope.querySelectorAll<HTMLElement>('button, [role="button"], input[type="submit"]'),
-    ).map(
-      (control) =>
-        control.getAttribute("aria-label") ||
-        control.textContent ||
-        control.getAttribute("value") ||
-        "",
-    );
+    const submitLabels = dom
+      .elements(scope)
+      .filter((element) => element.matches('button, [role="button"], input[type="submit"]'))
+      .map(
+        (control) =>
+          control.getAttribute("aria-label") ||
+          dom.text(control) ||
+          control.getAttribute("value") ||
+          "",
+      );
     const nonLoginAction =
       /\bsubscribe\b|newsletter|\bsign\s*up\b|\bregister\b|create (?:an? )?account|reset password/i;
     // Login forms commonly contain Sign up / Forgot password links. Their
@@ -503,7 +521,9 @@ function inspectDocument(
               )
             : [input];
         const required = choices.some((choice) => choice.required);
-        const legend = labelText(input.closest("fieldset")?.querySelector("legend") || null).trim();
+        const legend = labelText(
+          dom.closest(input, "fieldset")?.querySelector("legend") || null,
+        ).trim();
         fields.push({
           inputs: choices,
           choice: radio ? "radio" : "checkbox",
@@ -658,10 +678,17 @@ function inspectDocument(
         (input instanceof HTMLInputElement ||
           input instanceof HTMLSelectElement ||
           input instanceof HTMLTextAreaElement) &&
-        (input.form === scope || (!input.form && scope.contains(input))) &&
+        (input.form === scope || (!input.form && dom.contains(scope, input))) &&
         visible(input) &&
         input.required &&
         !fields.some((field) => field.inputs.includes(input)),
+    );
+    // A selection retains login semantics only when it includes the complete
+    // login step. Optional checkboxes do not prevent saving username/password.
+    const completeLogin = fields.every(
+      (field) =>
+        (field.choice === "checkbox" && !field.descriptor.required) ||
+        field.inputs.every((input) => targets.includes(input)),
     );
     if (targets.length) {
       const selected = fields.filter((field) =>
@@ -705,7 +732,10 @@ function inspectDocument(
       })),
     );
     const kind =
-      !targets.length && login && !unsupportedRequired && new Set(purposes).size === purposes.length
+      (!targets.length || completeLogin) &&
+      login &&
+      !unsupportedRequired &&
+      new Set(purposes).size === purposes.length
         ? "login"
         : "details";
     if (kind === "login")
@@ -715,20 +745,23 @@ function inspectDocument(
     matches.push({
       kind,
       scope,
+      dom,
       action: scope instanceof HTMLFormElement ? scope.action : undefined,
       focused:
         !!active &&
         active !== document.body &&
         active !== document.documentElement &&
         document.hasFocus() &&
-        (group.includes(active as FormControl) || scope.contains(active)),
-      primary: !!scope
+        (group.includes(active as FormControl) || dom.contains(scope, active)),
+      primary: !!dom
         .closest(
+          scope,
           'main, aside, nav, header, footer, [role="main"], [role="complementary"], [role="navigation"], [role="banner"], [role="contentinfo"]',
         )
         ?.matches('main, [role="main"]'),
       fields,
       labelFor: label,
+      scopeFor,
       controls,
     });
   }
@@ -742,7 +775,14 @@ function inspectDocument(
   if (focused.length === 1) return focused[0];
   if (matches.length === 1) return matches[0];
   const primary = matches.filter((form) => form.primary);
-  return primary.length === 1 ? primary[0] : null;
+  if (primary.length === 1) return primary[0];
+  // Sign-in and account creation can share a page without sharing a destination.
+  const logins = matches.filter(
+    (form) =>
+      form.kind === "login" &&
+      form.fields.some(({ descriptor }) => descriptor.purpose === "current-password"),
+  );
+  return logins.length === 1 ? logins[0] : null;
 }
 
 async function releaseForm(cdpService: CDPService) {
@@ -786,13 +826,17 @@ async function discoverBoundForm(
         await owner?.dispose();
         if (!visible) continue;
       }
+      const dom = await frame.evaluateHandle(createComposedDom).catch(() => undefined);
+      if (!dom) continue;
       const handle = (await frame
         .evaluateHandle(
           inspectDocument,
           secureFieldDefinitions,
+          dom,
           ...(selection?.handles.get(frame) || []),
         )
-        .catch(() => undefined)) as JSHandle<BoundForm | null> | undefined;
+        .catch(() => undefined)
+        .finally(() => dom.dispose())) as JSHandle<BoundForm | null> | undefined;
       if (!handle) continue;
       const metadata = await handle
         .evaluate(
@@ -833,28 +877,34 @@ async function discoverBoundForm(
         }
         for (const [frame, owners] of containers) {
           if (candidates.some((candidate) => candidate.frame === frame)) continue;
-          const handle = (await frame.evaluateHandle(
-            (...owners): BoundForm | null => {
-              const scope = owners[0]?.closest("form");
-              if (
-                !scope ||
-                !scope.isConnected ||
-                !owners.every((owner) => owner.closest("form") === scope)
-              )
-                return null;
-              return {
-                kind: "details",
-                focused: false,
-                primary: false,
-                scope,
-                action: scope.action,
-                fields: [],
-                labelFor: () => "",
-                controls: [],
-              };
-            },
-            ...owners,
-          )) as JSHandle<BoundForm | null>;
+          const dom = await frame.evaluateHandle(createComposedDom);
+          const handle = (await frame
+            .evaluateHandle(
+              (dom, ...owners): BoundForm | null => {
+                const scope = owners[0] && dom.closest(owners[0], "form");
+                if (
+                  !(scope instanceof HTMLFormElement) ||
+                  !scope.isConnected ||
+                  !owners.every((owner) => dom.closest(owner, "form") === scope)
+                )
+                  return null;
+                return {
+                  kind: "details",
+                  focused: false,
+                  primary: false,
+                  scope,
+                  dom,
+                  action: scope.action,
+                  fields: [],
+                  labelFor: () => "",
+                  scopeFor: () => scope,
+                  controls: [],
+                };
+              },
+              dom,
+              ...owners,
+            )
+            .finally(() => dom.dispose())) as JSHandle<BoundForm | null>;
           const exists = await handle.evaluate((form) => !!form);
           if (exists)
             candidates.push({
@@ -883,7 +933,7 @@ async function discoverBoundForm(
           const contained =
             owner &&
             (await container.handle
-              .evaluate((form, owner) => form.scope.contains(owner), owner)
+              .evaluate((form, owner) => form.dom.contains(form.scope, owner), owner)
               .catch(() => false));
           await owner?.dispose();
           if (contained) parent.set(candidate, container);
@@ -992,7 +1042,7 @@ async function discoverBoundForm(
     const previous = forms.get(cdpService);
     const same =
       !selection &&
-      !previous?.prepared &&
+      !previous?.selected &&
       previous?.parts.length === parts.length &&
       (
         await Promise.all(
@@ -1034,13 +1084,27 @@ async function discoverBoundForm(
       origin: httpOrigin(frame.url())!,
       kind,
       fields,
+      vaultEligible:
+        kind === "login" &&
+        new URL(frame.url()).protocol === "https:" &&
+        httpOrigin(page.url()) === httpOrigin(frame.url()) &&
+        fields.every((field) => ["username", "current-password"].includes(field.purpose)) &&
+        new Set(fields.map((field) => field.purpose)).size === fields.length &&
+        (await root.handle
+          .evaluate(
+            applyBoundValues,
+            { frameUrl: frame.url(), origin: httpOrigin(frame.url())!, vault: true },
+            {},
+            false,
+          )
+          .catch(() => false)) === true,
     };
     await releaseForm(cdpService);
     const timer = setTimeout(() => {
       void releaseForm(cdpService);
     }, 5 * 60_000);
     timer.unref();
-    forms.set(cdpService, { description, parts, timer, prepared: !!selection });
+    forms.set(cdpService, { description, parts, timer, selected: !!selection });
     if (selection) {
       for (const part of parts)
         await part.handle.evaluate((form) => {
@@ -1064,13 +1128,41 @@ async function discoverBoundForm(
 
 function applyBoundValues(
   form: BoundForm,
-  target: { frameUrl: string; origin: string },
+  target: { frameUrl: string; origin: string; vault?: boolean },
   values: Record<string, string>,
   write: boolean,
 ): FormControl | boolean | null {
   const valid = () =>
     location.href === target.frameUrl &&
     location.origin === target.origin &&
+    (!target.vault ||
+      (location.protocol === "https:" &&
+        (() => {
+          try {
+            return top?.location.origin === location.origin;
+          } catch {
+            return false;
+          }
+        })() &&
+        form.controls.every(({ input }) => {
+          const owner = input.form || (form.scope instanceof HTMLFormElement ? form.scope : null);
+          return (
+            !owner ||
+            (new URL(owner.action, document.baseURI).origin === location.origin &&
+              form.dom
+                .elements(document)
+                .filter(
+                  (button): button is HTMLButtonElement | HTMLInputElement =>
+                    (button instanceof HTMLButtonElement || button instanceof HTMLInputElement) &&
+                    button.hasAttribute("formaction"),
+                )
+                .filter((button) => (button.form || form.dom.closest(button, "form")) === owner)
+                .every(
+                  (button) =>
+                    new URL(button.formAction, document.baseURI).origin === location.origin,
+                ))
+          );
+        }))) &&
     form.scope.isConnected &&
     (form.scope instanceof HTMLFormElement ? form.scope.action : undefined) === form.action &&
     form.controls.every(({ input, form: owner, attributes, action, options, label }) => {
@@ -1083,7 +1175,8 @@ function applyBoundValues(
         rect.width > 0 &&
         rect.height > 0 &&
         getComputedStyle(input).visibility === "visible" &&
-        !input.closest('[inert], [aria-hidden="true"]') &&
+        !form.dom.closest(input, '[inert], [aria-hidden="true"]') &&
+        form.scopeFor(input) === form.scope &&
         input.form === owner &&
         input.form?.action === action &&
         form.labelFor(input) === label &&
@@ -1126,6 +1219,7 @@ function applyBoundValues(
       // delivering any value to a replacement or a different destination.
       if (!valid()) return null;
       if (field.choice === "radio" && index !== Number(value)) continue;
+      input.setAttribute("data-steel-private", "true");
       input.focus();
       if (!valid()) return null;
       if (field.choice === "checkbox" || field.choice === "radio") {
@@ -1156,7 +1250,9 @@ function applyBoundValues(
         if (!setter) return null;
         setter.call(input, field.inputs.length > 1 ? value[index] : value);
       }
-      input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
+      input.dispatchEvent(
+        new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }),
+      );
       input.dispatchEvent(new Event("change", { bubbles: true }));
       input.blur();
       anchor = input;
@@ -1189,7 +1285,7 @@ async function attachedParts(parts: BoundFormPart[]): Promise<boolean> {
         if (!visible) return false;
         if (container?.frame === child.parentFrame()) {
           foundContainer = await container.handle
-            .evaluate((form, element) => form.scope.contains(element), owner)
+            .evaluate((form, element) => form.dom.contains(form.scope, element), owner)
             .catch(() => false);
           if (!foundContainer) return false;
         }
@@ -1220,6 +1316,13 @@ async function fillBoundForm(
     throw new CredentialFormError("The form is no longer available. Reconnect to continue.", 409);
   }
   const { values } = request;
+  if (
+    request.vault &&
+    (!located.description.vaultEligible ||
+      httpOrigin(located.parts[0].frame.page().url()) !== target.origin)
+  ) {
+    throw new CredentialFormError("The login destination changed. Reconnect to continue.", 409);
+  }
   const fields = located.description.fields;
   if (
     !values ||
@@ -1254,7 +1357,12 @@ async function fillBoundForm(
   // its own live nodes so page event handlers cannot redirect subsequent values.
   for (const part of located.parts) {
     const valid = await part.handle
-      .evaluate(applyBoundValues, { frameUrl: part.frameUrl, origin: part.origin }, values, false)
+      .evaluate(
+        applyBoundValues,
+        { frameUrl: part.frameUrl, origin: part.origin, vault: request.vault },
+        values,
+        false,
+      )
       .catch(() => false);
     if (!valid) throw changed();
     const choicesValid = await part.handle
@@ -1278,6 +1386,7 @@ async function fillBoundForm(
       throw new CredentialFormError("Select at least one option in each required field.", 400);
   }
   await clearContinuation(cdpService);
+  cdpService.getInstrumentationLogger().protectValues(Object.values(values));
   let anchor: ElementHandle<HTMLElement> | undefined;
   let wrote = false;
   try {
@@ -1306,7 +1415,7 @@ async function fillBoundForm(
       const result = await part.handle
         .evaluateHandle(
           applyBoundValues,
-          { frameUrl: part.frameUrl, origin: part.origin },
+          { frameUrl: part.frameUrl, origin: part.origin, vault: request.vault },
           values,
           true,
         )
@@ -1368,7 +1477,7 @@ async function fillBoundForm(
   const submitted =
     request.submit === true &&
     located.description.kind === "login" &&
-    (await activateCredentialControl(anchor).catch(() => false));
+    (await activateCredentialControl(located.parts[0].handle).catch(() => false));
   receipt.submissionAttempted = submitted;
   return { submitted };
 }
@@ -1416,7 +1525,7 @@ export async function discoverCredentialForm(
   }
 }
 
-/** Prepare exactly one private entry round; selected fields never submit the page. */
+/** Bind selected controls; a complete login retains login submission and vault eligibility. */
 export async function prepareCredentialForm(
   cdpService: CDPService,
   selection: SelectedFormRequest,
@@ -1455,14 +1564,14 @@ export async function prepareCredentialForm(
   }
 }
 
-export async function getPreparedCredentialForm(
+export async function getBoundCredentialForm(
   cdpService: CDPService,
   formId: string,
 ): Promise<CredentialFormDescription> {
   const located = forms.get(cdpService);
   if (
     filling.has(cdpService) ||
-    !located?.prepared ||
+    !located ||
     located.description.formId !== formId ||
     !(await attachedParts(located.parts)) ||
     !(
@@ -1476,7 +1585,7 @@ export async function getPreparedCredentialForm(
     ).every(Boolean)
   )
     throw new CredentialFormError(
-      "The selected form changed or expired. Request a fresh handoff.",
+      "The secure form changed or expired. Request a fresh handoff.",
       409,
     );
   return located.description;

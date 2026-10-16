@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import puppeteer, { type Browser, type Frame, type Page } from "puppeteer-core";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { CDPService } from "./cdp/cdp.service.js";
+import { createBrowserLogger } from "./cdp/instrumentation/browser-logger.js";
 import { browserMonitorStatus } from "./browser-monitor.service.js";
 import { createGateway, mintCapability } from "../../../session-viewer/server.mjs";
 import {
@@ -10,7 +11,8 @@ import {
   fillCredentialForm,
   getCredentialContinuation,
   prepareCredentialForm,
-  getPreparedCredentialForm,
+  getBoundCredentialForm,
+  CredentialFormError,
 } from "./credential-form.service.js";
 import type { SelectedFormControl, SelectedFormRequest } from "./selected-form.service.js";
 
@@ -51,7 +53,14 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     page = await browser.newPage();
     page.setDefaultNavigationTimeout(5000);
     await page.setViewport({ width: 1920, height: 1080 });
-    service = { getAllPages: async () => [page] } as unknown as CDPService;
+    const logger = createBrowserLogger({
+      baseLogger: { info() {}, error() {} },
+      enableConsoleLogging: false,
+    });
+    service = {
+      getAllPages: async () => [page],
+      getInstrumentationLogger: () => logger,
+    } as unknown as CDPService;
   });
   afterEach(async () => {
     await page.close();
@@ -123,6 +132,173 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     }
   }
 
+  async function formGateway() {
+    const sessionId = "123e4567-e89b-42d3-a456-426614174000";
+    const secret = "synthetic-test-secret-at-least-thirty-two-bytes";
+    const upstream = createServer(async (request, response) => {
+      const url = new URL(request.url!, "http://upstream.test");
+      try {
+        let result;
+        if (url.pathname === `/v1/sessions/${sessionId}`) {
+          result = {
+            id: sessionId,
+            status: "live",
+            createdAt: new Date().toISOString(),
+            timeout: 60_000,
+          };
+        } else if (url.pathname.endsWith("/credential-handoff")) {
+          const chunks: Buffer[] = [];
+          for await (const chunk of request) chunks.push(chunk);
+          result = {
+            ...(await prepareCredentialForm(service, JSON.parse(Buffer.concat(chunks).toString()))),
+            expiresAt: Date.now() + 300_000,
+          };
+        } else if (url.pathname !== `/v1/sessions/${sessionId}/credential-form`) {
+          return void response.writeHead(404).end();
+        } else if (request.method === "GET") {
+          result = url.searchParams.has("formId")
+            ? await getBoundCredentialForm(service, url.searchParams.get("formId")!)
+            : await discoverCredentialForm(
+                service,
+                url.searchParams.get("scope") === "all" ? "all" : "sensitive",
+              );
+        } else {
+          const chunks: Buffer[] = [];
+          for await (const chunk of request) chunks.push(chunk);
+          const { target, ...values } = JSON.parse(Buffer.concat(chunks).toString());
+          result = { ok: true, ...(await fillCredentialForm(service, target, values)) };
+        }
+        response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(result));
+      } catch (error) {
+        response
+          .writeHead(error instanceof CredentialFormError ? error.statusCode : 500, {
+            "content-type": "application/json",
+          })
+          .end(JSON.stringify({ error: String(error) }));
+      }
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    const address = upstream.address();
+    if (!address || typeof address === "string") throw new Error("No upstream listener");
+    const { publicServer, internal } = createGateway({
+      secret,
+      publicOrigin: "https://viewer.example.test",
+      upstreamOrigin: `http://127.0.0.1:${address.port}`,
+      maximumTtlMs: 60_000,
+    });
+    return { sessionId, secret, publicServer, internal, upstream };
+  }
+
+  it("reports a completed fill while an optional passkey prompt awaits a browser action", async () => {
+    await load(`<form onsubmit="event.preventDefault();this.remove();document.getElementById('passkey').hidden=false">
+      <label>Username<input name="user" autocomplete="username" required></label>
+      <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+      <button>Sign in</button></form>
+      <section id="passkey" hidden><h1>Set up a passkey?</h1>
+      <button id="not-now" onclick="document.body.innerHTML='<h1>Account home</h1>'">Not now</button></section>`);
+    const { sessionId, publicServer, internal, upstream } = await formGateway();
+    try {
+      await new Promise<void>((resolve) => publicServer.listen(0, "127.0.0.1", resolve));
+      await new Promise<void>((resolve) => internal.listen(0, "127.0.0.1", resolve));
+      const base = `http://127.0.0.1:${publicServer.address().port}`;
+      const prepared = await fetch(
+        `http://127.0.0.1:${internal.address().port}/v1/sessions/${sessionId}/credential-handoff`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ discover: true }),
+        },
+      );
+      expect(prepared.status).toBe(200);
+      const token = new URL((await prepared.json()).viewer_url).pathname.slice(3);
+      const handoff = await (await fetch(`${base}/credentials/${token}`)).json();
+      const filled = await fetch(`${base}/credential-fills/${handoff.handoffId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          values: { f0: "fixture-user", f1: "fixture-password" },
+          submit: true,
+        }),
+      });
+      expect(filled.status).toBe(200);
+      expect(await (await fetch(`${base}/credential-result/${token}`)).json()).toEqual({
+        status: "filled",
+        submitted: true,
+      });
+      await expect(discoverCredentialForm(service)).rejects.toMatchObject({ statusCode: 404 });
+      expect(await page.$eval("#passkey", (element) => element.hidden)).toBe(false);
+      await page.click("#not-now");
+      expect(await page.$eval("h1", (element) => element.textContent)).toBe("Account home");
+      expect(await (await fetch(`${base}/credential-result/${token}`)).json()).toEqual({
+        status: "filled",
+        submitted: true,
+      });
+    } finally {
+      publicServer.closeAllConnections();
+      internal.closeAllConnections();
+      upstream.closeAllConnections();
+      await Promise.all([
+        new Promise<void>((resolve) => publicServer.close(resolve)),
+        new Promise<void>((resolve) => internal.close(resolve)),
+        new Promise<void>((resolve) => upstream.close(() => resolve())),
+      ]);
+    }
+  });
+
+  it("preserves login semantics when selecting the complete username/password form", async () => {
+    await page.setRequestInterception(true);
+    page.on(
+      "request",
+      (request) =>
+        void request.respond({
+          contentType: "text/html",
+          body: `<b>Login</b><form action="/login"><input name="acct"><input name="pw" type="password"><input type="submit" value="login"></form>
+        <b>Create Account</b><form action="/register"><input name="acct"><input name="pw" type="password"><input type="submit" value="create account"></form>`,
+        }),
+    );
+    await page.goto("https://login.example.test/login");
+    const form = await prepareCredentialForm(
+      service,
+      await selection([
+        'form[action="/login"] input[name="acct"]',
+        'form[action="/login"] input[name="pw"]',
+      ]),
+    );
+    expect(form).toMatchObject({ kind: "login", vaultEligible: true });
+    expect(form.fields.map(({ purpose, required }) => ({ purpose, required }))).toEqual([
+      { purpose: "username", required: true },
+      { purpose: "current-password", required: true },
+    ]);
+    expect(await getBoundCredentialForm(service, form.formId)).toEqual(form);
+  });
+
+  it.each([
+    [
+      "partial login",
+      '<form><input name="user"><input type="password"><button>Login</button></form>',
+      ['input[type="password"]'],
+    ],
+    [
+      "account creation",
+      '<form><input name="user"><input type="password"><button>Create account</button></form>',
+      ['input[name="user"]', 'input[type="password"]'],
+    ],
+    [
+      "new password",
+      '<form><input name="user"><input type="password" autocomplete="new-password"><button>Login</button></form>',
+      ['input[name="user"]', 'input[type="password"]'],
+    ],
+    [
+      "mixed checkout",
+      '<form><input name="user"><input type="password"><input autocomplete="cc-number"><button>Pay</button></form>',
+      ['input[name="user"]', 'input[type="password"]'],
+    ],
+  ])("keeps selected %s fields as private details", async (_name, body, selectors) => {
+    await load(body as string);
+    const form = await prepareCredentialForm(service, await selection(selectors as string[]));
+    expect(form).toMatchObject({ kind: "details", vaultEligible: false });
+  });
+
   it("fills only selected fields, preserving unrelated required fields and dropdown values", async () => {
     await load(`<form action="/done"><label>Last name<input name="lastname" required></label>
       <label>SSN<input name="ssn_3" required></label><label>Month<select name="bm" required>
@@ -138,7 +314,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       { value: "1", label: "January" },
       { value: "2", label: "February" },
     ]);
-    expect(await getPreparedCredentialForm(service, form.formId)).toEqual(form);
+    expect(await getBoundCredentialForm(service, form.formId)).toEqual(form);
     expect(
       await fillCredentialForm(service, form, { values: { f0: "123", f1: "2" }, submit: true }),
     ).toMatchObject({ submitted: false });
@@ -223,7 +399,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     await page.$eval("span", (label) => {
       label.textContent = "Government identifier";
     });
-    await expect(getPreparedCredentialForm(service, form.formId)).rejects.toMatchObject({
+    await expect(getBoundCredentialForm(service, form.formId)).rejects.toMatchObject({
       statusCode: 409,
     });
     await expect(
@@ -315,7 +491,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     await page.$eval("option", (option) => {
       option.value = "other-value";
     });
-    await expect(getPreparedCredentialForm(service, form.formId)).rejects.toMatchObject({
+    await expect(getBoundCredentialForm(service, form.formId)).rejects.toMatchObject({
       statusCode: 409,
     });
     await expect(fillCredentialForm(service, form, { values: { f0: "0" } })).rejects.toMatchObject({
@@ -323,7 +499,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     });
     const next = await prepareCredentialForm(service, await selection(["select"]));
     expect(next.formId).not.toBe(form.formId);
-    await expect(getPreparedCredentialForm(service, form.formId)).rejects.toMatchObject({
+    await expect(getBoundCredentialForm(service, form.formId)).rejects.toMatchObject({
       statusCode: 409,
     });
   });
@@ -375,6 +551,124 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       submit,
     });
   }
+
+  async function loadSecure(body: string) {
+    await page.setRequestInterception(true);
+    page.on(
+      "request",
+      (request) => void request.respond({ status: 200, contentType: "text/html", body }),
+    );
+    await page.goto("https://login.example/signin");
+  }
+
+  it("fills saved HTTPS logins and marks both fields sensitive before any input events", async () => {
+    await loadSecure(`<form onsubmit="event.preventDefault()">${fields}<button>Sign in</button></form>
+      <script>window.leaked=false; document.addEventListener('input',e=>{if(e.target.dataset.steelPrivate!=='true')window.leaked=true})</script>`);
+    const target = await discoverCredentialForm(service);
+    expect(target.vaultEligible).toBe(true);
+    const result = await fillCredentialForm(service, target, {
+      vault: true,
+      values: { f0: "fixture-user", f1: "fixture-secret" },
+      submit: true,
+    });
+    expect(result.submitted).toBe(true);
+    expect(
+      await page.evaluate(() =>
+        Array.from(document.querySelectorAll("input")).map((input) => [
+          input.value,
+          input.dataset.steelPrivate,
+        ]),
+      ),
+    ).toEqual([
+      ["fixture-user", "true"],
+      ["fixture-secret", "true"],
+    ]);
+    expect(await page.evaluate("window.leaked")).toBe(false);
+    expect(JSON.stringify(result)).not.toContain("fixture-secret");
+    const status = browserMonitorStatus(service);
+    expect(status).toMatchObject({
+      form: { formId: target.formId },
+      fill: { formId: target.formId, submitted: true },
+    });
+    expect(JSON.stringify(status)).not.toMatch(/fixture-user|fixture-secret|origin|frameUrl/);
+  });
+
+  it("rejects saved credentials for HTTP, cross-origin actions, OTP, and cross-origin frames", async () => {
+    await load(`<form>${fields}</form>`);
+    let target = await discoverCredentialForm(service);
+    expect(target.vaultEligible).toBe(false);
+    await expect(
+      fillCredentialForm(service, target, {
+        vault: true,
+        values: { f0: "fixture-user", f1: "fixture-secret" },
+      }),
+    ).rejects.toThrow("destination changed");
+    expect(browserMonitorStatus(service).failure).toBeDefined();
+    expect(browserMonitorStatus(service).fill).toBeUndefined();
+    await loadSecure(`<form action="https://different.example/receive">${fields}</form>`);
+    expect((await discoverCredentialForm(service)).vaultEligible).toBe(false);
+    await page.setContent('<input autocomplete="one-time-code" required>');
+    expect((await discoverCredentialForm(service)).vaultEligible).toBe(false);
+    await page.setContent(
+      '<iframe src="https://different.example/form" width="600" height="300"></iframe>',
+    );
+    await page.waitForFunction(() => document.querySelector("iframe")?.contentWindow !== null);
+    // Each intercepted document has the login form; the top page contains only the frame.
+    target = await discoverCredentialForm(service);
+    expect(target.origin).toBe("https://different.example");
+    expect(target.vaultEligible).toBe(false);
+  });
+
+  it("refuses a stale destination before disclosing a password, including synchronous field handlers", async () => {
+    await loadSecure(
+      `<form onsubmit="event.preventDefault()">${fields}<button>Sign in</button></form>`,
+    );
+    let target = await discoverCredentialForm(service);
+    await page.evaluate(() => {
+      document.querySelector("form")!.action = "https://different.example/receive";
+    });
+    await expect(
+      fillCredentialForm(service, target, {
+        vault: true,
+        values: { f0: "fixture-user", f1: "fixture-secret" },
+      }),
+    ).rejects.toThrow();
+    expect(await page.$eval("[type=password]", (input) => (input as HTMLInputElement).value)).toBe(
+      "",
+    );
+    await page.evaluate(() => {
+      document.querySelector("form")!.action = "/signin";
+      document.querySelector("[name=username]")!.addEventListener("input", () => {
+        document.querySelector("form")!.action = "https://different.example/receive";
+      });
+    });
+    target = await discoverCredentialForm(service);
+    await expect(
+      fillCredentialForm(service, target, {
+        vault: true,
+        values: { f0: "fixture-user", f1: "fixture-secret" },
+      }),
+    ).rejects.toThrow();
+    expect(await page.$eval("[type=password]", (input) => (input as HTMLInputElement).value)).toBe(
+      "",
+    );
+  });
+
+  it("checks the destination again after focus handlers run", async () => {
+    await loadSecure(`<form>${fields}<button>Sign in</button></form><script>
+      document.querySelector('[type=password]').onfocus=()=>{document.querySelector('form').action='https://different.example/receive'}
+    </script>`);
+    const target = await discoverCredentialForm(service);
+    await expect(
+      fillCredentialForm(service, target, {
+        vault: true,
+        values: { f0: "fixture-user", f1: "fixture-secret" },
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(await page.$eval("[type=password]", (input) => (input as HTMLInputElement).value)).toBe(
+      "",
+    );
+  });
 
   it("observes a submitted login form that remains visible", async () => {
     await load(`<form onsubmit="event.preventDefault()">${fields}<button>Sign in</button></form>`);
@@ -548,6 +842,40 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     expect((await fill()).submitted).toBe(true);
   });
 
+  it.each([false, true])(
+    "selects the login beside an account-creation form (registration first: %s)",
+    async (registrationFirst) => {
+      const login = `<form id="login" method="post" onsubmit="event.preventDefault(); document.body.dataset.submitted='login'">
+        <input name="acct" autocomplete="username">
+        <input name="pw" type="password" autocomplete="current-password">
+        <input type="submit" value="login">
+      </form>`;
+      const registration = `<form id="registration" method="post" onsubmit="event.preventDefault(); document.body.dataset.submitted='registration'">
+        <input type="hidden" name="creating" value="t">
+        <input name="acct" autocomplete="username">
+        <input name="pw" type="password" autocomplete="new-password">
+        <input type="submit" value="create account">
+      </form>`;
+      await loadSecure(registrationFirst ? registration + login : login + registration);
+      const target = await discoverCredentialForm(service);
+      expect(target.kind).toBe("login");
+      expect(target.vaultEligible).toBe(true);
+      expect(target.fields.map((field) => field.purpose)).toEqual(["username", "current-password"]);
+      await expect(
+        fillCredentialForm(service, target, {
+          vault: true,
+          values: { f0: "fixture-user", f1: "fixture-secret" },
+          submit: true,
+        }),
+      ).resolves.toEqual({ submitted: true });
+      expect(await page.$eval("body", (body) => body.dataset.submitted)).toBe("login");
+      expect(
+        await page.$$eval("#registration input:not([type=hidden]):not([type=submit])", (inputs) =>
+          inputs.map((input) => (input as HTMLInputElement).value),
+        ),
+      ).toEqual(["", ""]);
+    },
+  );
   it("keeps login submission available with optional checkboxes", async () => {
     await load(`<form onsubmit="event.preventDefault();document.body.dataset.sent='yes'">${fields}
       <label>Remember me<input type="checkbox"></label><button>Sign in</button></form>`);
@@ -1059,6 +1387,166 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     ).toBe("secret");
   });
 
+  async function loadComponentLogin(secure = false) {
+    await (secure ? loadSecure : load)(`<login-dialog>
+      <h1>Sign in</h1>
+      <login-field id="identity" purpose="username"><span slot="label">Email or username</span></login-field>
+      <login-field id="password" purpose="current-password"><span slot="label">Password</span><button slot="trailing" type="button">Show password</button></login-field>
+      <login-button></login-button>
+    </login-dialog>
+    <script>
+      customElements.define('login-dialog', class extends HTMLElement {
+        connectedCallback() { this.attachShadow({mode:'open'}).innerHTML='<div role="dialog"><slot></slot></div>'; }
+      });
+      customElements.define('login-field', class extends HTMLElement {
+        connectedCallback() {
+          const purpose=this.getAttribute('purpose');
+          this.attachShadow({mode:'open'}).innerHTML='<label><span id="caption"><slot name="label"></slot><span aria-hidden="true">*</span></span><input aria-labelledby="caption" required autocomplete="'+purpose+'" type="'+(purpose==='current-password'?'password':'text')+'"><slot name="trailing"></slot></label>';
+        }
+      });
+      customElements.define('login-button', class extends HTMLElement {
+        connectedCallback() { this.attachShadow({mode:'open'}).innerHTML='<button disabled>Sign in</button>'; }
+      });
+      document.querySelector('login-dialog').addEventListener('input', () => {
+        document.querySelector('login-button').shadowRoot.querySelector('button').disabled =
+          !Array.from(document.querySelectorAll('login-field')).every(el => el.shadowRoot.querySelector('input').value);
+      });
+      document.querySelector('login-button').shadowRoot.querySelector('button').onclick=()=>{document.body.dataset.submitted='yes'};
+    </script>`);
+  }
+
+  it.each(["identity", "password", null])(
+    "groups slotted component inputs independently of focus on %s",
+    async (focused) => {
+      await loadComponentLogin();
+      if (focused) await page.focus(`#${focused} >>> input`);
+      const target = await discoverCredentialForm(service, "all");
+      expect(target.kind).toBe("login");
+      expect(target.fields.map(({ purpose, label }) => ({ purpose, label }))).toEqual([
+        { purpose: "username", label: "Email or username" },
+        { purpose: "current-password", label: "Password" },
+      ]);
+      await page.evaluate(
+        () => (document.activeElement?.shadowRoot?.activeElement as HTMLElement | null)?.blur(),
+      );
+      expect((await discoverCredentialForm(service, "all")).formId).toBe(target.formId);
+      await expect(getBoundCredentialForm(service, target.formId)).resolves.toEqual(target);
+      expect(
+        await fillCredentialForm(service, target, {
+          values: { f0: "fixture-user", f1: "fixture-password" },
+          submit: true,
+        }),
+      ).toEqual({ submitted: true });
+      expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+    },
+  );
+
+  it.each(["text", "aria-label"])(
+    "submits a component button with whitespace in its %s",
+    async (labelSource) => {
+      await loadComponentLogin();
+      await page.$eval(
+        "login-button >>> button",
+        (button, labelSource) => {
+          const label = "\n  \t Log In \n  ";
+          if (labelSource === "aria-label") button.setAttribute("aria-label", label);
+          else button.textContent = label;
+        },
+        labelSource,
+      );
+      const target = await discoverCredentialForm(service, "all");
+      expect(
+        await fillCredentialForm(service, target, {
+          values: { f0: "fixture-user", f1: "fixture-password" },
+          submit: true,
+        }),
+      ).toEqual({ submitted: true });
+      expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+    },
+  );
+
+  it("prepares both selected component fields using their accessible names", async () => {
+    await loadComponentLogin();
+    const target = await prepareCredentialForm(
+      service,
+      await selection(["#identity >>> input", "#password >>> input"]),
+    );
+    expect(target.fields.map((field) => field.label)).toEqual(["Email or username", "Password"]);
+    expect(target.kind).toBe("login");
+    expect(
+      await fillCredentialForm(service, target, {
+        values: { f0: "fixture-user", f1: "fixture-password" },
+        submit: true,
+      }),
+    ).toEqual({ submitted: true });
+    expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+  });
+
+  it("rejects changed slotted labels before filling a component input", async () => {
+    await loadComponentLogin();
+    const target = await discoverCredentialForm(service, "all");
+    await page.$eval('#identity [slot="label"]', (label) => {
+      label.textContent = "Different destination";
+    });
+    await expect(
+      fillCredentialForm(service, target, {
+        values: { f0: "fixture-user", f1: "fixture-password" },
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      await page.$eval("#identity >>> input", (input) => (input as HTMLInputElement).value),
+    ).toBe("");
+  });
+
+  it("rejects a component moved to a different form before entry", async () => {
+    await loadComponentLogin();
+    const target = await discoverCredentialForm(service, "all");
+    await page.evaluate(() => {
+      const other = document.createElement("form");
+      document.querySelector("login-dialog")!.append(other);
+      other.append(document.querySelector("#password")!);
+    });
+    await expect(
+      fillCredentialForm(service, target, {
+        values: { f0: "fixture-user", f1: "fixture-password" },
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      await page.$eval("#identity >>> input", (input) => (input as HTMLInputElement).value),
+    ).toBe("");
+  });
+
+  it.each([false, true])(
+    "checks a component login's enclosing form destination (cross-origin: %s)",
+    async (crossOrigin) => {
+      await loadComponentLogin(true);
+      await page.evaluate((crossOrigin) => {
+        const container = document.querySelector("login-dialog")!;
+        const form = document.createElement("form");
+        form.action = crossOrigin ? "https://different.example/receive" : "/signin";
+        form.append(...Array.from(container.children));
+        container.append(form);
+      }, crossOrigin);
+      const target = await discoverCredentialForm(service);
+      expect(target.fields.map((field) => field.purpose)).toEqual(["username", "current-password"]);
+      expect(target.vaultEligible).toBe(!crossOrigin);
+      const filled = fillCredentialForm(service, target, {
+        vault: true,
+        values: { f0: "fixture-user", f1: "fixture-password" },
+        submit: true,
+      });
+      if (crossOrigin) {
+        await expect(filled).rejects.toThrow("destination changed");
+        expect(
+          await page.$eval("#identity >>> input", (input) => (input as HTMLInputElement).value),
+        ).toBe("");
+      } else {
+        await expect(filled).resolves.toEqual({ submitted: true });
+        expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+      }
+    },
+  );
+
   it("fills native text controls using page labels without exposing existing values", async () => {
     await load(`<form onsubmit="event.preventDefault();document.body.dataset.sent='yes'">
       <label>Subject<input name="subject" required value="private-subject"></label>
@@ -1110,9 +1598,10 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     expect(await page.evaluate(() => document.body.dataset.sent)).toBeUndefined();
   });
 
-  it.each([false, true])(
-    "passes generic date dropdowns through the viewer and dispatches their field events (selected=%s)",
-    async (selected) => {
+  it.each(["viewer", "automatic", "selected"])(
+    "passes generic date dropdowns through the viewer and dispatches their field events (%s)",
+    async (mode) => {
+      const selected = mode === "selected";
       await load(`<form onsubmit="event.preventDefault();document.body.dataset.submitted='yes'">
       <label>Reference<input name="reference" required></label>
       <label>Month<select name="month" required>
@@ -1129,68 +1618,13 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
         });
       }</script>`);
       await expect(discoverCredentialForm(service)).rejects.toMatchObject({ statusCode: 404 });
-      const sessionId = "123e4567-e89b-42d3-a456-426614174000";
-      const secret = "synthetic-test-secret-at-least-thirty-two-bytes";
-      const upstream = createServer(async (request, response) => {
-        const url = new URL(request.url!, "http://upstream.test");
-        try {
-          let result;
-          if (url.pathname === `/v1/sessions/${sessionId}`) {
-            result = {
-              id: sessionId,
-              status: "live",
-              createdAt: new Date().toISOString(),
-              timeout: 60_000,
-            };
-          } else if (url.pathname.endsWith("/credential-handoff")) {
-            const chunks: Buffer[] = [];
-            for await (const chunk of request) chunks.push(chunk);
-            result = {
-              ...(await prepareCredentialForm(
-                service,
-                JSON.parse(Buffer.concat(chunks).toString()),
-              )),
-              expiresAt: Date.now() + 300_000,
-            };
-          } else if (url.pathname !== `/v1/sessions/${sessionId}/credential-form`) {
-            return void response.writeHead(404).end();
-          } else if (request.method === "GET") {
-            result = url.searchParams.has("formId")
-              ? await getPreparedCredentialForm(service, url.searchParams.get("formId")!)
-              : await discoverCredentialForm(
-                  service,
-                  url.searchParams.get("scope") === "all" ? "all" : "sensitive",
-                );
-          } else {
-            const chunks: Buffer[] = [];
-            for await (const chunk of request) chunks.push(chunk);
-            const { target, ...values } = JSON.parse(Buffer.concat(chunks).toString());
-            result = { ok: true, ...(await fillCredentialForm(service, target, values)) };
-          }
-          response
-            .writeHead(200, { "content-type": "application/json" })
-            .end(JSON.stringify(result));
-        } catch (error) {
-          response
-            .writeHead(404, { "content-type": "application/json" })
-            .end(JSON.stringify({ error: String(error) }));
-        }
-      });
-      await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
-      const address = upstream.address();
-      if (!address || typeof address === "string") throw new Error("No upstream listener");
-      const { publicServer, internal } = createGateway({
-        secret,
-        publicOrigin: "https://viewer.example.test",
-        upstreamOrigin: `http://127.0.0.1:${address.port}`,
-        maximumTtlMs: 60_000,
-      });
+      const { sessionId, secret, publicServer, internal, upstream } = await formGateway();
       try {
         await new Promise<void>((resolve) => publicServer.listen(0, "127.0.0.1", resolve));
         await new Promise<void>((resolve) => internal.listen(0, "127.0.0.1", resolve));
         const base = `http://127.0.0.1:${publicServer.address().port}`;
         let token = mintCapability({ sessionId, expiresAt: Date.now() + 60_000 }, secret);
-        if (selected) {
+        if (mode !== "viewer") {
           const prepared = await fetch(
             `http://127.0.0.1:${
               internal.address().port
@@ -1199,7 +1633,9 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
               method: "POST",
               headers: { "content-type": "application/json" },
               body: JSON.stringify(
-                await selection(['[name="month"]', '[name="day"]', '[name="year"]']),
+                selected
+                  ? await selection(['[name="month"]', '[name="day"]', '[name="year"]'])
+                  : { discover: true },
               ),
             },
           );
@@ -1264,6 +1700,68 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
           expect(await page.$eval("input", (input) => input.value)).toBe("");
           expect((await fetch(`${base}/credentials/${token}`)).status).toBe(404);
         }
+      } finally {
+        publicServer.closeAllConnections();
+        internal.closeAllConnections();
+        upstream.closeAllConnections();
+        await Promise.all([
+          new Promise<void>((resolve) => publicServer.close(resolve)),
+          new Promise<void>((resolve) => internal.close(resolve)),
+          new Promise<void>((resolve) => upstream.close(() => resolve())),
+        ]);
+      }
+    },
+  );
+
+  it.each(["automatic", "selected"])(
+    "opens a %s login handoff and submits its bound fields through the viewer",
+    async (mode) => {
+      await load(`<form onsubmit="event.preventDefault();document.body.dataset.submitted='yes'">
+        <label>User<input name="user" autocomplete="username" required></label>
+        <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+        <button>Login</button></form>`);
+      const { sessionId, secret, publicServer, internal, upstream } = await formGateway();
+      try {
+        await new Promise<void>((resolve) => publicServer.listen(0, "127.0.0.1", resolve));
+        await new Promise<void>((resolve) => internal.listen(0, "127.0.0.1", resolve));
+        const base = `http://127.0.0.1:${publicServer.address().port}`;
+        const prepared = await fetch(
+          `http://127.0.0.1:${internal.address().port}/v1/sessions/${sessionId}/credential-handoff`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(
+              mode === "selected"
+                ? await selection(['input[name="user"]', 'input[name="password"]'])
+                : { discover: true },
+            ),
+          },
+        );
+        expect(prepared.status).toBe(200);
+        const token = new URL((await prepared.json()).viewer_url).pathname.slice(3);
+        const opened = await fetch(`${base}/credentials/${token}`);
+        expect(opened.status).toBe(200);
+        const handoff = await opened.json();
+        expect(handoff.kind).toBe("login");
+        expect(handoff.fields.map((field) => field.purpose)).toEqual([
+          "username",
+          "current-password",
+        ]);
+        const values = { f0: "synthetic-user", f1: "synthetic-password" };
+        const filled = await fetch(`${base}/credential-fills/${handoff.handoffId}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ values, submit: true }),
+        });
+        expect(filled.status).toBe(200);
+        expect(await filled.json()).toEqual({ ok: true, submitted: true });
+        expect(await page.$$eval("input", (inputs) => inputs.map((input) => input.value))).toEqual(
+          Object.values(values),
+        );
+        expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+        // A form-bound link cannot select a replacement form after navigation.
+        await load('<form><input type="password" name="password"><button>Login</button></form>');
+        expect((await fetch(`${base}/credentials/${token}`)).ok).toBe(false);
       } finally {
         publicServer.closeAllConnections();
         internal.closeAllConnections();

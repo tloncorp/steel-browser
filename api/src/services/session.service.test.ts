@@ -12,6 +12,7 @@ const makeCDPService = () => {
   const launchConfigs: Array<{
     userDataDir?: string;
     options?: { downloadsPath?: string };
+    userPreferences?: Record<string, unknown>;
   }> = [];
   const service = {
     getUserAgent: vi.fn(() => "test-agent"),
@@ -65,6 +66,28 @@ afterEach(async () => {
 });
 
 describe("SessionService multi-session isolation", () => {
+  it("disables Chrome credential storage while preserving requested preferences", async () => {
+    const profileRoot = await mkdtemp(path.join(os.tmpdir(), "steel-session-test-"));
+    roots.push(profileRoot);
+    const { sessionService, runtimes } = makeSessionService();
+    const session = await sessionService.startSession({
+      userDataDir: profileRoot,
+      timezone: "UTC",
+      credentials: undefined,
+      userPreferences: {
+        credentials_enable_service: true,
+        profile: { password_manager_enabled: true, other_preference: "retained" },
+        autofill: { profile_enabled: true, credit_card_enabled: true },
+      },
+    });
+    expect(runtimes[0].launchConfigs[0].userPreferences).toMatchObject({
+      credentials_enable_service: false,
+      profile: { password_manager_enabled: false, other_preference: "retained" },
+      autofill: { profile_enabled: false, credit_card_enabled: false },
+    });
+    await sessionService.endSession(session.id);
+  });
+
   it("uses a dedicated runtime and profile directory for each session", async () => {
     const profileRoot = await mkdtemp(path.join(os.tmpdir(), "steel-session-test-"));
     roots.push(profileRoot);

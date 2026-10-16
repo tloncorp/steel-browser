@@ -143,3 +143,58 @@ describe("BrowserLogger", () => {
     );
   });
 });
+
+describe("secure credential logging", () => {
+  it("redacts page echoes before console, event streams, and storage, and drops unredactable recordings", () => {
+    const info = vi.fn();
+    const write = vi.fn().mockResolvedValue(undefined);
+    const logger = createBrowserLogger({
+      baseLogger: { info, error: vi.fn() },
+      storage: { write } as any,
+    });
+    const listener = vi.fn();
+    logger.on?.("log" as any, listener);
+    logger.protectValues(["fixture p@ssword"]);
+    logger.record({
+      type: BrowserEventType.Console,
+      timestamp: "now",
+      console: { level: "log", text: "echo fixture p@ssword" },
+    });
+    logger.record({
+      type: BrowserEventType.Request,
+      timestamp: "now",
+      request: {
+        method: "POST",
+        url: "https://login.example/?p=fixture%20p%40ssword",
+        postData: "p=fixture+p%40ssword",
+      },
+    });
+    logger.record({
+      type: BrowserEventType.Recording,
+      timestamp: "now",
+      data: "packed-private-dom",
+    });
+    logger.record({
+      type: BrowserEventType.ScreencastFrame,
+      timestamp: "now",
+      data: "private-image",
+    });
+    expect(info).toHaveBeenCalledTimes(2);
+    expect(write).toHaveBeenCalledTimes(2);
+    const outputs = JSON.stringify([
+      info.mock.calls,
+      write.mock.calls,
+      listener.mock.calls,
+      logger.getContext(),
+    ]);
+    for (const value of [
+      "fixture p@ssword",
+      "fixture%20p%40ssword",
+      "fixture+p%40ssword",
+      "packed-private-dom",
+      "private-image",
+    ])
+      expect(outputs).not.toContain(value);
+    expect(outputs).toContain("[redacted]");
+  });
+});

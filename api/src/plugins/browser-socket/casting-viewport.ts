@@ -51,7 +51,7 @@ export class PageViewport {
       controlling: canControl(),
       available: !this.owner,
     });
-    const serial = <T>(operation: () => Promise<T>) => {
+    const serial = <T>(operation: () => T | Promise<T>) => {
       const result = this.pending.then(operation);
       this.pending = result.then(
         () => {},
@@ -74,16 +74,12 @@ export class PageViewport {
     return {
       snapshot,
       mode: () => this.current.mode,
-      acquire: (prepare?: () => Promise<void>) =>
-        serial(async () => {
+      acquire: () =>
+        serial(() => {
           if (!this.clients.has(token)) throw new ViewerInputError("control_lost");
           if (this.owner && this.owner !== token)
             throw new ViewerInputError("another_viewer_controlling");
           if (!this.owner) {
-            // Prepare the page before publishing control. Other acquisitions and
-            // releases wait on the same queue, including disconnects during setup.
-            await prepare?.();
-            if (!this.clients.has(token) || releasing) throw new ViewerInputError("control_lost");
             this.owner = token;
             this.generation++;
             this.hasApplied = false;

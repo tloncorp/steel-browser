@@ -245,6 +245,7 @@ async function routes(server: FastifyInstance) {
               additionalProperties: { type: "string", maxLength: 4096 },
             },
             submit: { type: "boolean" },
+            vault: { type: "boolean" },
           },
         },
       },
@@ -262,6 +263,7 @@ async function routes(server: FastifyInstance) {
           };
           values: Record<string, string>;
           submit?: boolean;
+          vault?: boolean;
         };
       }>,
       reply: FastifyReply,
