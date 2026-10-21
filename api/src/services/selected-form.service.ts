@@ -1,11 +1,30 @@
+// ABOUTME: Rebinds snapshot-selected controls only within their original form and document.
+// ABOUTME: Uses Chrome document identity to reject stale selections across CDP attachments.
 import type { CDPSession, ElementHandle, Frame, JSHandle, Page } from "puppeteer-core";
 
 type ChromeFrame = Frame & {
   _id: string;
-  _loaderId: string;
   client: CDPSession;
   mainRealm(): { adoptBackendNode(id: number): Promise<JSHandle<Node>> };
 };
+
+export class SelectedFormStaleError extends Error {}
+
+type FrameTree = {
+  frame: { id: string; loaderId: string };
+  childFrames?: FrameTree[];
+};
+
+/** Read Chrome's live identity; a late CDP attachment may have no cached init event. */
+async function currentLoader(frame: ChromeFrame): Promise<string | undefined> {
+  const { frameTree } = await frame.client.send("Page.getFrameTree");
+  const pending: FrameTree[] = [frameTree];
+  while (pending.length) {
+    const tree = pending.pop()!;
+    if (tree.frame.id === frame._id) return tree.frame.loaderId;
+    pending.push(...(tree.childFrames || []));
+  }
+}
 
 /** Identity recorded by the browser snapshot, never a selector supplied by a website. */
 export interface SelectedFormControl {
@@ -41,8 +60,10 @@ export async function resolveSelectedFields(
   try {
     for (const target of selection.fields) {
       const frame = (page.frames() as ChromeFrame[]).find((frame) => frame._id === target.frameId);
-      if (!frame || frame._loaderId !== target.loaderId)
-        throw new Error("The selected document changed. Take a fresh browser snapshot.");
+      if (!frame || (await currentLoader(frame)) !== target.loaderId)
+        throw new SelectedFormStaleError(
+          "The selected document changed. Take a fresh browser snapshot.",
+        );
       const adopt = async (id: number | undefined) =>
         id
           ? frame
@@ -119,7 +140,7 @@ export async function resolveSelectedFields(
         }
         const handle = retained;
         if (!handle) {
-          throw new Error(
+          throw new SelectedFormStaleError(
             "A selected field changed or its name is ambiguous. Take a fresh browser snapshot.",
           );
         }

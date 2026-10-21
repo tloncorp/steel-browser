@@ -450,9 +450,9 @@ test("secure handoffs expose metadata and a one-use endpoint, never values or se
   };
   const filled = await gateway.fill(handoff.handoffId, input);
   assert.equal(filled.status, 200);
-  assert.deepEqual(await filled.json(), { ok: true, submitted: true });
+  assert.deepEqual(await filled.json(), { ok: true, submitted: false });
   const { fields: _fields, ...target } = gateway.metadata;
-  assert.deepEqual(gateway.posted, [{ target, ...input }]);
+  assert.deepEqual(gateway.posted, [{ target, ...input, submit: false }]);
   assert.equal((await gateway.fill(handoff.handoffId, input)).status, 401);
 });
 
@@ -1014,7 +1014,7 @@ test("login identifier, password, and code steps each require a fresh handoff", 
     const input = { values: { f0: `private-${index}` }, submit: true };
     const filled = await gateway.fill(handoff.handoffId, input);
     assert.equal(filled.status, 200);
-    assert.deepEqual(await filled.json(), { ok: true, submitted: true });
+    assert.deepEqual(await filled.json(), { ok: true, submitted: false });
     assert.equal(gateway.posted.at(-1).target.formId, handoff.formId);
     assert.deepEqual(gateway.posted.at(-1).values, input.values);
     assert.equal((await gateway.fill(handoff.handoffId, input)).status, 401);
@@ -1166,7 +1166,7 @@ for (const submit of [true, false]) {
       values: { f0: "private" },
       submit,
     });
-    assert.deepEqual(await filled.json(), { ok: true, submitted: submit });
+    assert.deepEqual(await filled.json(), { ok: true, submitted: false });
     assert.equal((await gateway.discover()).status, 404);
     const response = await gateway.discover(await gateway.freshCapability());
     assert.equal(response.status, 200);
@@ -1327,7 +1327,7 @@ test("a filled handoff reports its result without discovering the next page", as
     values: { f0: "private" },
     submit: true,
   });
-  const expected = { status: "filled", submitted: true };
+  const expected = { status: "filled", submitted: false };
   assert.deepEqual(await (await fetch(resultUrl)).json(), expected);
   assert.equal((await gateway.discover()).status, 404);
   assert.equal(scans, 1);
@@ -1364,7 +1364,9 @@ test("cancellation and fill failure report fixed results without input or upstre
     ).json(),
     { status: "failed" },
   );
-  assert.equal((await failed.discover()).status, 404);
+  const ended = await failed.discover();
+  assert.equal(ended.status, 404);
+  assert.equal((await ended.json()).code, "handoff_complete");
 });
 
 test("a disconnected app does not interrupt result delivery", async (context) => {
@@ -1409,7 +1411,7 @@ test("a disconnected app does not interrupt result delivery", async (context) =>
     if (result.status !== "pending") break;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  assert.deepEqual(result, { status: "filled", submitted: true });
+  assert.deepEqual(result, { status: "filled", submitted: false });
   assert.equal(gateway.posted.length, 1);
 });
 
@@ -1447,3 +1449,29 @@ test("cancel cannot overwrite an in-flight fill result", async (context) => {
     { status: "filled", submitted: false },
   );
 });
+
+for (const failure of [404, 409, 500, "invalid"]) {
+  test(`opening a secure form reports ${failure} to the agent without waiting for expiry`, async (context) => {
+    const gateway = await secureGateway(
+      context,
+      [secureField("username")],
+      "login",
+      200,
+      {
+        discover: () => {
+          return typeof failure === "number" ? failure : 200;
+        },
+      },
+    );
+    if (failure === "invalid") gateway.metadata.fields = [];
+    assert.equal((await gateway.discover()).ok, false);
+    assert.deepEqual(
+      await (
+        await fetch(`${gateway.base}/credential-result/${gateway.capability}`)
+      ).json(),
+      { status: "failed" },
+    );
+    assert.equal((await gateway.discover()).status, 404);
+    assert.equal(gateway.posted.length, 0);
+  });
+}

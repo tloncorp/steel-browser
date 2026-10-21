@@ -9,6 +9,7 @@ import { createGateway, mintCapability } from "../../../session-viewer/server.mj
 import {
   discoverCredentialForm,
   fillCredentialForm,
+  fillCredentialFormWithWriter,
   getCredentialContinuation,
   prepareCredentialForm,
   getBoundCredentialForm,
@@ -76,6 +77,17 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     await page.goto(`${origin}/login`);
   }
 
+  async function liveLoaderId(client: Awaited<ReturnType<Page["createCDPSession"]>>, id: string) {
+    const { frameTree } = await client.send("Page.getFrameTree");
+    const pending = [frameTree];
+    while (pending.length) {
+      const tree = pending.pop()!;
+      if (tree.frame.id === id) return tree.frame.loaderId;
+      pending.push(...(tree.childFrames || []));
+    }
+    throw new Error("Fixture frame unavailable");
+  }
+
   async function selection(
     selectors: string[],
     frame: Frame = page.mainFrame(),
@@ -112,7 +124,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
             .replace(/\s+/g, " ")
             .trim(),
           frameId: (frame as unknown as { _id: string })._id,
-          loaderId: (frame as unknown as { _loaderId: string })._loaderId,
+          loaderId: await liveLoaderId(frameClient, (frame as unknown as { _id: string })._id),
           ...(owner.asElement()
             ? {
                 formBackendNodeId: (
@@ -131,6 +143,129 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       await cdp.detach();
     }
   }
+
+  it("uses a trusted writer on selected nodes, retains receipts, and never submits", async () => {
+    await load(
+      `<form onsubmit="event.preventDefault();document.body.dataset.submitted='yes'"><label>Email<input id="email" autocomplete="username" required></label><label>Password<input id="password" type="password" autocomplete="current-password"></label><button>Continue</button></form>`,
+    );
+    const target = await prepareCredentialForm(service, await selection(["#email"]));
+    let writes = 0;
+    await fillCredentialFormWithWriter(
+      service,
+      target,
+      { values: { f0: "private@example.test" }, submit: true },
+      async ({ fields, validate }) => {
+        writes++;
+        expect(fields).toHaveLength(1);
+        expect(fields[0].value).toBe("private@example.test");
+        expect(await fields[0].input.evaluate((input) => input.id)).toBe("email");
+        await validate();
+        await fields[0].input.evaluate((input) => {
+          (input as HTMLInputElement).value = "provider-filled";
+        });
+      },
+    );
+    expect(writes).toBe(1);
+    expect(await page.$eval("#email", (input) => input.value)).toBe("provider-filled");
+    expect(await page.$eval("#password", (input) => input.value)).toBe("");
+    expect(await page.evaluate(() => document.body.dataset.submitted)).toBeUndefined();
+    expect(await getCredentialContinuation(service)).toMatchObject({
+      formId: target.formId,
+      submissionAttempted: false,
+    });
+  });
+
+  it("never invokes a trusted writer for replaced controls and never falls back after writer failure", async () => {
+    await load(
+      '<form><label>Email<input id="email" autocomplete="username" required></label></form>',
+    );
+    const target = await prepareCredentialForm(service, await selection(["#email"]));
+    let invoked = false;
+    await page.$eval("#email", (input) => input.replaceWith(input.cloneNode(true)));
+    await expect(
+      fillCredentialFormWithWriter(
+        service,
+        target,
+        { values: { f0: "private@example.test" } },
+        async () => {
+          invoked = true;
+        },
+      ),
+    ).rejects.toThrow();
+    expect(invoked).toBe(false);
+    const fresh = await prepareCredentialForm(service, await selection(["#email"]));
+    await expect(
+      fillCredentialFormWithWriter(
+        service,
+        fresh,
+        { values: { f0: "private@example.test" } },
+        async () => {
+          throw new Error("Provider unavailable");
+        },
+      ),
+    ).rejects.toThrow("Provider unavailable");
+    expect(await page.$eval("#email", (input) => input.value)).toBe("");
+    expect(await getCredentialContinuation(service)).toBeNull();
+    expect(browserMonitorStatus(service).fill).toBeUndefined();
+  });
+
+  it("binds a snapshot from before the credential client attached and rejects real navigation", async () => {
+    await load(
+      '<h1>Sign in</h1><form><label>Email<input id="email" type="email" autocomplete="username"></label><button>Continue</button></form>',
+    );
+    const target = await selection(["#email"]);
+    const lateBrowser = await puppeteer.connect({
+      browserWSEndpoint: browser.wsEndpoint(),
+      defaultViewport: null,
+    });
+    try {
+      const latePage = (await lateBrowser.pages()).find(
+        (candidate) => candidate.url() === page.url(),
+      )!;
+      const lateService = {
+        ...service,
+        getAllPages: async () => [latePage],
+      } as unknown as CDPService;
+      const prepared = await prepareCredentialForm(lateService, target);
+      expect(prepared.fields).toHaveLength(1);
+      await fillCredentialForm(lateService, prepared, {
+        values: { f0: "private@example.test" },
+        submit: false,
+      });
+      expect(await page.$eval("#email", (input) => input.value)).toBe("private@example.test");
+      await page.reload();
+      await expect(prepareCredentialForm(lateService, target)).rejects.toMatchObject({
+        code: "stale_ref",
+      });
+      await expect(
+        prepareCredentialForm(lateService, await selection(["#email"])),
+      ).resolves.toMatchObject({ kind: "login" });
+    } finally {
+      await lateBrowser.disconnect();
+    }
+  });
+
+  it.each([false, true])(
+    "fills without choosing the next action (selected=%s, legacy submit=true)",
+    async (selected) => {
+      await load(
+        `<h1>Sign in</h1><form onsubmit="event.preventDefault();document.body.dataset.submitted='yes'"><label>Email<input id="email" autocomplete="username"></label><button>Continue</button></form>`,
+      );
+      const target = selected
+        ? await prepareCredentialForm(service, await selection(["#email"]))
+        : await discoverCredentialForm(service);
+      await expect(
+        fillCredentialForm(service, target, {
+          values: { f0: "private@example.test" },
+          submit: true,
+        }),
+      ).resolves.toEqual({ submitted: false });
+      expect(await page.$eval("#email", (input) => input.value)).toBe("private@example.test");
+      expect(await page.evaluate(() => document.body.dataset.submitted)).toBeUndefined();
+      await page.click("button");
+      expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+    },
+  );
 
   async function formGateway() {
     const sessionId = "123e4567-e89b-42d3-a456-426614174000";
@@ -223,15 +358,17 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       expect(filled.status).toBe(200);
       expect(await (await fetch(`${base}/credential-result/${token}`)).json()).toEqual({
         status: "filled",
-        submitted: true,
+        submitted: false,
       });
+      expect(await page.$eval("#passkey", (element) => element.hidden)).toBe(true);
+      await page.click("form button");
       await expect(discoverCredentialForm(service)).rejects.toMatchObject({ statusCode: 404 });
       expect(await page.$eval("#passkey", (element) => element.hidden)).toBe(false);
       await page.click("#not-now");
       expect(await page.$eval("h1", (element) => element.textContent)).toBe("Account home");
       expect(await (await fetch(`${base}/credential-result/${token}`)).json()).toEqual({
         status: "filled",
-        submitted: true,
+        submitted: false,
       });
     } finally {
       publicServer.closeAllConnections();
@@ -530,10 +667,11 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       ]),
     );
     await fillCredentialForm(service, form, { values, submit: true });
+    await page.click("button");
     await page.waitForFunction(() => location.pathname === "/done");
     expect(await getCredentialContinuation(service)).toBeNull();
     const status = browserMonitorStatus(service);
-    expect(status.fill).toMatchObject({ formId: form.formId, submitted: true });
+    expect(status.fill).toMatchObject({ formId: form.formId, submitted: false });
     expect(status.revision).toBeGreaterThan(baseline.revision);
     expect(JSON.stringify(status)).not.toMatch(/private-password|private-user|frameUrl|origin/);
   });
@@ -571,7 +709,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       values: { f0: "fixture-user", f1: "fixture-secret" },
       submit: true,
     });
-    expect(result.submitted).toBe(true);
+    expect(result.submitted).toBe(false);
     expect(
       await page.evaluate(() =>
         Array.from(document.querySelectorAll("input")).map((input) => [
@@ -588,7 +726,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     const status = browserMonitorStatus(service);
     expect(status).toMatchObject({
       form: { formId: target.formId },
-      fill: { formId: target.formId, submitted: true },
+      fill: { formId: target.formId, submitted: false },
     });
     expect(JSON.stringify(status)).not.toMatch(/fixture-user|fixture-secret|origin|frameUrl/);
   });
@@ -670,9 +808,9 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     );
   });
 
-  it("observes a submitted login form that remains visible", async () => {
+  it("observes a filled login form that remains visible", async () => {
     await load(`<form onsubmit="event.preventDefault()">${fields}<button>Sign in</button></form>`);
-    expect((await fill()).submitted).toBe(true);
+    expect((await fill()).submitted).toBe(false);
     const filled = browserMonitorStatus(service);
     const redisplayed = await discoverCredentialForm(service, "all");
     const observed = browserMonitorStatus(service);
@@ -682,20 +820,22 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     expect(JSON.stringify(observed)).not.toMatch(/private-password|test-user/);
   });
 
-  it("activates click-only handlers with trusted browser input", async () => {
+  it("leaves click-only handlers for a separate browser action", async () => {
     await load(`<form onsubmit="event.preventDefault()">${fields}<button type="button"
       onclick="document.body.dataset.trusted = event.isTrusted; location.href='/done'">Sign in</button></form>`);
     const result = await fill();
-    expect(result).toMatchObject({ submitted: true });
+    expect(result).toMatchObject({ submitted: false });
+    await page.click("button");
     await page.waitForFunction(() => location.pathname === "/done");
     expect(await getCredentialContinuation(service)).toBeNull();
     expect(JSON.stringify(result)).not.toContain("private-password");
   });
 
-  it("uses the actual submitter and its validation override", async () => {
+  it("leaves submitter choice and validation overrides to the agent", async () => {
     await load(`<form action="/wrong"><input type="email" name="username"><input type="password" required>
       <button name="intent" value="login" formaction="/done" formnovalidate>Log in</button></form>`);
-    expect((await fill()).submitted).toBe(true);
+    expect((await fill()).submitted).toBe(false);
+    await page.click("button");
     await page.waitForFunction(() => location.pathname === "/done");
     expect(requests.some((url) => url.startsWith("/done?") && url.includes("intent=login"))).toBe(
       true,
@@ -703,19 +843,22 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     expect(requests.some((url) => url.startsWith("/wrong"))).toBe(false);
   });
 
-  it("waits for a button enabled by field events and clicks only once", async () => {
+  it("returns after filling without waiting for or clicking a disabled button", async () => {
     await load(`<form onsubmit="event.preventDefault()">${fields}<button disabled>Continue</button></form>
       <script>let clicks=0;document.querySelector('[type=password]').addEventListener('input',()=>
       setTimeout(()=>document.querySelector('button').disabled=false,150));
       document.querySelector('button').onclick=e=>{clicks++;document.body.dataset.clicks=clicks;document.body.dataset.trusted=e.isTrusted}</script>`);
-    expect((await fill()).submitted).toBe(true);
+    expect((await fill()).submitted).toBe(false);
+    expect(await page.evaluate(() => document.body.dataset.clicks)).toBeUndefined();
+    await page.waitForFunction(() => !document.querySelector("button")!.disabled);
+    await page.click("button");
     expect(await page.evaluate(() => ({ ...document.body.dataset }))).toMatchObject({
       clicks: "1",
       trusted: "true",
     });
     expect(await getCredentialContinuation(service)).toMatchObject({
       origin,
-      submissionAttempted: true,
+      submissionAttempted: false,
     });
   });
 
@@ -774,7 +917,9 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
   it("fill-only does not authorize submission or publish any credential values", async () => {
     await load(`<form action="/done">${fields}<button>Sign in</button></form>`);
     expect(await fill(false)).toEqual({ submitted: false });
-    expect(await getCredentialContinuation(service)).toBeNull();
+    const receipt = await getCredentialContinuation(service);
+    expect(receipt).toMatchObject({ kind: "login", submissionAttempted: false });
+    expect(JSON.stringify(receipt)).not.toMatch(/test-user|private-password/);
     expect(page.url()).toBe(`${origin}/login`);
   });
 
@@ -787,7 +932,9 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       values: { [target.fields[0].id]: "123456" },
       submit: true,
     });
-    expect(result.submitted).toBe(true);
+    expect(result.submitted).toBe(false);
+    expect(await page.$eval("input", (input) => input.value)).toBe("123456");
+    await page.click("button");
     expect(await getCredentialContinuation(service)).toBeNull();
   });
 
@@ -820,6 +967,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       values: { f0: "person@example.test" },
       submit: true,
     });
+    await page.click("button");
     const second = await discoverCredentialForm(service, "all");
     expect(second.formId).not.toBe(first.formId);
     expect(second.fields.map((field) => field.purpose)).toEqual(["current-password"]);
@@ -828,9 +976,11 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       fillCredentialForm(service, first, { values: { f0: "do-not-replay" } }),
     ).rejects.toMatchObject({ statusCode: 409 });
     await fillCredentialForm(service, second, { values: { f0: "private-password" }, submit: true });
+    await page.click("button");
     const third = await discoverCredentialForm(service, "all");
     expect(third.fields).toMatchObject([{ purpose: "one-time-code", exactLength: 6 }]);
     await fillCredentialForm(service, third, { values: { f0: "aBc123" }, submit: true });
+    await page.click("button");
     expect(await page.$eval("h2", (el) => el.textContent)).toBe("Account home");
     await expect(discoverCredentialForm(service, "all")).rejects.toMatchObject({ statusCode: 404 });
   });
@@ -839,7 +989,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
     await load(
       `<form onsubmit="event.preventDefault()">${fields}<a href="/register">Sign up</a><a href="/reset">Reset password</a><button>Sign in</button></form>`,
     );
-    expect((await fill()).submitted).toBe(true);
+    expect((await fill()).submitted).toBe(false);
   });
 
   it.each([false, true])(
@@ -867,8 +1017,11 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
           values: { f0: "fixture-user", f1: "fixture-secret" },
           submit: true,
         }),
-      ).resolves.toEqual({ submitted: true });
-      expect(await page.$eval("body", (body) => body.dataset.submitted)).toBe("login");
+      ).resolves.toEqual({ submitted: false });
+      expect(await page.$eval("body", (body) => body.dataset.submitted)).toBeUndefined();
+      expect(
+        await page.$eval("#login [name=acct]", (input) => (input as HTMLInputElement).value),
+      ).toBe("fixture-user");
       expect(
         await page.$$eval("#registration input:not([type=hidden]):not([type=submit])", (inputs) =>
           inputs.map((input) => (input as HTMLInputElement).value),
@@ -876,7 +1029,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       ).toEqual(["", ""]);
     },
   );
-  it("keeps login submission available with optional checkboxes", async () => {
+  it("fills login fields and optional checkboxes without submitting", async () => {
     await load(`<form onsubmit="event.preventDefault();document.body.dataset.sent='yes'">${fields}
       <label>Remember me<input type="checkbox"></label><button>Sign in</button></form>`);
     const target = await discoverCredentialForm(service, "all");
@@ -887,11 +1040,11 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
         values: { f0: "user", f1: "secret", f2: "1" },
         submit: true,
       }),
-    ).toEqual({ submitted: true });
+    ).toEqual({ submitted: false });
     expect(
       await page.$eval('[type="checkbox"]', (input) => (input as HTMLInputElement).checked),
     ).toBe(true);
-    expect(await page.evaluate(() => document.body.dataset.sent)).toBe("yes");
+    expect(await page.evaluate(() => document.body.dataset.sent)).toBeUndefined();
   });
 
   it("revokes a receipt if any filled field changes identity or is cleared", async () => {
@@ -918,7 +1071,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
       "current-password",
       "one-time-code",
     ]);
-    expect(result.submitted).toBe(true);
+    expect(result.submitted).toBe(false);
     expect(await page.$$eval("input", (inputs) => inputs.map((input) => input.value))).toEqual([
       "user",
       "secret",
@@ -1436,13 +1589,13 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
           values: { f0: "fixture-user", f1: "fixture-password" },
           submit: true,
         }),
-      ).toEqual({ submitted: true });
-      expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+      ).toEqual({ submitted: false });
+      expect(await page.evaluate(() => document.body.dataset.submitted)).toBeUndefined();
     },
   );
 
   it.each(["text", "aria-label"])(
-    "submits a component button with whitespace in its %s",
+    "does not activate a component button with whitespace in its %s",
     async (labelSource) => {
       await loadComponentLogin();
       await page.$eval(
@@ -1460,8 +1613,8 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
           values: { f0: "fixture-user", f1: "fixture-password" },
           submit: true,
         }),
-      ).toEqual({ submitted: true });
-      expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+      ).toEqual({ submitted: false });
+      expect(await page.evaluate(() => document.body.dataset.submitted)).toBeUndefined();
     },
   );
 
@@ -1478,8 +1631,8 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
         values: { f0: "fixture-user", f1: "fixture-password" },
         submit: true,
       }),
-    ).toEqual({ submitted: true });
-    expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+    ).toEqual({ submitted: false });
+    expect(await page.evaluate(() => document.body.dataset.submitted)).toBeUndefined();
   });
 
   it("rejects changed slotted labels before filling a component input", async () => {
@@ -1541,8 +1694,8 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
           await page.$eval("#identity >>> input", (input) => (input as HTMLInputElement).value),
         ).toBe("");
       } else {
-        await expect(filled).resolves.toEqual({ submitted: true });
-        expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+        await expect(filled).resolves.toEqual({ submitted: false });
+        expect(await page.evaluate(() => document.body.dataset.submitted)).toBeUndefined();
       }
     },
   );
@@ -1714,7 +1867,7 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
   );
 
   it.each(["automatic", "selected"])(
-    "opens a %s login handoff and submits its bound fields through the viewer",
+    "opens a %s login handoff and fills its bound fields without submitting",
     async (mode) => {
       await load(`<form onsubmit="event.preventDefault();document.body.dataset.submitted='yes'">
         <label>User<input name="user" autocomplete="username" required></label>
@@ -1754,11 +1907,11 @@ describe.skipIf(!existsSync(executablePath))("secure credential entry in Chrome"
           body: JSON.stringify({ values, submit: true }),
         });
         expect(filled.status).toBe(200);
-        expect(await filled.json()).toEqual({ ok: true, submitted: true });
+        expect(await filled.json()).toEqual({ ok: true, submitted: false });
         expect(await page.$$eval("input", (inputs) => inputs.map((input) => input.value))).toEqual(
           Object.values(values),
         );
-        expect(await page.evaluate(() => document.body.dataset.submitted)).toBe("yes");
+        expect(await page.evaluate(() => document.body.dataset.submitted)).toBeUndefined();
         // A form-bound link cannot select a replacement form after navigation.
         await load('<form><input type="password" name="password"><button>Login</button></form>');
         expect((await fetch(`${base}/credentials/${token}`)).ok).toBe(false);

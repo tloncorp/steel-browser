@@ -742,6 +742,7 @@ export function createGateway(config) {
         sendCredentialJson(response, 404, {
           error:
             "This form handoff is complete. Request a fresh handoff for another step.",
+          code: "handoff_complete",
         });
       let round = credentialRounds.get(token);
       if (round && round.status !== "ready") return endRound();
@@ -770,6 +771,7 @@ export function createGateway(config) {
         if (credentialRounds.get(token) !== round || round.status !== "ready")
           return endRound();
         if (!discovered.response.ok) {
+          finishRound(round, { status: "failed" });
           return sendCredentialJson(response, discovered.response.status, {
             error: discovered.body?.error ?? "No live form is available.",
           });
@@ -788,6 +790,7 @@ export function createGateway(config) {
           (capability.formId && formId !== capability.formId) ||
           !fields
         ) {
+          finishRound(round, { status: "failed" });
           return sendCredentialJson(response, 502, {
             error: "Browser returned an invalid secure form.",
           });
@@ -798,6 +801,7 @@ export function createGateway(config) {
             parsedOrigin.protocol !== "https:") ||
           parsedOrigin.origin !== origin
         ) {
+          finishRound(round, { status: "failed" });
           return sendCredentialJson(response, 502, {
             error: "Browser returned an invalid credential origin.",
           });
@@ -847,6 +851,7 @@ export function createGateway(config) {
           ...(handoff.vault ? { vault: handoff.vault } : {}),
         });
       } catch {
+        finishRound(round, { status: "failed" });
         return sendCredentialJson(response, 502, {
           error: "Browser unavailable.",
         });
@@ -922,7 +927,7 @@ export function createGateway(config) {
           const filled = await vaultRequest("fill", {
             ...body,
             handoffId: credentialFill[1],
-            submit: body.submit === true,
+            submit: false,
           });
           finishRound(
             round,
@@ -965,7 +970,7 @@ export function createGateway(config) {
           body: JSON.stringify({
             target: handoff.target,
             values: body.values,
-            submit: handoff.target.kind === "login" && body.submit === true,
+            submit: false,
           }),
         });
         if (!filled.response.ok || filled.body?.ok !== true) {
