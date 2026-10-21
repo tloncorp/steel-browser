@@ -10,6 +10,7 @@ import { createComposedDom, type ComposedDom } from "./composed-dom.js";
 import { secureFieldDefinitions, type SecureFormField } from "./secure-form-fields.js";
 import {
   disposeSelectedFields,
+  SelectedFormStaleError,
   resolveSelectedFields,
   type SelectedFormHandles,
   type SelectedFormRequest,
@@ -29,9 +30,22 @@ export interface CredentialFormDescription extends CredentialFormTarget {
 export type CredentialFormScope = "all" | "sensitive";
 export interface CredentialFormValues {
   values: Record<string, string>;
+  /** Legacy input accepted for compatibility; secure entry never submits. */
   submit?: boolean;
   vault?: boolean;
 }
+/** Trusted transport hook. Selection, validation, locking and receipts stay here. */
+export interface CredentialFormWrite {
+  frame: Frame;
+  fields: Array<{
+    input: ElementHandle<HTMLElement>;
+    field: SecureFormField;
+    value: string;
+  }>;
+  validate: () => Promise<void>;
+}
+export type CredentialFormWriter = (request: CredentialFormWrite) => Promise<void>;
+
 export class CredentialFormError extends Error {
   constructor(
     message: string,
@@ -135,114 +149,6 @@ export async function getCredentialContinuation(
   }
   return { ...state.receipt };
 }
-/** Click one unambiguous login control through the browser's input pipeline. */
-async function activateCredentialControl(bound: JSHandle<BoundForm>): Promise<boolean> {
-  const deadline = Date.now() + 2_000;
-  do {
-    const handle = await bound.evaluateHandle(({ scope, dom }) => {
-      if (!scope.isConnected) return null;
-      const visible = (element: HTMLElement) => {
-        const style = getComputedStyle(element);
-        const rect = element.getBoundingClientRect();
-        return (
-          rect.width > 0 &&
-          rect.height > 0 &&
-          style.display !== "none" &&
-          style.visibility === "visible" &&
-          !dom.closest(element, '[inert], [aria-hidden="true"]')
-        );
-      };
-      const isLogin = (element: HTMLElement) =>
-        /^(?:log\s*in|sign\s*in|continue|next|verify|submit)(?:\s|$)/i.test(
-          (
-            element.getAttribute("aria-label") ||
-            dom.text(element) ||
-            (element as HTMLInputElement).value ||
-            ""
-          ).trim(),
-        ) && !/\b(?:with|google|apple|facebook|register|sign\s*up)\b/i.test(dom.text(element));
-      const form = scope instanceof HTMLFormElement ? scope : null;
-      let candidates: HTMLElement[];
-      if (form) {
-        candidates = dom
-          .elements(document)
-          .filter(
-            (control): control is HTMLButtonElement | HTMLInputElement =>
-              (control instanceof HTMLButtonElement || control instanceof HTMLInputElement) &&
-              control.form === form &&
-              control.type === "submit" &&
-              visible(control),
-          );
-        if (!candidates.length) {
-          candidates = dom
-            .elements(form)
-            .filter(
-              (control): control is HTMLElement =>
-                control instanceof HTMLElement &&
-                control.matches('button, [role="button"]') &&
-                visible(control) &&
-                isLogin(control),
-            );
-        }
-      } else {
-        candidates = dom
-          .elements(scope)
-          .filter(
-            (control): control is HTMLElement =>
-              control instanceof HTMLElement &&
-              control.matches('button, [role="button"], input[type="submit"]') &&
-              visible(control) &&
-              isLogin(control),
-          );
-      }
-      if (candidates.length !== 1) return null;
-      const control = candidates[0];
-      const label =
-        control.getAttribute("aria-label") ||
-        dom.text(control) ||
-        (control as HTMLInputElement).value ||
-        "";
-      if (
-        /\b(?:buy|purchase|pay|delete|remove|save|change|reset|register|create|subscribe|transfer|order)\b|sign\s*up/i.test(
-          label,
-        )
-      )
-        return null;
-      if (control.matches(':disabled, [aria-disabled="true"]')) return null;
-      if (form) {
-        const action =
-          control.getAttribute("formaction") || form.getAttribute("action") || location.href;
-        if (new URL(action, document.baseURI).origin !== location.origin) return null;
-      }
-      return control;
-    });
-    try {
-      const control = handle.asElement() as ElementHandle<HTMLElement> | null;
-      if (control) {
-        await control.scrollIntoView();
-        const reachable = await control.evaluate((element) => {
-          const rect = element.getBoundingClientRect();
-          const root = element.getRootNode() as Document | ShadowRoot;
-          const hit = root.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
-          return (
-            element.isConnected &&
-            !element.matches(':disabled, [aria-disabled="true"]') &&
-            (hit === element || (hit !== null && element.contains(hit)))
-          );
-        });
-        if (reachable) {
-          await control.click();
-          return true;
-        }
-      }
-    } finally {
-      await handle.dispose();
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  } while (Date.now() < deadline);
-  return false;
-}
-
 function pageId(page: Page): string {
   return (page.target() as unknown as { _targetId: string })._targetId;
 }
@@ -1303,6 +1209,7 @@ async function fillBoundForm(
   cdpService: CDPService,
   target: CredentialFormTarget,
   request: CredentialFormValues,
+  writer?: CredentialFormWriter,
 ): Promise<{ submitted: boolean }> {
   const located = forms.get(cdpService);
   if (
@@ -1412,14 +1319,60 @@ async function fillBoundForm(
         }
         continue;
       }
-      const result = await part.handle
-        .evaluateHandle(
-          applyBoundValues,
-          { frameUrl: part.frameUrl, origin: part.origin, vault: request.vault },
-          values,
-          true,
-        )
-        .catch(() => undefined);
+      let result: JSHandle | undefined;
+      if (writer) {
+        const controls: CredentialFormWrite["fields"] = [];
+        try {
+          for (const field of await part.handle.evaluate((form) =>
+            form.fields.map((bound) => bound.descriptor),
+          )) {
+            const value = values[field.id];
+            if (value === undefined) continue;
+            const handle = await part.handle.evaluateHandle((form, id) => {
+              const bound = form.fields.find((candidate) => candidate.descriptor.id === id);
+              return bound && !bound.choice && bound.inputs.length === 1 ? bound.inputs[0] : null;
+            }, field.id);
+            const input = handle.asElement() as ElementHandle<HTMLElement> | null;
+            if (!input) {
+              await handle.dispose();
+              throw new CredentialFormError(
+                "This secure-entry transport does not support the selected control.",
+                400,
+              );
+            }
+            controls.push({ input, field, value });
+          }
+          const validate = async () => {
+            if (
+              !(await attachedParts(located.parts)) ||
+              !(await part.handle
+                .evaluate(
+                  applyBoundValues,
+                  { frameUrl: part.frameUrl, origin: part.origin, vault: request.vault },
+                  values,
+                  false,
+                )
+                .catch(() => false))
+            )
+              throw changed();
+          };
+          await validate();
+          await writer({ frame: part.frame, fields: controls, validate });
+          await validate();
+          result = await part.handle.evaluateHandle((form) => form.scope);
+        } finally {
+          await Promise.all(controls.map(({ input }) => input.dispose().catch(() => {})));
+        }
+      } else {
+        result = await part.handle
+          .evaluateHandle(
+            applyBoundValues,
+            { frameUrl: part.frameUrl, origin: part.origin, vault: request.vault },
+            values,
+            true,
+          )
+          .catch(() => undefined);
+      }
       const filled = result?.asElement() as ElementHandle<HTMLElement> | null;
       if (!filled) {
         await result?.dispose();
@@ -1435,10 +1388,6 @@ async function fillBoundForm(
   } catch (error) {
     await anchor?.dispose();
     throw error;
-  }
-  if (request.submit !== true && located.description.kind === "login") {
-    await anchor.dispose();
-    return { submitted: false };
   }
   // A receipt identifies an exact node, so MCP never guesses which filled form
   // a continuation button belongs to. It carries no field values.
@@ -1473,13 +1422,8 @@ async function fillBoundForm(
     filledIds: Object.keys(values).filter((id) => values[id] !== ""),
     timer,
   });
-  // Filling card/address fields does not authorize any transaction or save.
-  const submitted =
-    request.submit === true &&
-    located.description.kind === "login" &&
-    (await activateCredentialControl(located.parts[0].handle).catch(() => false));
-  receipt.submissionAttempted = submitted;
-  return { submitted };
+  // The agent owns all navigation and submission, including login buttons.
+  return { submitted: false };
 }
 
 // A fill is one browser operation. Concurrent discovery must not dispose its
@@ -1489,12 +1433,13 @@ export async function fillCredentialForm(
   cdpService: CDPService,
   target: CredentialFormTarget,
   request: CredentialFormValues,
+  writer?: CredentialFormWriter,
 ): Promise<{ submitted: boolean }> {
   if (filling.has(cdpService))
     throw new CredentialFormError("A secure form is already being filled.", 409, "session_busy");
   filling.add(cdpService);
   try {
-    const result = await fillBoundForm(cdpService, target, request);
+    const result = await fillBoundForm(cdpService, target, request, writer);
     recordBrowserFill(cdpService, target.formId, result.submitted);
     return result;
   } catch (error) {
@@ -1525,7 +1470,7 @@ export async function discoverCredentialForm(
   }
 }
 
-/** Bind selected controls; a complete login retains login submission and vault eligibility. */
+/** Bind selected controls; a complete login retains vault eligibility, never submission. */
 export async function prepareCredentialForm(
   cdpService: CDPService,
   selection: SelectedFormRequest,
@@ -1549,11 +1494,8 @@ export async function prepareCredentialForm(
     try {
       handles = await resolveSelectedFields(page, selection);
     } catch (error) {
-      throw new CredentialFormError(
-        error instanceof Error ? error.message : "The selected fields changed.",
-        409,
-        "stale_ref",
-      );
+      if (!(error instanceof SelectedFormStaleError)) throw error;
+      throw new CredentialFormError(error.message, 409, "stale_ref");
     }
     const result = await discoverBoundForm(cdpService, "all", { page, handles });
     recordBrowserForm(cdpService, result.formId);
@@ -1589,4 +1531,15 @@ export async function getBoundCredentialForm(
       409,
     );
   return located.description;
+}
+
+/** Explicit capability for adapters; older services cannot silently use DOM fill. */
+export async function fillCredentialFormWithWriter(
+  cdpService: CDPService,
+  target: CredentialFormTarget,
+  request: CredentialFormValues,
+  writer: CredentialFormWriter,
+): Promise<{ submitted: boolean }> {
+  if (typeof writer !== "function") throw new Error("A trusted credential writer is required.");
+  return fillCredentialForm(cdpService, target, request, writer);
 }
