@@ -2,6 +2,7 @@ import { record } from "rrweb";
 import { pack } from "@rrweb/packer";
 
 record({
+  maskAllInputs: true,
   emit: (event) => {
     chrome.runtime.sendMessage(
       {

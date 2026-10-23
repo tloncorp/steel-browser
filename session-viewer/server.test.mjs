@@ -108,7 +108,7 @@ test("a selected-form capability binds its form ID into the signature", () => {
   );
 });
 
-test("live session responses receive neutral capability and scoped CDP URLs", () => {
+test("live session responses expose a viewer without a raw CDP capability", () => {
   const rewritten = rewriteSession(
     {
       id: sessionId,
@@ -138,16 +138,7 @@ test("live session responses receive neutral capability and scoped CDP URLs", ()
   );
   assert.equal(rewritten.debugUrl, rewritten.sessionViewerUrl);
   assert.equal(rewritten.debuggerUrl, rewritten.sessionViewerUrl);
-  const websocket = new URL(rewritten.websocketUrl);
-  assert.equal(websocket.protocol, "wss:");
-  assert.equal(websocket.pathname, "/cdp");
-  assert.equal(websocket.searchParams.get("sessionId"), sessionId);
-  const verified = verifyCapability(
-    websocket.searchParams.get("cap"),
-    secret,
-    20_000,
-  );
-  assert.deepEqual(verified, { sessionId, expiresAt: 70_000 });
+  assert.equal(rewritten.websocketUrl, "");
 });
 
 test("released sessions are not given viewer capabilities", () => {
@@ -259,7 +250,7 @@ test("the public listener exposes only a capability-scoped viewer", async (conte
     new URL(created.sessionViewerUrl).searchParams.get("clipboardBridge"),
     "true",
   );
-  assert.match(created.websocketUrl, /^wss:\/\/viewer\.example\/cdp\?/);
+  assert.equal(created.websocketUrl, "");
 
   const publicBase = `http://127.0.0.1:${publicPort}`;
   const denied = await fetch(`${publicBase}/v1/sessions`);
@@ -311,6 +302,7 @@ async function secureGateway(
   kind = "login",
   fillStatus = 200,
   hooks = {},
+  vault,
 ) {
   const posted = [];
   const discovered = [];
@@ -381,6 +373,7 @@ async function secureGateway(
     publicOrigin: "https://viewer.example",
     upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
     maximumTtlMs: 900_000,
+    vault,
   });
   const [publicPort, internalPort] = await Promise.all([
     listen(publicServer),
@@ -403,6 +396,8 @@ async function secureGateway(
     assert.equal(response.status, 200);
     return new URL((await response.json()).sessionViewerUrl).pathname.slice(3);
   };
+  const cancel = (token = capability) =>
+    fetch(`${base}/credentials/${token}`, { method: "DELETE" });
   const fill = (id, body) =>
     fetch(`${base}/credential-fills/${id}`, {
       method: "POST",
@@ -410,6 +405,7 @@ async function secureGateway(
       body: JSON.stringify(body),
     });
   return {
+    cancel,
     metadata,
     posted,
     discovered,
@@ -454,31 +450,33 @@ test("secure handoffs expose metadata and a one-use endpoint, never values or se
   };
   const filled = await gateway.fill(handoff.handoffId, input);
   assert.equal(filled.status, 200);
-  assert.deepEqual(await filled.json(), { ok: true, submitted: true });
+  assert.deepEqual(await filled.json(), { ok: true, submitted: false });
   const { fields: _fields, ...target } = gateway.metadata;
-  assert.deepEqual(gateway.posted, [{ target, ...input }]);
+  assert.deepEqual(gateway.posted, [{ target, ...input, submit: false }]);
   assert.equal((await gateway.fill(handoff.handoffId, input)).status, 401);
 });
 
-test("selected-form links refuse a different discovered form and never broaden to automatic discovery", async (context) => {
-  const formId = "223e4567-e89b-42d3-a456-426614174000";
-  const gateway = await secureGateway(
-    context,
-    [secureField("field")],
-    "details",
-    200,
-    { formId },
-  );
-  const capability = mintCapability(
-    { sessionId, formId, expiresAt: Date.now() + 60_000 },
-    secret,
-  );
-  const handoff = await (await gateway.discover(capability)).json();
-  assert.equal(handoff.formId, formId);
-  gateway.metadata.formId = "323e4567-e89b-42d3-a456-426614174000";
-  assert.equal((await gateway.discover(capability)).status, 502);
-  assert.equal(gateway.posted.length, 0);
-});
+for (const kind of ["login", "details"]) {
+  test(`${kind} form-bound links refuse a different form and never broaden to automatic discovery`, async (context) => {
+    const formId = "223e4567-e89b-42d3-a456-426614174000";
+    const gateway = await secureGateway(
+      context,
+      [secureField("field")],
+      kind,
+      200,
+      { formId },
+    );
+    const capability = mintCapability(
+      { sessionId, formId, expiresAt: Date.now() + 60_000 },
+      secret,
+    );
+    const handoff = await (await gateway.discover(capability)).json();
+    assert.equal(handoff.formId, formId);
+    gateway.metadata.formId = "323e4567-e89b-42d3-a456-426614174000";
+    assert.equal((await gateway.discover(capability)).status, 502);
+    assert.equal(gateway.posted.length, 0);
+  });
+}
 
 test("field contracts reject wrong keys and enforce verification-code length", async (context) => {
   const gateway = await secureGateway(context, [
@@ -632,6 +630,296 @@ for (const fields of [
   });
 }
 
+test("saved-login requests require the private service and a one-use prepared handoff", async (context) => {
+  const calls = [];
+  const vault = http.createServer(async (request, response) => {
+    assert.equal(request.headers["x-browser-vault-service"], secret);
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+    calls.push({ path: request.url, body });
+    const answer = request.url.endsWith("/prepare")
+      ? {
+          available: true,
+          planet: "sampel-palnet",
+          moon: "pinser-botter-sampel-palnet",
+        }
+      : request.url.endsWith("/authorize")
+      ? {
+          grant: "g".repeat(43),
+          accounts: [{ id: sessionId, label: "Personal", revision: 1 }],
+        }
+      : { ok: true, submitted: true, saveStatus: "failed" };
+    response
+      .writeHead(200, { "content-type": "application/json" })
+      .end(JSON.stringify(answer));
+  });
+  const port = await listen(vault);
+  context.after(() => close(vault));
+  const gateway = await secureGateway(
+    context,
+    [
+      {
+        id: "f0",
+        purpose: "current-password",
+        label: "Password",
+        inputType: "password",
+        required: true,
+      },
+    ],
+    "login",
+    200,
+    {},
+    { origin: `http://127.0.0.1:${port}`, token: secret },
+  );
+  gateway.metadata.vaultEligible = true;
+  const handoff = await (await gateway.discover()).json();
+  assert.deepEqual(handoff.vault, {
+    available: true,
+    planet: "sampel-palnet",
+    moon: "pinser-botter-sampel-palnet",
+  });
+  assert.equal(calls[0].body.sessionId, sessionId);
+  const authorize = await fetch(
+    `${gateway.base}/credential-vault/${handoff.handoffId}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        planet: "sampel-palnet",
+        ownerToken: "owner-private",
+      }),
+    },
+  );
+  const auth = await authorize.json();
+  assert.equal(calls[1].path, "/internal/vault/authorize");
+  assert.equal(calls[1].body.ownerToken, "owner-private");
+  for (const values of [null, [], {}, "unexpected"]) {
+    assert.equal(
+      (
+        await gateway.fill(handoff.handoffId, {
+          use: { id: sessionId, revision: 1 },
+          grant: auth.grant,
+          values,
+        })
+      ).status,
+      400,
+    );
+  }
+  const result = await gateway.fill(handoff.handoffId, {
+    grant: auth.grant,
+    values: { f0: "fixture-password" },
+    submit: true,
+    save: { label: "Personal" },
+  });
+  assert.deepEqual(await result.json(), {
+    ok: true,
+    submitted: true,
+    saveStatus: "failed",
+  });
+  assert.equal(calls[2].path, "/internal/vault/fill");
+  assert.equal(calls[2].body.handoffId, handoff.handoffId);
+  assert.equal(
+    gateway.posted.length,
+    0,
+    "the vault owns the single private browser fill",
+  );
+  assert.equal(
+    (
+      await gateway.fill(handoff.handoffId, {
+        use: { id: sessionId, revision: 1 },
+        grant: auth.grant,
+      })
+    ).status,
+    401,
+  );
+  assert.equal(
+    (
+      await fetch(`${gateway.base}/credential-vault/${handoff.handoffId}`, {
+        method: "POST",
+        body: "{}",
+      })
+    ).status,
+    404,
+  );
+  assert.equal(JSON.stringify(handoff).includes("owner-private"), false);
+  const nextToken = await gateway.freshCapability();
+  const nextStep = await gateway.discover(nextToken);
+  assert.equal(nextStep.status, 200);
+  const abandoned = await nextStep.json();
+  assert.notEqual(abandoned.handoffId, handoff.handoffId);
+  assert.equal((await gateway.cancel(nextToken)).status, 200);
+  assert.deepEqual(calls.at(-1), {
+    path: "/internal/vault/cancel",
+    body: { sessionId },
+  });
+  assert.equal(
+    (
+      await gateway.fill(abandoned.handoffId, {
+        use: { id: sessionId, revision: 1 },
+        grant: auth.grant,
+      })
+    ).status,
+    401,
+  );
+});
+
+test("manual entry discards pending save consent and unavailable vaults do not block it", async (context) => {
+  const paths = [];
+  let available = true;
+  const vault = http.createServer(async (request, response) => {
+    paths.push(request.url);
+    for await (const _ of request) {
+      /* drain bounded fixture body */
+    }
+    response
+      .writeHead(available ? 200 : 503, { "content-type": "application/json" })
+      .end(
+        JSON.stringify(
+          request.url.endsWith("/prepare")
+            ? {
+                available: true,
+                planet: "sampel-palnet",
+                moon: "pinser-botter-sampel-palnet",
+              }
+            : { ok: true },
+        ),
+      );
+  });
+  const port = await listen(vault);
+  context.after(() => close(vault));
+  const gateway = await secureGateway(
+    context,
+    [
+      {
+        id: "f0",
+        purpose: "username",
+        label: "Username",
+        inputType: "text",
+        required: true,
+      },
+    ],
+    "login",
+    200,
+    {},
+    { origin: `http://127.0.0.1:${port}`, token: secret },
+  );
+  gateway.metadata.vaultEligible = true;
+  const handoff = await (await gateway.discover()).json();
+  assert.equal(
+    (
+      await gateway.fill(handoff.handoffId, {
+        values: { f0: "manual-user" },
+        submit: true,
+      })
+    ).status,
+    200,
+  );
+  assert.deepEqual(paths, [
+    "/internal/vault/prepare",
+    "/internal/vault/discard",
+  ]);
+  assert.equal(gateway.posted.length, 1);
+  available = false;
+  const withoutVault = await (
+    await gateway.discover(await gateway.freshCapability())
+  ).json();
+  assert.equal(withoutVault.vault, undefined);
+  assert.equal(
+    (
+      await gateway.fill(withoutVault.handoffId, {
+        values: { f0: "manual-user" },
+      })
+    ).status,
+    200,
+  );
+});
+
+test("viewer access requires a separate owner proof and never grants raw CDP", async (context) => {
+  let authorizedSession;
+  const vault = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+    assert.equal(request.url, "/internal/vault/authorize-viewer");
+    assert.equal(request.headers["x-browser-vault-service"], secret);
+    authorizedSession = body.sessionId;
+    response
+      .writeHead(body.ownerToken === "owner-proof" ? 200 : 403, {
+        "content-type": "application/json",
+      })
+      .end(JSON.stringify({ ok: true }));
+  });
+  const port = await listen(vault);
+  context.after(() => close(vault));
+  const gateway = await secureGateway(
+    context,
+    [secureField("username")],
+    "login",
+    200,
+    {},
+    { origin: `http://127.0.0.1:${port}`, token: secret },
+  );
+  const formId = "223e4567-e89b-42d3-a456-426614174000";
+  const capability = mintCapability(
+    { sessionId, formId, expiresAt: Date.now() + 60_000 },
+    secret,
+  );
+  assert.equal((await fetch(`${gateway.base}/s/${capability}`)).status, 401);
+  assert.equal(
+    (
+      await fetch(
+        `${gateway.base}/viewer?sessionId=${sessionId}&cap=${capability}`,
+      )
+    ).status,
+    401,
+  );
+  const authorize = (ownerToken) =>
+    fetch(`${gateway.base}/viewer-authorize`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ capability, planet: "sampel-palnet", ownerToken }),
+    });
+  assert.equal((await authorize("browser-key")).status, 403);
+  const response = await authorize("owner-proof");
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  const token = new URL(body.viewerUrl).pathname.split("/s/")[1];
+  assert.equal(verifyCapability(token, secret).owner, true);
+  assert.equal(verifyCapability(token, secret).formId, formId);
+  assert.equal(authorizedSession, sessionId);
+  assert.equal(verifyCapability(capability, secret).owner, undefined);
+  for (const [path, expected] of [
+    ["/v1/sessions/cast", 401],
+    ["/cdp", 404],
+  ]) {
+    const tokenForPath = path === "/cdp" ? token : capability;
+    const status = await new Promise((resolve, reject) => {
+      const req = http.request(
+        `${gateway.base}${path}?sessionId=${sessionId}&cap=${tokenForPath}`,
+        {
+          headers: {
+            connection: "Upgrade",
+            upgrade: "websocket",
+            "sec-websocket-version": "13",
+            "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+          },
+        },
+      );
+      req.on("response", (res) => {
+        res.resume();
+        resolve(res.statusCode);
+      });
+      req.on("upgrade", (_res, socket) => {
+        socket.destroy();
+        reject(new Error("Unexpected upgrade"));
+      });
+      req.on("error", reject);
+      req.end();
+    });
+    assert.equal(status, expected);
+  }
+});
 test("a fill admitted before its deadline cannot dispatch after a delayed body expires", async (context) => {
   const gateway = await secureGateway(context, [secureField("username")]);
   const handoff = await (await gateway.discover()).json();
@@ -694,7 +982,7 @@ test("session reads mint distinct capabilities with the same session deadline", 
   );
 });
 
-test("login identifier, password, and code steps share one link with single-use fill handles", async (context) => {
+test("login identifier, password, and code steps each require a fresh handoff", async (context) => {
   let discoveryStatus = 200;
   const gateway = await secureGateway(
     context,
@@ -711,7 +999,9 @@ test("login identifier, password, and code steps share one link with single-use 
   ].entries()) {
     gateway.metadata.formId = `form-${index}`;
     gateway.metadata.fields = [secureField(purpose)];
-    const response = await gateway.discover();
+    const token =
+      index === 0 ? gateway.capability : await gateway.freshCapability();
+    const response = await gateway.discover(token);
     assert.equal(response.status, 200);
     const handoff = await response.json();
     assert.equal(handoff.formId, `form-${index}`);
@@ -724,12 +1014,13 @@ test("login identifier, password, and code steps share one link with single-use 
     const input = { values: { f0: `private-${index}` }, submit: true };
     const filled = await gateway.fill(handoff.handoffId, input);
     assert.equal(filled.status, 200);
-    assert.deepEqual(await filled.json(), { ok: true, submitted: true });
+    assert.deepEqual(await filled.json(), { ok: true, submitted: false });
     assert.equal(gateway.posted.at(-1).target.formId, handoff.formId);
     assert.deepEqual(gateway.posted.at(-1).values, input.values);
     assert.equal((await gateway.fill(handoff.handoffId, input)).status, 401);
+    assert.equal((await gateway.discover(token)).status, 404);
   }
-  // Propagate the absence of a supported form so the app can return to the bot.
+  // A completed request stays closed regardless of the current page.
   discoveryStatus = 404;
   assert.equal((await gateway.discover()).status, 404);
   assert.equal(gateway.posted.length, 3);
@@ -768,7 +1059,7 @@ test("details fills end discovery on that link and a fresh bot handoff opens the
   assert.equal(gateway.posted.length, 1);
 });
 
-test("a failed fill allows fresh discovery on the same link without replaying values", async (context) => {
+test("a failed fill closes its request and requires a fresh handoff", async (context) => {
   const gateway = await secureGateway(
     context,
     [secureField("username")],
@@ -780,7 +1071,8 @@ test("a failed fill allows fresh discovery on the same link without replaying va
     (await gateway.fill(first.handoffId, { values: { f0: "private" } })).status,
     500,
   );
-  const retry = await gateway.discover();
+  assert.equal((await gateway.discover()).status, 404);
+  const retry = await gateway.discover(await gateway.freshCapability());
   assert.equal(retry.status, 200);
   assert.notEqual((await retry.json()).handoffId, first.handoffId);
   assert.equal(gateway.posted.length, 1);
@@ -841,9 +1133,10 @@ for (const kind of ["login", "details"]) {
       }
       releaseFill.resolve();
       assert.equal((await pendingFill).status, 200);
-      const response = await gateway.discover();
-      assert.equal(response.status, kind === "login" ? 200 : 404);
-      if (kind === "login") next = await response.json();
+      assert.equal((await gateway.discover()).status, 404);
+      const response = await gateway.discover(await gateway.freshCapability());
+      assert.equal(response.status, 200);
+      next = await response.json();
       if (!discoveryFinishesFirst) {
         releaseDiscovery.resolve();
         assert.equal((await pendingDiscovery).status, 404);
@@ -866,15 +1159,16 @@ for (const kind of ["login", "details"]) {
 }
 
 for (const submit of [true, false]) {
-  test(`a login form that remains allows fresh input without replay (submit=${submit})`, async (context) => {
+  test(`a login form that remains requires a fresh request without replay (submit=${submit})`, async (context) => {
     const gateway = await secureGateway(context, [secureField("username")]);
     const handoff = await (await gateway.discover()).json();
     const filled = await gateway.fill(handoff.handoffId, {
       values: { f0: "private" },
       submit,
     });
-    assert.deepEqual(await filled.json(), { ok: true, submitted: submit });
-    const response = await gateway.discover();
+    assert.deepEqual(await filled.json(), { ok: true, submitted: false });
+    assert.equal((await gateway.discover()).status, 404);
+    const response = await gateway.discover(await gateway.freshCapability());
     assert.equal(response.status, 200);
     const next = await response.json();
     assert.equal(next.formId, handoff.formId);
@@ -933,5 +1227,251 @@ for (const code of ["stale_ref", "session_busy"]) {
     );
     assert.equal(response.status, 409);
     assert.equal((await response.json()).code, code);
+  });
+}
+
+test("automatic preparation issues a capability bound to the discovered form", async (context) => {
+  const formId = "223e4567-e89b-42d3-a456-426614174000";
+  const requests = [];
+  const upstream = http.createServer((request, response) => {
+    requests.push([request.method, request.url]);
+    response.setHeader("content-type", "application/json");
+    if (request.url === `/v1/sessions/${sessionId}`)
+      return response.end(
+        JSON.stringify({
+          id: sessionId,
+          status: "live",
+          createdAt: new Date().toISOString(),
+          timeout: 60_000,
+        }),
+      );
+    if (
+      request.method === "GET" &&
+      request.url === `/v1/sessions/${sessionId}/credential-form?scope=all`
+    )
+      return response.end(
+        JSON.stringify({ formId, fields: [{ purpose: "username" }] }),
+      );
+    response.writeHead(400).end("{}");
+  });
+  const upstreamPort = await listen(upstream);
+  const { internal, publicServer } = createGateway({
+    secret,
+    publicOrigin: "https://viewer.test",
+    upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
+    maximumTtlMs: 900_000,
+  });
+  const port = await listen(internal);
+  const publicPort = await listen(publicServer);
+  context.after(() =>
+    Promise.all([close(internal), close(publicServer), close(upstream)]),
+  );
+  const response = await fetch(
+    `http://127.0.0.1:${port}/v1/sessions/${sessionId}/credential-handoff`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ discover: true }),
+    },
+  );
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  const capability = verifyCapability(
+    new URL(body.viewer_url).pathname.slice(3),
+    secret,
+  );
+  assert.equal(capability.sessionId, sessionId);
+  assert.equal(capability.formId, formId);
+  assert.ok(body.expires_at <= Date.now() + 60_000);
+  assert.equal(requests.length, 2);
+  const ambiguous = await fetch(
+    `http://127.0.0.1:${port}/v1/sessions/${sessionId}/credential-handoff`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ discover: true, fields: [] }),
+    },
+  );
+  assert.equal(ambiguous.status, 409);
+  assert.equal(requests.length, 2);
+  const token = new URL(body.viewer_url).pathname.slice(3);
+  const resultUrl = `http://127.0.0.1:${publicPort}/credential-result/${token}`;
+  assert.deepEqual(await (await fetch(resultUrl)).json(), {
+    status: "pending",
+  });
+  await fetch(`http://127.0.0.1:${publicPort}/credentials/${token}`, {
+    method: "DELETE",
+  });
+  assert.deepEqual(await (await fetch(resultUrl)).json(), {
+    status: "cancelled",
+  });
+});
+
+test("a filled handoff reports its result without discovering the next page", async (context) => {
+  let scans = 0;
+  const gateway = await secureGateway(
+    context,
+    [secureField("username")],
+    "login",
+    200,
+    {
+      discover: () => (++scans === 1 ? 200 : 500),
+    },
+  );
+  const handoff = await (await gateway.discover()).json();
+  const resultUrl = `${gateway.base}/credential-result/${gateway.capability}`;
+  assert.deepEqual(await (await fetch(resultUrl)).json(), {
+    status: "pending",
+  });
+  await gateway.fill(handoff.handoffId, {
+    values: { f0: "private" },
+    submit: true,
+  });
+  const expected = { status: "filled", submitted: false };
+  assert.deepEqual(await (await fetch(resultUrl)).json(), expected);
+  assert.equal((await gateway.discover()).status, 404);
+  assert.equal(scans, 1);
+  await gateway.cancel();
+  assert.deepEqual(await (await fetch(resultUrl)).json(), expected);
+});
+
+test("cancellation and fill failure report fixed results without input or upstream errors", async (context) => {
+  const canceled = await secureGateway(context, [secureField("username")]);
+  const first = await (await canceled.discover()).json();
+  await canceled.cancel();
+  assert.deepEqual(
+    await (
+      await fetch(`${canceled.base}/credential-result/${canceled.capability}`)
+    ).json(),
+    { status: "cancelled" },
+  );
+  assert.equal(
+    (await canceled.fill(first.handoffId, { values: { f0: "private" } }))
+      .status,
+    401,
+  );
+  const failed = await secureGateway(
+    context,
+    [secureField("username")],
+    "login",
+    500,
+  );
+  const second = await (await failed.discover()).json();
+  await failed.fill(second.handoffId, { values: { f0: "private" } });
+  assert.deepEqual(
+    await (
+      await fetch(`${failed.base}/credential-result/${failed.capability}`)
+    ).json(),
+    { status: "failed" },
+  );
+  const ended = await failed.discover();
+  assert.equal(ended.status, 404);
+  assert.equal((await ended.json()).code, "handoff_complete");
+});
+
+test("a disconnected app does not interrupt result delivery", async (context) => {
+  let finish;
+  let started;
+  const entered = new Promise((resolve) => {
+    started = resolve;
+  });
+  const gateway = await secureGateway(
+    context,
+    [secureField("username")],
+    "login",
+    200,
+    {
+      fill: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+          started();
+        }),
+    },
+  );
+  const handoff = await (await gateway.discover()).json();
+  const controller = new AbortController();
+  const filling = fetch(
+    `${gateway.base}/credential-fills/${handoff.handoffId}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ values: { f0: "private" }, submit: true }),
+      signal: controller.signal,
+    },
+  ).catch((error) => error);
+  await entered;
+  controller.abort();
+  assert.equal((await filling).name, "AbortError");
+  finish();
+  let result;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    result = await (
+      await fetch(`${gateway.base}/credential-result/${gateway.capability}`)
+    ).json();
+    if (result.status !== "pending") break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.deepEqual(result, { status: "filled", submitted: false });
+  assert.equal(gateway.posted.length, 1);
+});
+
+test("cancel cannot overwrite an in-flight fill result", async (context) => {
+  let finish;
+  let started;
+  const entered = new Promise((resolve) => {
+    started = resolve;
+  });
+  const gateway = await secureGateway(
+    context,
+    [secureField("username")],
+    "login",
+    200,
+    {
+      fill: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+          started();
+        }),
+    },
+  );
+  const handoff = await (await gateway.discover()).json();
+  const filling = gateway.fill(handoff.handoffId, {
+    values: { f0: "private" },
+  });
+  await entered;
+  assert.equal((await gateway.cancel()).status, 409);
+  finish();
+  assert.equal((await filling).status, 200);
+  assert.deepEqual(
+    await (
+      await fetch(`${gateway.base}/credential-result/${gateway.capability}`)
+    ).json(),
+    { status: "filled", submitted: false },
+  );
+});
+
+for (const failure of [404, 409, 500, "invalid"]) {
+  test(`opening a secure form reports ${failure} to the agent without waiting for expiry`, async (context) => {
+    const gateway = await secureGateway(
+      context,
+      [secureField("username")],
+      "login",
+      200,
+      {
+        discover: () => {
+          return typeof failure === "number" ? failure : 200;
+        },
+      },
+    );
+    if (failure === "invalid") gateway.metadata.fields = [];
+    assert.equal((await gateway.discover()).ok, false);
+    assert.deepEqual(
+      await (
+        await fetch(`${gateway.base}/credential-result/${gateway.capability}`)
+      ).json(),
+      { status: "failed" },
+    );
+    assert.equal((await gateway.discover()).status, 404);
+    assert.equal(gateway.posted.length, 0);
   });
 }

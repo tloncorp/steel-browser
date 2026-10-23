@@ -74,12 +74,12 @@ Chrome session is released. The standalone YAML manifests still place those prof
 `emptyDir`, so they survive idle/release but not Pod replacement. The Terraform cluster-services
 deployment mounts `browser-profiles`, a configurable persistent volume claim, instead.
 
-The manifest admits 20 browser sessions, expires them after two hours, retains at most 20
+The manifest admits 20 browser sessions, expires them after one hour, retains at most 20
 released-session records, and admits at most one live session per credential so a Chrome profile
 never has concurrent writers.
 
 Viewer and credential-entry links expire at the earlier of the session's hard deadline and
-`SESSION_VIEWER_MAX_TTL_MS` after issuance (two hours by default). The bot's
+`SESSION_VIEWER_MAX_TTL_MS` after issuance (one hour in these manifests). The bot's
 `browser handoff <session_id>` tool resolves a fresh signed link through its configured MCP
 connection and passes it directly to the native login card. The model supplies only the session
 handle, never the signed URL. A released session is unavailable even if its link has time remaining.
@@ -103,7 +103,7 @@ bare-metal cluster's `WORKLOAD_IDENTITY_POOL_AUDIENCE` when deploying elsewhere;
 must also provide its corresponding `pioneer-wid-config` ConfigMap.
 
 The patched self-hosted Steel MCP server honors `STEEL_MAX_SESSIONS`, so the sidecar and browser both
-admit 20 concurrent sessions. Sessions have a two-hour hard lifetime and a 30-minute idle timeout.
+admit 20 concurrent sessions. Sessions have a one-hour hard lifetime and a one-hour idle timeout.
 Explicit session requests can choose a shorter lifetime. The per-credential request-rate budget
 is separate from these settings. Keep the Deployment at one replica while MCP handles are
 process-local. Monitor browser memory usage: the concurrency ceiling does not reserve memory
@@ -111,3 +111,66 @@ for 20 heavy pages.
 
 The NetworkPolicy limits ingress to Pods in `tlon`; `X-Api-Key` provides the tenant boundary within
 that network. Requests without a supported credential are rejected before a tenant runtime exists.
+
+## Planet-backed saved logins
+
+`BROWSER_VAULT_ENABLED=true` on both the MCP and viewer containers enables saved logins.
+The manifests leave it disabled until the service, secrets, and client integration are configured.
+Owner-authenticated endpoints support saving, account selection, deletion, and automatic-sign-in
+permission changes. Saved-login controls require a separate client UI integration.
+`browser_login` can list account metadata and privately fill credentials marked `allow`;
+credentials marked `ask` require owner approval. Passwords never appear in tool results. OTPs, new-password fields,
+cards, cross-origin frames/actions, and HTTP origins are excluded.
+
+Provision `browser-vault-secrets` in each Steel deployment with these keys:
+
+- `encryption-key`: a persistent, base64-encoded 32-byte random key, used only by Steel MCP.
+- `key-id`: the identifier for that encryption key, such as `primary`.
+- `service-token`: a secret of at least 32 characters, shared by the viewer and Steel MCP for
+  their private API.
+Steel MCP reads `PIONEER_SIDECAR_TOKEN` from the existing
+`voyager-env-secrets.PIONEER_SIDECAR_TOKEN` entry. Pioneer authenticates both the
+browser vault API and the Solaris metadata-management API with that existing
+sidecar token. Solaris uses its existing sidecar client configuration. No
+additional Pioneer vault token or Kubernetes secret entry is required.
+
+Use the same encryption key and key ID across browser clusters in one environment, and keep a
+secure backup. Test and production use separate keys. There is no generated startup key or
+plaintext fallback. Changing the encryption key requires a deliberate authenticated re-encryption
+migration of stored records; replacing or losing it makes those records unreadable. Rotating a
+moon's login code or the planet owner token does not require re-encryption.
+
+MCP derives each AES-256-GCM key from the static server key and a domain-separated derivative
+of the owner planet's code. Each ship-stored record retains its encryption factor so code changes
+do not invalidate saved passwords. The key context binds the planet, bot moon, and credential ID.
+Pioneer verifies the moon's current browser key before retrieval. The raw code stays in Pioneer.
+Owner requests use a domain-separated HMAC proof with a ten-minute expiry, checked against
+the planet's current code and server time.
+Ship headers are routing hints until verification succeeds. A signed conversation viewer link
+grants no owner authority; the app exchanges it for an owner-authenticated viewer capability.
+Public raw CDP is disabled, and credential-enabled MCP refuses screenshots, PDFs, recording replay,
+and diagnostic artifacts. Known filled values are redacted from text and automation-model input.
+Chrome retains its debugger Origin checks and routes loopback page requests through the
+configured egress proxy. Keep that proxy isolated from internal control services. A malicious destination that
+transforms and discloses its own password is outside the redaction guarantee.
+
+Pioneer stores only encrypted records in the **parent planet's** `%settings` bucket
+`%moltbot/%browser-logins`. Each entry is scoped to one bot moon and exact HTTPS origin, with
+authenticated identity, origin, label, factor, creation time, and key ID. Current revisions and
+permissions are enforced by Pioneer without decrypting. Sibling bots do
+not share entries. Updates and deletes check the record revision under the planet's writer lock.
+Save acknowledgement waits until the planet's scry observes the write; successful form filling
+and successful saving are reported separately. Neither result proves sign-in.
+
+Deploy Pioneer with the vault endpoint, then the matching MCP/browser/viewer images, then enable
+both feature flags. Start with synthetic accounts for two bot moons: verify isolation, owner
+selection, ask/allow/revocation, username/password steps, metadata-only Solaris listing/deletion,
+rejected retries, expired/replayed handoffs, and
+browser-key/owner-token rotation. The viewer-to-MCP route and browser REST API remain private;
+Pioneer routing uses the fixed operator-controlled HTTPS origin template. Owner tokens and
+credential payloads are excluded from request logs. Secure fills redact known values from browser
+logs and stop recording that session's remaining DOM/image events.
+Chrome password-manager and autofill saving are disabled; existing profile data is preserved.
+
+Turning both flags off disables saving and reuse while preserving ciphertext on the planet.
+Existing browser cookies are separate: deleting a saved login does not sign out a browser.

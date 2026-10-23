@@ -1,4 +1,5 @@
 import { EventEmitter } from "events";
+import { chromeProxyArgs } from "./utils/chrome-proxy.js";
 import { FastifyBaseLogger } from "fastify";
 import {
   BrowserFingerprintWithHeaders,
@@ -876,7 +877,6 @@ export class CDPService extends EventEmitter {
           (typeof process.getuid === "function" && process.getuid() === 0);
 
         const staticDefaultArgs = [
-          "--remote-allow-origins=*",
           "--disable-dev-shm-usage",
           "--disable-gpu",
           "--disable-features=TranslateUI,BlinkGenPropertyTrees,LinuxNonClientFrame,PermissionPromptSurvey,IsolateOrigins,site-per-process,TouchpadAndWheelScrollLatching,TrackingProtection3pcd,InterestFeedContentSuggestions,PrivacySandboxSettings4,AutofillServerCommunication,OptimizationHints,MediaRouter,DialMediaRouteProvider,CertificateTransparencyComponentUpdater,GlobalMediaControls,AudioServiceOutOfProcess,LazyFrameLoading,AvoidUnnecessaryBeforeUnloadCheckSync,DisableLoadExtensionCommandLineSwitch,DisableDisableExtensionsExceptCommandLineSwitch",
@@ -941,9 +941,7 @@ export class CDPService extends EventEmitter {
             this.launchConfig.dimensions?.height ?? 1080
           }`,
           userAgent ? `--user-agent=${userAgent}` : "",
-          this.launchConfig.options.proxyUrl
-            ? `--proxy-server=${this.launchConfig.options.proxyUrl}`
-            : "",
+          ...chromeProxyArgs(this.launchConfig.options.proxyUrl),
           this.launchConfig.fullscreen === true ? "--kiosk" : "",
         ];
 

@@ -293,9 +293,15 @@ export class SessionService {
         plugins_disabled: ["Chrome PDF Viewer"],
       },
     };
-    const mergedUserPreferences = userPreferences
-      ? deepMerge(defaultUserPreferences, userPreferences)
-      : defaultUserPreferences;
+    const mergedUserPreferences = deepMerge<Record<string, unknown>>(
+      userPreferences ? deepMerge(defaultUserPreferences, userPreferences) : defaultUserPreferences,
+      {
+        // Browser profiles retain website sessions, while the owner-authorized vault stores logins.
+        credentials_enable_service: false,
+        profile: { password_manager_enabled: false },
+        autofill: { profile_enabled: false, credit_card_enabled: false },
+      },
+    );
     const normalizedOptimize = this.normalizeOptimizeBandwidth(optimizeBandwidth);
 
     try {

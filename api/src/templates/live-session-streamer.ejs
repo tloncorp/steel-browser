@@ -221,6 +221,7 @@
   </head>
   <body>
     <header <%= showControls ? '' : 'hidden' %>>
+      <button id="return-to-app" type="button" hidden>Return to app</button>
       <button id="back" class="icon-button" aria-label="Back" title="Back">‹</button>
       <button id="forward" class="icon-button" aria-label="Forward" title="Forward">›</button>
       <input id="url" aria-label="Browser address" autocomplete="off" spellcheck="false" readonly />
@@ -286,6 +287,12 @@
         const controlButton = $("control");
         const status = $("status");
         const layout = $("viewport-mode");
+        const returnToApp = $("return-to-app");
+        returnToApp.hidden = new URLSearchParams(location.search).get("returnToApp") !== "true";
+        returnToApp.addEventListener("click", () => {
+          window.close();
+          status.textContent = "Close this tab to return to the app.";
+        });
         const menu = $("browser-menu");
         function closeMenu() {
           menu.hidden = true;
