@@ -14,12 +14,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # Automatic semantic version bump (major/minor/patch from commit messages)
       - name: Bump version and push tag
         id: bump_version
-        uses: phips28/gh-action-bump-version@v11.0.3
+        uses: phips28/gh-action-bump-version@2422b2051d4c598644ce17a0053c4eff88cf3ff8 # v11.0.3
         with:
           tag-prefix: "v"
           tag-suffix: "-beta"
@@ -32,7 +32,7 @@ jobs:
 
       # Generate changelog file from previous commits
       - name: Generate changelog
-        uses: mikepenz/release-changelog-builder-action@v5
+        uses: mikepenz/release-changelog-builder-action@c9dc8369bccbc41e0ac887f8fd674f5925d315f7 # v5
         id: changelog
         with:
           mode: "COMMIT"
@@ -94,7 +94,7 @@ jobs:
 
       # Create automatic GitHub release
       - name: Create GitHub Release
-        uses: ncipollo/release-action@v1.18.0
+        uses: ncipollo/release-action@bcfe5470707e8832e12347755757cec0eb3c22af # v1.18.0
         with:
           token: "${{ secrets.GITHUB_TOKEN }}"
           tag: ${{ steps.bump_version.outputs.newTag }}
